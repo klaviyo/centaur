@@ -344,6 +344,7 @@ module Mcp
       assert_equal "http://www.example.com/mcp/oauth/revoke", body.fetch("revocation_endpoint")
       assert_includes body.fetch("scopes_supported"), "mcp:tools"
       assert_includes body.fetch("scopes_supported"), "sessions:read"
+      assert_includes body.fetch("scopes_supported"), "sessions:write"
       assert_equal "centaur-cli", body.fetch("centaur_cli_client_id")
     end
 
@@ -384,6 +385,7 @@ module Mcp
       assert_equal "sessions:read", claims.fetch("scope")
       assert_equal @operator.oid, claims.fetch("user_id")
       assert_equal client.public_client_id, claims.fetch("client_id")
+      assert_equal true, claims.fetch("console_admin")
       assert_nil claims["capabilities"]
 
       post "/mcp/oauth/token",
@@ -396,6 +398,35 @@ module Mcp
       refreshed = decode_jwt_payload(JSON.parse(response.body).fetch("access_token"))
       assert_equal "user", refreshed.fetch("token_use")
       assert_equal "centaur-api", refreshed.fetch("aud")
+    end
+
+    test "API write scope reflects the user's current admin status on every issue" do
+      member = users(:member_user)
+      client = create_api_client
+      code = authorize_code(
+        client,
+        api_authorize_params(client).merge(scope: "sessions:read sessions:write"),
+        user: member
+      )
+
+      exchange_authorization_code(client, code)
+
+      assert_response :ok
+      body = JSON.parse(response.body)
+      assert_equal "sessions:read sessions:write", body.fetch("scope")
+      claims = decode_jwt_payload(body.fetch("access_token"))
+      assert_equal "sessions:read sessions:write", claims.fetch("scope")
+      assert_equal false, claims.fetch("console_admin")
+
+      member.update!(admin: true)
+      post "/mcp/oauth/token",
+           params: {
+             grant_type: "refresh_token",
+             client_id: client.public_client_id,
+             refresh_token: body.fetch("refresh_token")
+           }
+      assert_response :ok
+      assert_equal true, decode_jwt_payload(JSON.parse(response.body).fetch("access_token")).fetch("console_admin")
     end
 
     test "an API client that omits scope receives its registered API scopes" do
@@ -512,8 +543,8 @@ module Mcp
       authorize_params(client).merge(scope: "sessions:read").except(:resource)
     end
 
-    def authorize_code(client, approval_params = authorize_params(client))
-      post login_url, params: { email: @operator.email, password: "password123456" }
+    def authorize_code(client, approval_params = authorize_params(client), user: @operator)
+      post login_url, params: { email: user.email, password: "password123456" }
 
       assert_no_difference -> { McpOauthAuthorizationCode.count } do
         get "/mcp/oauth/authorize", params: approval_params

@@ -55,6 +55,9 @@ module ApiServer
     # Access token for a person signed in through Console OAuth (the `centaur`
     # CLI). api-rs derives capabilities from `scope` alone and checks session
     # ownership against `sub`, the same principal subject sandbox tokens use.
+    # `console_admin` lets api-rs skip that ownership check; it is read from the
+    # user at every issue, including refresh, so promotion and demotion take
+    # effect within one access-token lifetime.
     def encode_for_user(user:, principal:, scopes:, client_id:, ttl_seconds:, now: Time.current)
       issued_at = now.to_i
       payload = {
@@ -69,7 +72,8 @@ module ApiServer
         "scope" => scopes.join(" "),
         "client_id" => client_id,
         "user_id" => user.oid,
-        "email" => user.email
+        "email" => user.email,
+        "console_admin" => user.admin?
       }
       CentaurJwt::Hs256.encode(payload, signing_secret: ENV["CENTAUR_JWT_SIGNING_SECRET"])
     end

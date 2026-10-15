@@ -9,7 +9,7 @@ class McpOauthClient < ApplicationRecord
   DEFAULT_SCOPES = %w[mcp:tools].freeze
   # Scopes for api-rs user tokens (the `centaur` CLI). They mint a different
   # token than MCP scopes, so a request may not combine the two.
-  API_SCOPES = %w[sessions:read].freeze
+  API_SCOPES = %w[sessions:read sessions:write].freeze
   SUPPORTED_SCOPES = (DEFAULT_SCOPES + API_SCOPES).freeze
   # The `centaur` CLI is a built-in public client with this well-known ID, so
   # every login shares one client instead of registering its own.
