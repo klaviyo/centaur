@@ -51,6 +51,35 @@ def test_react_is_discoverable() -> None:
     assert "reactions:write" in result.output
 
 
+@pytest.mark.parametrize("command", ["send", "dm"])
+def test_send_commands_report_confirmed_delivery_with_permalink_fallback(
+    monkeypatch, command
+) -> None:
+    def fake_send(*args, **kwargs):
+        return {
+            "delivery_status": "confirmed",
+            "permalink": "https://slack.com/archives/D123/p123456",
+            "permalink_status": "fallback",
+            "permalink_error": {
+                "slack_method": "chat.getPermalink",
+                "error_code": "invalid_auth",
+            },
+        }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "slack.client",
+        types.SimpleNamespace(send_message=fake_send, send_dm=fake_send),
+    )
+    args = [command, "U123ABC", "hello"]
+
+    result = CliRunner().invoke(app, args)
+
+    assert result.exit_code == 0
+    assert "delivery was confirmed" in result.output
+    assert "permalink lookup failed (invalid_auth)" in result.output
+
+
 def test_channel_arg_is_id_accepts_channel_id_forms() -> None:
     assert _channel_arg_is_id("C0AJ07U8Z1N")
     assert _channel_arg_is_id("#C0AJ07U8Z1N")

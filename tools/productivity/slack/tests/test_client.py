@@ -272,6 +272,8 @@ def test_send_message_posts_directly_to_user_id_without_im_write_scope() -> None
     assert result["channel"] == "D123"
     assert result["permalink"] == "https://acme.slack.com/archives/D123/p123456"
     assert fake_web_client.permalink_calls == [{"channel": "D123", "message_ts": "123.456"}]
+    assert result["delivery_status"] == "confirmed"
+    assert result["permalink_status"] == "confirmed"
 
 
 def test_canonical_message_permalink_falls_back_when_slack_rejects_lookup() -> None:
@@ -299,6 +301,64 @@ def test_send_dm_posts_directly_to_user_id() -> None:
     assert fake_web_client.last_kwargs["unfurl_links"] is False
 
 
+def test_username_resolution_surfaces_invalid_auth_instead_of_not_found(monkeypatch) -> None:
+    client, fake_web_client = _make_client()
+    client._load_user_cache = lambda: None  # type: ignore[method-assign]
+    client._save_user_cache = lambda _: None  # type: ignore[method-assign]
+
+    def fail_users_list(**kwargs):
+        raise _make_slack_error(error="invalid_auth", status_code=401)
+
+    fake_web_client.users_list = fail_users_list  # type: ignore[method-assign]
+
+    with pytest.raises(SlackAuthError) as exc_info:
+        client.send_dm("@thomas", "hello", no_attribution=True)
+
+    assert exc_info.value.payload["slack_method"] == "users.list"
+    assert exc_info.value.payload["access_path"] == "bot_token"
+    assert exc_info.value.payload["error_code"] == "invalid_auth"
+    assert fake_web_client.last_kwargs is None
+    assert fake_web_client.open_calls == []
+
+
+def test_send_message_surfaces_rejected_send_as_auth_failure() -> None:
+    client, fake_web_client = _make_client()
+
+    def reject_message(**kwargs):
+        raise _make_slack_error(error="invalid_auth", status_code=401)
+
+    fake_web_client.chat_postMessage = reject_message  # type: ignore[method-assign]
+
+    with pytest.raises(SlackAuthError) as exc_info:
+        client.send_message("U123ABC", "hello", no_attribution=True)
+
+    assert exc_info.value.payload["slack_method"] == "chat.postMessage"
+    assert exc_info.value.payload["error_code"] == "invalid_auth"
+    assert exc_info.value.payload["requested_channel"] == "U123ABC"
+    assert exc_info.value.payload["resolved_channel"] == "U123ABC"
+
+
+def test_send_message_confirms_delivery_when_permalink_lookup_fails() -> None:
+    client, fake_web_client = _make_client()
+
+    def fail_permalink(**kwargs):
+        raise _make_slack_error(error="invalid_auth", status_code=401)
+
+    fake_web_client.chat_getPermalink = fail_permalink  # type: ignore[method-assign]
+
+    result = client.send_message("U123ABC", "hello", no_attribution=True)
+
+    assert result["delivery_status"] == "confirmed"
+    assert result["permalink_status"] == "fallback"
+    assert result["permalink_error"] == {
+        "slack_method": "chat.getPermalink",
+        "error_code": "invalid_auth",
+    }
+    assert result["permalink"] == "https://slack.com/archives/D123/p123456"
+    assert fake_web_client.last_kwargs is not None
+    assert fake_web_client.last_kwargs["channel"] == "U123ABC"
+
+
 def _restore_real_resolve_channel(client: SlackClient) -> None:
     client._resolve_channel = SlackClient._resolve_channel.__get__(client)  # type: ignore[method-assign]
 
@@ -314,7 +374,7 @@ def test_resolve_channel_opens_dm_for_user_id() -> None:
 def test_resolve_channel_opens_dm_for_at_username() -> None:
     client, fake_web_client = _make_client()
     _restore_real_resolve_channel(client)
-    client._get_user_cache = lambda: {"U123ABC": "georgios"}  # type: ignore[method-assign]
+    client._get_user_cache = lambda **_: {"U123ABC": "georgios"}  # type: ignore[method-assign]
 
     assert client._resolve_channel("@georgios") == "D123"
     assert fake_web_client.open_calls == [{"users": "U123ABC"}]

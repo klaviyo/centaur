@@ -89,6 +89,12 @@ def send(
         result = send_message(channel, message, thread_ts=thread, no_attribution=no_attribution)
         console.print("[green]✓ Message sent[/]")
         console.print(f"[dim]{result['permalink']}[/]")
+        if result.get("permalink_status") == "fallback":
+            error_code = (result.get("permalink_error") or {}).get("error_code", "unknown_error")
+            console.print(
+                f"[yellow]Message delivery was confirmed, but Slack permalink lookup failed "
+                f"({error_code}); showing a generic permalink.[/]"
+            )
     except RuntimeError as e:
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1)
@@ -138,6 +144,12 @@ def dm(
         result = send_dm(user_id, message, no_attribution=no_attribution)
         console.print("[green]✓ DM sent[/]")
         console.print(f"[dim]{result['permalink']}[/]")
+        if result.get("permalink_status") == "fallback":
+            error_code = (result.get("permalink_error") or {}).get("error_code", "unknown_error")
+            console.print(
+                f"[yellow]Message delivery was confirmed, but Slack permalink lookup failed "
+                f"({error_code}); showing a generic permalink.[/]"
+            )
     except (RuntimeError, ValueError) as e:
         console.print(f"[red]Error: {e}[/]")
         raise typer.Exit(1)

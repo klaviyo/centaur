@@ -566,6 +566,13 @@ class SlackClient:
 
     def _canonical_message_permalink(self, channel_id: str, ts: str) -> str:
         """Ask Slack for the workspace-aware permalink for a message."""
+        permalink, _ = self._canonical_message_permalink_result(channel_id, ts)
+        return permalink
+
+    def _canonical_message_permalink_result(
+        self, channel_id: str, ts: str
+    ) -> tuple[str, dict[str, str] | None]:
+        """Return a permalink and safe metadata about a lookup fallback."""
         try:
             response = self._retry_on_ratelimit(
                 self._client.chat_getPermalink,
@@ -573,11 +580,24 @@ class SlackClient:
                 channel=channel_id,
                 message_ts=ts,
             )
-        except (SlackApiError, SlackRateLimitError):
-            return self._message_permalink(channel_id, ts)
+        except SlackApiError as error:
+            return self._message_permalink(channel_id, ts), {
+                "slack_method": "chat.getPermalink",
+                "error_code": self._slack_error_code(error),
+            }
+        except SlackRateLimitError:
+            return self._message_permalink(channel_id, ts), {
+                "slack_method": "chat.getPermalink",
+                "error_code": "ratelimited",
+            }
 
         permalink = str(response.get("permalink") or "").strip()
-        return permalink or self._message_permalink(channel_id, ts)
+        if permalink:
+            return permalink, None
+        return self._message_permalink(channel_id, ts), {
+            "slack_method": "chat.getPermalink",
+            "error_code": "missing_permalink",
+        }
 
     def _resolve_channel_name(self, channel: str, channel_id: str) -> str:
         """Resolve a human-readable channel name when callers passed an ID."""
@@ -700,7 +720,10 @@ class SlackClient:
             return self._open_dm_channel(raw)
         if raw.startswith("@"):
             username = raw[1:].strip()
-            user_cache = self._get_user_cache()
+            # Username resolution depends on a successful Slack lookup. Keep
+            # best-effort cache behavior for display-only callers, but do not
+            # turn auth/rate-limit failures into a misleading "not found".
+            user_cache = self._get_user_cache(required=True)
             for user_id, name in user_cache.items():
                 if name == username:
                     return self._open_dm_channel(user_id)
@@ -811,7 +834,7 @@ class SlackClient:
         except Exception:
             pass
 
-    def _get_user_cache(self, *, direct: bool = False) -> dict[str, str]:
+    def _get_user_cache(self, *, direct: bool = False, required: bool = False) -> dict[str, str]:
         """Get user ID -> name mapping, using cache when possible."""
         cached = self._load_user_cache()
         if cached:
@@ -824,8 +847,16 @@ class SlackClient:
             for user in users_response.get("members", []):
                 user_cache[user.get("id", "")] = user.get("name", "")
             self._save_user_cache(user_cache)
-        except (SlackApiError, SlackRateLimitError):
-            pass
+        except SlackApiError as error:
+            if required:
+                self._raise_slack_api_error(
+                    error,
+                    slack_method="users.list",
+                    access_path="search_token" if direct else "bot_token",
+                )
+        except SlackRateLimitError:
+            if required:
+                raise
         return user_cache
 
     def list_bot_channels(
@@ -1751,13 +1782,27 @@ class SlackClient:
             response = self._client.chat_postMessage(**kwargs)
             response_channel = str(response.get("channel") or channel_id)
             response_ts = str(response.get("ts") or "")
-            return {
+            permalink, permalink_error = self._canonical_message_permalink_result(
+                response_channel, response_ts
+            )
+            result = {
+                "delivery_status": "confirmed",
                 "channel": response_channel,
                 "ts": response_ts,
-                "permalink": self._canonical_message_permalink(response_channel, response_ts),
+                "permalink": permalink,
+                "permalink_status": "fallback" if permalink_error else "confirmed",
             }
+            if permalink_error:
+                result["permalink_error"] = permalink_error
+            return result
         except SlackApiError as e:
-            raise RuntimeError(f"Slack API error: {e.response['error']}") from e
+            self._raise_slack_api_error(
+                e,
+                slack_method="chat.postMessage",
+                access_path="bot_token",
+                requested_channel=channel,
+                resolved_channel=channel_id,
+            )
 
     def add_reaction(self, channel_id: str, timestamp: str, emoji: str) -> dict:
         """Add a bot reaction to a message; requires Slack's reactions:write scope.
