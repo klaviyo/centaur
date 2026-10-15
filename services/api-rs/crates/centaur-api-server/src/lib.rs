@@ -77,6 +77,23 @@ mod tests {
         .unwrap()
     }
 
+    fn user_token(subject: &str) -> String {
+        encode(
+            &Header::new(Algorithm::HS256),
+            &json!({
+                "iss": "centaur-console",
+                "sub": subject,
+                "aud": "centaur-api",
+                "iat": 1_700_000_000i64,
+                "exp": 4_102_444_800i64,
+                "token_use": "user",
+                "scope": "sessions:read",
+            }),
+            &EncodingKey::from_secret(b"test-secret"),
+        )
+        .unwrap()
+    }
+
     fn principal_token(subject: &str) -> String {
         encode(
             &Header::new(Algorithm::HS256),
@@ -522,6 +539,127 @@ mod tests {
             .unwrap();
         assert_ne!(slack_response.status(), StatusCode::UNAUTHORIZED);
         assert_ne!(slack_response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn user_jwt_reads_sessions_but_reaches_nothing_else() {
+        let authorized = format!("Bearer {}", user_token("prn_user"));
+        let request = |method: Method, uri: &str| {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::AUTHORIZATION, &authorized)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap()
+        };
+        for (request, expected) in [
+            (
+                request(Method::GET, "/api/session/slack%3AC123%3A123.456"),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                request(Method::GET, "/api/session/slack%3AC123%3A123.456/events"),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                request(Method::POST, "/api/session/slack%3AC123%3A123.456"),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                request(Method::POST, "/api/session/slack%3AC123%3A123.456/messages"),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                request(Method::POST, "/api/session/slack%3AC123%3A123.456/execute"),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                request(
+                    Method::POST,
+                    "/api/session/slack%3AC123%3A123.456/interrupt",
+                ),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                request(Method::POST, "/api/session/slack%3AC123%3A123.456/pause"),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                request(Method::POST, "/api/sandboxes/drain"),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                request(Method::GET, "/api/workflows/runs"),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                request(Method::GET, "/api/slack/channels"),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                request(Method::GET, "/api/admin/slack/dm-sync/checkpoints"),
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let uri = request.uri().to_string();
+            let response = build_router_with_app_state(AppState::unready(test_auth()))
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn whoami_describes_the_authenticated_caller() {
+        for (token, expected) in [
+            (
+                user_token("prn_user"),
+                json!({
+                    "class": "user",
+                    "principal": "prn_user",
+                    "capabilities": ["sessions_read"],
+                }),
+            ),
+            (
+                "test-slackbot-key".to_owned(),
+                json!({
+                    "class": "ingress",
+                    "capabilities": [
+                        "sessions_read",
+                        "sessions_write",
+                        "workflows_events",
+                        "workflows_actions",
+                    ],
+                }),
+            ),
+        ] {
+            let response = build_router_with_app_state(AppState::unready(test_auth_with_slack()))
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/auth/whoami")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), expected);
+        }
+
+        let anonymous = build_router_with_app_state(AppState::unready(test_auth()))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/whoami")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

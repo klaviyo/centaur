@@ -39,14 +39,35 @@ impl Capability {
         Self::WorkflowsActions,
         Self::AdminSync,
     ];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionsRead => "sessions_read",
+            Self::SessionsWrite => "sessions_write",
+            Self::SandboxesDrain => "sandboxes_drain",
+            Self::WorkflowsRead => "workflows_read",
+            Self::WorkflowsWrite => "workflows_write",
+            Self::WorkflowsEvents => "workflows_events",
+            Self::WorkflowsActions => "workflows_actions",
+            Self::AdminSync => "admin_sync",
+        }
+    }
 }
+
+/// OAuth scopes Console grants to user tokens, and the capability each one
+/// carries. Anything not listed here grants nothing.
+const USER_SCOPE_CAPABILITIES: &[(&str, Capability)] =
+    &[("sessions:read", Capability::SessionsRead)];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CallerClass {
     Admin,
     Console,
     Ingress,
+    /// A sandbox acting for its iron-control principal.
     Principal,
+    /// A person signed in through Console OAuth (the `centaur` CLI).
+    User,
 }
 
 impl CallerClass {
@@ -56,6 +77,7 @@ impl CallerClass {
             Self::Console => "console",
             Self::Ingress => "ingress",
             Self::Principal => "principal",
+            Self::User => "user",
         }
     }
 }
@@ -72,6 +94,10 @@ pub(crate) struct AuthenticatedCaller {
 impl AuthenticatedCaller {
     pub(crate) fn has_capability(&self, capability: Capability) -> bool {
         self.capabilities.contains(&capability)
+    }
+
+    pub(crate) fn capabilities(&self) -> impl Iterator<Item = Capability> + '_ {
+        self.capabilities.iter().copied()
     }
 
     pub(crate) const fn class(&self) -> CallerClass {
@@ -234,6 +260,20 @@ impl ApiAuthConfig {
             Some(ApiJwtTokenUse::ConsoleService) => Err(ApiError::Unauthorized(
                 "invalid Console service token subject".to_owned(),
             )),
+            Some(ApiJwtTokenUse::User) => {
+                if subject.is_empty() {
+                    return Err(ApiError::Unauthorized(
+                        "user token subject is required".to_owned(),
+                    ));
+                }
+                Ok(AuthenticatedCaller {
+                    class: CallerClass::User,
+                    identity: subject.clone(),
+                    capabilities: user_scope_capabilities(claims.scope.as_deref()),
+                    platform_prefixes: None,
+                    principal_subject: Some(subject),
+                })
+            }
             None => {
                 let mut capabilities = BTreeSet::new();
                 match claims.capabilities {
@@ -280,6 +320,8 @@ struct ApiJwtClaims {
     sub: String,
     token_use: Option<ApiJwtTokenUse>,
     capabilities: Option<ApiJwtCapabilities>,
+    /// Space-delimited OAuth scopes; only read for user tokens.
+    scope: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -296,6 +338,20 @@ struct ApiJwtCapabilities {
 #[serde(rename_all = "snake_case")]
 enum ApiJwtTokenUse {
     ConsoleService,
+    User,
+}
+
+fn user_scope_capabilities(scope: Option<&str>) -> BTreeSet<Capability> {
+    scope
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|scope| {
+            USER_SCOPE_CAPABILITIES
+                .iter()
+                .find(|(name, _)| *name == scope)
+                .map(|(_, capability)| *capability)
+        })
+        .collect()
 }
 
 /// Every ingress key and the session thread-key families it is allowed to
@@ -542,6 +598,105 @@ mod tests {
         assert!(!caller.has_capability(Capability::SessionsRead));
         assert!(caller.has_capability(Capability::WorkflowsRead));
         assert!(caller.has_capability(Capability::WorkflowsWrite));
+    }
+
+    fn bearer_headers(claims: serde_json::Value) -> HeaderMap {
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(b"jwt-secret"),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn authenticates_user_jwt_with_scope_capabilities() {
+        let auth = ApiAuthConfig::testing("jwt-secret");
+        let headers = bearer_headers(json!({
+            "iss": "centaur-console",
+            "sub": "prn_user",
+            "aud": "centaur-api",
+            "iat": 1_700_000_000i64,
+            "exp": 4_102_444_800i64,
+            "token_use": "user",
+            "scope": "sessions:read",
+        }));
+
+        let caller = auth.authenticate(&headers).unwrap();
+        assert_eq!(caller.class(), CallerClass::User);
+        assert_eq!(caller.principal_subject(), Some("prn_user"));
+        assert_eq!(caller.platform_prefixes(), None);
+        assert_eq!(
+            caller.capabilities().collect::<Vec<_>>(),
+            vec![Capability::SessionsRead]
+        );
+    }
+
+    #[test]
+    fn user_jwt_ignores_capability_claims_and_unknown_scopes() {
+        let auth = ApiAuthConfig::testing("jwt-secret");
+        let headers = bearer_headers(json!({
+            "iss": "centaur-console",
+            "sub": "prn_user",
+            "aud": "centaur-api",
+            "iat": 1_700_000_000i64,
+            "exp": 4_102_444_800i64,
+            "token_use": "user",
+            "scope": "sessions:write mcp:tools *",
+            "capabilities": {
+                "sessions_read": true,
+                "workflows_read": true,
+                "workflows_write": true,
+            },
+        }));
+
+        let caller = auth.authenticate(&headers).unwrap();
+        assert_eq!(caller.class(), CallerClass::User);
+        assert_eq!(caller.capabilities().count(), 0);
+    }
+
+    #[test]
+    fn user_jwt_requires_a_subject() {
+        let auth = ApiAuthConfig::testing("jwt-secret");
+        let headers = bearer_headers(json!({
+            "iss": "centaur-console",
+            "sub": " ",
+            "aud": "centaur-api",
+            "iat": 1_700_000_000i64,
+            "exp": 4_102_444_800i64,
+            "token_use": "user",
+            "scope": "sessions:read",
+        }));
+
+        assert!(matches!(
+            auth.authenticate(&headers),
+            Err(ApiError::Unauthorized(_))
+        ));
+    }
+
+    #[test]
+    fn mcp_access_tokens_are_not_api_tokens() {
+        let auth = ApiAuthConfig::testing("jwt-secret");
+        let headers = bearer_headers(json!({
+            "iss": "https://console.example.com",
+            "sub": "usr_test",
+            "aud": "https://api.example.com/mcp",
+            "iat": 1_700_000_000i64,
+            "exp": 4_102_444_800i64,
+            "scope": "mcp:tools",
+            "principal_id": "prn_user",
+        }));
+
+        assert!(matches!(
+            auth.authenticate(&headers),
+            Err(ApiError::Unauthorized(_))
+        ));
     }
 
     #[test]

@@ -56,7 +56,7 @@ use crate::{
         ExecuteSessionResponse, GithubThreadContext, InterruptSessionExecutionRequest,
         InterruptSessionExecutionResponse, LinearThreadContext, ListWorkflowRunsQuery,
         OnHarnessConflict, SessionContextResponse, SessionSseEvent, SlackThreadContext,
-        stream_error_sse,
+        WhoamiResponse, stream_error_sse,
     },
 };
 
@@ -228,6 +228,7 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             post(pause_session_sandbox),
         )
         .route("/api/sandboxes/drain", post(drain_sandboxes))
+        .route("/api/auth/whoami", get(whoami))
         .merge(slack_proxy_router())
         .route("/api/workflows/schedules", get(list_workflow_schedules))
         .route(
@@ -387,8 +388,19 @@ async fn metrics(State(state): State<AppState>) -> Response {
 
 #[derive(Clone, Copy)]
 enum RouteAccess {
+    /// Any caller that presents a valid credential.
+    Authenticated,
     Capability(Capability),
     PrincipalOnly,
+}
+
+/// Principal and user identities are principal IDs; keep them out of logs.
+fn caller_log_identity(caller: &AuthenticatedCaller) -> &str {
+    match caller.class() {
+        CallerClass::Principal => "principal",
+        CallerClass::User => "user",
+        CallerClass::Admin | CallerClass::Console | CallerClass::Ingress => caller.identity(),
+    }
 }
 
 async fn authorize_api_request(
@@ -409,11 +421,7 @@ async fn authorize_api_request(
         record_api_authentication(caller.class().as_str(), "forbidden");
         tracing::warn!(
             caller_class = caller.class().as_str(),
-            caller_identity = if caller.class() == CallerClass::Principal {
-                "principal"
-            } else {
-                caller.identity()
-            },
+            caller_identity = caller_log_identity(&caller),
             http_method = method.as_str(),
             http_route = route,
             "authenticated caller denied because route has no authorization policy"
@@ -423,6 +431,7 @@ async fn authorize_api_request(
     };
 
     let allowed = match access {
+        RouteAccess::Authenticated => true,
         RouteAccess::Capability(capability) => caller.has_capability(capability),
         RouteAccess::PrincipalOnly => caller.class() == CallerClass::Principal,
     };
@@ -430,11 +439,7 @@ async fn authorize_api_request(
         record_api_authentication(caller.class().as_str(), "forbidden");
         tracing::warn!(
             caller_class = caller.class().as_str(),
-            caller_identity = if caller.class() == CallerClass::Principal {
-                "principal"
-            } else {
-                caller.identity()
-            },
+            caller_identity = caller_log_identity(&caller),
             http_method = method.as_str(),
             http_route = route,
             "authenticated caller lacks route capability"
@@ -451,11 +456,7 @@ async fn authorize_api_request(
         record_api_authentication(caller.class().as_str(), "forbidden");
         tracing::warn!(
             caller_class = caller.class().as_str(),
-            caller_identity = if caller.class() == CallerClass::Principal {
-                "principal"
-            } else {
-                caller.identity()
-            },
+            caller_identity = caller_log_identity(&caller),
             expected_thread_prefixes = ?prefixes,
             "ingress caller denied for another platform's session"
         );
@@ -471,6 +472,7 @@ async fn authorize_api_request(
 fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
     let capability = |capability| Some(RouteAccess::Capability(capability));
     match (method, route) {
+        (&Method::GET, "/api/auth/whoami") => Some(RouteAccess::Authenticated),
         (&Method::GET, "/api/session/{thread_key}")
         | (&Method::GET, "/api/session/{thread_key}/events") => {
             capability(Capability::SessionsRead)
@@ -583,6 +585,17 @@ async fn create_or_get_session(
         harness_switched: outcome.harness_switched,
         unavailable_requested_persona_id: outcome.unavailable_requested_persona_id,
     }))
+}
+
+async fn whoami(Extension(caller): Extension<AuthenticatedCaller>) -> Json<WhoamiResponse> {
+    Json(WhoamiResponse {
+        class: caller.class().as_str().to_owned(),
+        principal: caller.principal_subject().map(ToOwned::to_owned),
+        capabilities: caller
+            .capabilities()
+            .map(|capability| capability.as_str().to_owned())
+            .collect(),
+    })
 }
 
 async fn get_session_context(
