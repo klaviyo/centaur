@@ -219,6 +219,14 @@ pub struct WhoamiResponse {
     pub capabilities: Vec<String>,
 }
 
+/// `POST /api/session/{thread_key}/pause`. `paused` is false when the session
+/// had no idle sandbox to pause.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PauseSessionResponse {
+    pub ok: bool,
+    pub paused: bool,
+}
+
 /// `GET /api/sessions` query. The server clamps `limit` to its maximum.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ListSessionsQuery {

@@ -56,8 +56,8 @@ use crate::{
         ExecuteSessionResponse, ExecutionSummary, GithubThreadContext,
         InterruptSessionExecutionRequest, InterruptSessionExecutionResponse, LinearThreadContext,
         ListSessionsQuery, ListSessionsResponse, ListWorkflowRunsQuery, OnHarnessConflict,
-        SessionContextResponse, SessionSseEvent, SessionSummary, SlackThreadContext,
-        WhoamiResponse, stream_error_sse,
+        PauseSessionResponse, SessionContextResponse, SessionSseEvent, SessionSummary,
+        SlackThreadContext, WhoamiResponse, stream_error_sse,
     },
 };
 
@@ -904,10 +904,10 @@ async fn drain_sandboxes(
 async fn pause_session_sandbox(
     State(state): State<AppState>,
     Path(raw_thread_key): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<PauseSessionResponse>, ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
     let paused = state.runtime()?.pause_idle_session(&thread_key).await?;
-    Ok(Json(json!({ "ok": true, "paused": paused })))
+    Ok(Json(PauseSessionResponse { ok: true, paused }))
 }
 
 async fn stream_events(

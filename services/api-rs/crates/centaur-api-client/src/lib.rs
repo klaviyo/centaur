@@ -1,6 +1,9 @@
+//! HTTP client for the api-rs session API, built on `centaur-api-types` so
+//! callers do not depend on the server.
+
 use std::pin::Pin;
 
-use centaur_session_core::{Session, ThreadKey};
+use centaur_session_core::ThreadKey;
 use eventsource_stream::Eventsource;
 use futures_util::{Stream, StreamExt};
 use reqwest::{
@@ -9,9 +12,11 @@ use reqwest::{
 };
 use thiserror::Error;
 
-use crate::types::{
-    AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, ExecuteSessionRequest,
-    ExecuteSessionResponse,
+use centaur_api_types::{
+    AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
+    EventsQuery, ExecuteSessionRequest, ExecuteSessionResponse, InterruptSessionExecutionRequest,
+    InterruptSessionExecutionResponse, ListSessionsQuery, ListSessionsResponse,
+    PauseSessionResponse, SessionSummary,
 };
 
 #[derive(Clone, Debug)]
@@ -49,7 +54,7 @@ impl CentaurClient {
         &self,
         thread_key: &ThreadKey,
         request: CreateSessionRequest,
-    ) -> Result<Session, ClientError> {
+    ) -> Result<CreateSessionResponse, ClientError> {
         self.post_json(&self.session_url(thread_key), &request)
             .await
     }
@@ -78,22 +83,80 @@ impl CentaurClient {
         .await
     }
 
+    /// Sessions most recently updated first; see `GET /api/sessions`.
+    pub async fn list_sessions(
+        &self,
+        query: &ListSessionsQuery,
+    ) -> Result<ListSessionsResponse, ClientError> {
+        self.get_json(&format!("{}/api/sessions", self.base_url), query)
+            .await
+    }
+
+    pub async fn session_summary(
+        &self,
+        thread_key: &ThreadKey,
+    ) -> Result<SessionSummary, ClientError> {
+        self.get_json(&format!("{}/summary", self.session_url(thread_key)), &())
+            .await
+    }
+
+    pub async fn interrupt_session(
+        &self,
+        thread_key: &ThreadKey,
+        request: InterruptSessionExecutionRequest,
+    ) -> Result<InterruptSessionExecutionResponse, ClientError> {
+        self.post_json(
+            &format!("{}/interrupt", self.session_url(thread_key)),
+            &request,
+        )
+        .await
+    }
+
+    pub async fn pause_session(
+        &self,
+        thread_key: &ThreadKey,
+    ) -> Result<PauseSessionResponse, ClientError> {
+        self.post_json(
+            &format!("{}/pause", self.session_url(thread_key)),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    /// Replays the thread's events after `after_event_id`, then follows new
+    /// ones. `execution_id` limits the stream to one execution's events.
     pub async fn stream_events(
         &self,
         thread_key: &ThreadKey,
         after_event_id: i64,
+        execution_id: Option<&str>,
     ) -> Result<SseEventStream, ClientError> {
-        let events_url = format!(
-            "{}/events?after_event_id={after_event_id}",
-            self.session_url(thread_key)
-        );
-        let response = self.client.get(&events_url).send().await?;
+        let query = EventsQuery {
+            after_event_id: Some(after_event_id),
+            execution_id: execution_id.map(str::to_owned),
+        };
+        let response = self
+            .client
+            .get(format!("{}/events", self.session_url(thread_key)))
+            .query(&query)
+            .send()
+            .await?;
         let response = ensure_response_success(response).await?;
         let stream = response
             .bytes_stream()
             .eventsource()
             .map(|event| event.map_err(|error| ClientError::EventStream(error.to_string())));
         Ok(Box::pin(stream))
+    }
+
+    async fn get_json<Q, R>(&self, url: &str, query: &Q) -> Result<R, ClientError>
+    where
+        Q: serde::Serialize + ?Sized,
+        R: serde::de::DeserializeOwned,
+    {
+        let response = self.client.get(url).query(query).send().await?;
+        let response = ensure_response_success(response).await?;
+        Ok(response.json().await?)
     }
 
     async fn post_json<T, R>(&self, url: &str, payload: &T) -> Result<R, ClientError>
@@ -139,4 +202,42 @@ pub enum ClientError {
     EventStream(String),
     #[error("bearer token cannot be represented as an HTTP header")]
     InvalidBearerToken,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn query_string(query: &impl serde::Serialize) -> Option<String> {
+        HttpClient::new()
+            .get("http://api.test/")
+            .query(query)
+            .build()
+            .unwrap()
+            .url()
+            .query()
+            .map(str::to_owned)
+    }
+
+    /// Unset optional fields are left out, and values are percent-encoded.
+    #[test]
+    fn query_types_serialize_to_query_strings() {
+        assert_eq!(query_string(&ListSessionsQuery::default()), None);
+        assert_eq!(
+            query_string(&ListSessionsQuery {
+                limit: Some(5),
+                thread_key_prefix: Some("slack:C1&x".to_owned()),
+            })
+            .as_deref(),
+            Some("limit=5&thread_key_prefix=slack%3AC1%26x")
+        );
+        assert_eq!(
+            query_string(&EventsQuery {
+                after_event_id: Some(0),
+                execution_id: None,
+            })
+            .as_deref(),
+            Some("after_event_id=0")
+        );
+    }
 }

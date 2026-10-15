@@ -12,6 +12,7 @@ Important crate boundaries:
 - `centaur-api-server`: HTTP routes, middleware, startup, health, and metrics.
 - `centaur-api-types`: HTTP wire types shared by the server and its clients;
   keep it free of server-only dependencies.
+- `centaur-api-client`: HTTP and event-stream client for the session API.
 - `centaur-session-core`: shared session types and backend-neutral contracts.
 - `centaur-session-runtime`: orchestration, execution, recovery, and lifecycle.
 - `centaur-session-sqlx`: persistence and embedded SQLx migrations.

@@ -378,6 +378,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "centaur-api-client"
+version = "0.1.0"
+dependencies = [
+ "centaur-api-types",
+ "centaur-session-core",
+ "eventsource-stream",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "urlencoding",
+]
+
+[[package]]
 name = "centaur-api-server"
 version = "0.1.0"
 dependencies = [
@@ -396,7 +411,6 @@ dependencies = [
  "centaur-telemetry",
  "centaur-workflows",
  "clap",
- "eventsource-stream",
  "futures-util",
  "hex",
  "hmac 0.13.0",
@@ -539,7 +553,8 @@ dependencies = [
 name = "centaur-session-cli"
 version = "0.1.0"
 dependencies = [
- "centaur-api-server",
+ "centaur-api-client",
+ "centaur-api-types",
  "centaur-session-core",
  "clap",
  "crossterm",
