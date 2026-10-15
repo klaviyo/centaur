@@ -58,7 +58,7 @@ use title_generator::{
     OpenAiSessionTitleGenerator, sanitize_session_title, session_title_source_from_parts,
 };
 
-pub const SESSION_OUTPUT_LINE_EVENT: &str = "session.output.line";
+pub use centaur_session_core::SESSION_OUTPUT_LINE_EVENT;
 pub const SESSION_FIRST_TOKEN_EVENT: &str = "session.first_token";
 
 const EVENT_STREAM_SAFETY_POLL_INTERVAL: Duration = Duration::from_secs(30);

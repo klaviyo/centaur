@@ -12,6 +12,8 @@ use thiserror::Error;
 use time::OffsetDateTime;
 
 pub const MAX_THREAD_KEY_BYTES: usize = 512;
+/// Session event carrying one raw NDJSON line of harness output.
+pub const SESSION_OUTPUT_LINE_EVENT: &str = "session.output.line";
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ThreadKey(String);
