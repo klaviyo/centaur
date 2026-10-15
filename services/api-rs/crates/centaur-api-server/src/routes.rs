@@ -20,7 +20,7 @@ use axum::{
     routing::{any, get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
-use centaur_session_core::{ChatDestination, ThreadKey};
+use centaur_session_core::{ChatDestination, Session, SessionExecution, ThreadKey};
 use centaur_session_runtime::{
     ExecuteSessionInput, HarnessConflictPolicy, SandboxRuntime, SessionPrincipalRegistrar,
     SessionRuntime,
@@ -53,9 +53,10 @@ use crate::{
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
         DiscordThreadContext, EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest,
-        ExecuteSessionResponse, GithubThreadContext, InterruptSessionExecutionRequest,
-        InterruptSessionExecutionResponse, LinearThreadContext, ListWorkflowRunsQuery,
-        OnHarnessConflict, SessionContextResponse, SessionSseEvent, SlackThreadContext,
+        ExecuteSessionResponse, ExecutionSummary, GithubThreadContext,
+        InterruptSessionExecutionRequest, InterruptSessionExecutionResponse, LinearThreadContext,
+        ListSessionsQuery, ListSessionsResponse, ListWorkflowRunsQuery, OnHarnessConflict,
+        SessionContextResponse, SessionSseEvent, SessionSummary, SlackThreadContext,
         WhoamiResponse, stream_error_sse,
     },
 };
@@ -209,6 +210,11 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .route(
             "/api/session/{thread_key}",
             post(create_or_get_session).get(get_session_context),
+        )
+        .route("/api/sessions", get(list_sessions))
+        .route(
+            "/api/session/{thread_key}/summary",
+            get(get_session_summary),
         )
         .route(
             "/api/session/{thread_key}/messages",
@@ -473,7 +479,9 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
     let capability = |capability| Some(RouteAccess::Capability(capability));
     match (method, route) {
         (&Method::GET, "/api/auth/whoami") => Some(RouteAccess::Authenticated),
-        (&Method::GET, "/api/session/{thread_key}")
+        (&Method::GET, "/api/sessions")
+        | (&Method::GET, "/api/session/{thread_key}")
+        | (&Method::GET, "/api/session/{thread_key}/summary")
         | (&Method::GET, "/api/session/{thread_key}/events") => {
             capability(Capability::SessionsRead)
         }
@@ -598,6 +606,93 @@ async fn whoami(Extension(caller): Extension<AuthenticatedCaller>) -> Json<Whoam
     })
 }
 
+const DEFAULT_SESSION_LIST_LIMIT: u32 = 50;
+const MAX_SESSION_LIST_LIMIT: u32 = 200;
+
+/// Admin and Console callers list every session; a user lists the sessions
+/// bound to their principal. Sandbox principals and ingress keys have no use
+/// for a cross-thread listing, so they are refused rather than filtered.
+async fn list_sessions(
+    State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
+    Query(query): Query<ListSessionsQuery>,
+) -> Result<Json<ListSessionsResponse>, ApiError> {
+    let principal = match caller.class() {
+        CallerClass::Admin | CallerClass::Console => None,
+        CallerClass::User => Some(
+            caller
+                .principal_subject()
+                .ok_or_else(|| ApiError::Forbidden("user caller has no principal".to_owned()))?,
+        ),
+        CallerClass::Principal | CallerClass::Ingress => {
+            return Err(ApiError::Forbidden(
+                "caller is not authorized to list sessions".to_owned(),
+            ));
+        }
+    };
+    let runtime = state.runtime()?;
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_SESSION_LIST_LIMIT)
+        .clamp(1, MAX_SESSION_LIST_LIMIT);
+    let sessions = runtime
+        .list_sessions(
+            principal,
+            query
+                .thread_key_prefix
+                .as_deref()
+                .filter(|prefix| !prefix.is_empty()),
+            i64::from(limit),
+        )
+        .await?
+        .into_iter()
+        .map(|(session, execution)| session_summary(session, execution))
+        .collect();
+    Ok(Json(ListSessionsResponse { sessions }))
+}
+
+async fn get_session_summary(
+    State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
+    Path(raw_thread_key): Path<String>,
+) -> Result<Json<SessionSummary>, ApiError> {
+    let runtime = state.runtime()?;
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    authorize_principal_session_read(&runtime, &caller, &thread_key).await?;
+    let session = runtime.session(&thread_key).await?;
+    let execution = runtime.latest_execution(&thread_key).await?;
+    Ok(Json(session_summary(session, execution)))
+}
+
+fn session_summary(session: Session, execution: Option<SessionExecution>) -> SessionSummary {
+    SessionSummary {
+        platform: thread_platform(&session.thread_key),
+        thread_key: session.thread_key,
+        title: session.title,
+        harness_type: session.harness_type,
+        status: session.status,
+        created_at: session.created_at,
+        updated_at: session.updated_at,
+        latest_execution: execution.map(|execution| ExecutionSummary {
+            execution_id: execution.execution_id,
+            status: execution.status,
+            error: execution.error,
+            created_at: execution.created_at,
+            started_at: execution.started_at,
+            completed_at: execution.completed_at,
+        }),
+    }
+}
+
+fn thread_platform(thread_key: &ThreadKey) -> String {
+    thread_key
+        .chat_destination()
+        .as_ref()
+        .map(ChatDestination::platform)
+        .unwrap_or("unknown")
+        .to_owned()
+}
+
 async fn get_session_context(
     State(state): State<AppState>,
     Extension(caller): Extension<AuthenticatedCaller>,
@@ -606,12 +701,8 @@ async fn get_session_context(
     let runtime = state.runtime()?;
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
     authorize_principal_session_read(&runtime, &caller, &thread_key).await?;
+    let platform = thread_platform(&thread_key);
     let destination = thread_key.chat_destination();
-    let platform = destination
-        .as_ref()
-        .map(ChatDestination::platform)
-        .unwrap_or("unknown")
-        .to_owned();
     let (slack, discord, linear, github) = match destination {
         Some(ChatDestination::Slack {
             channel_id,

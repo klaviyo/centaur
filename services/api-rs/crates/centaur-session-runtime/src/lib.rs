@@ -810,6 +810,44 @@ impl SessionRuntime {
         Ok(self.store.get_session(thread_key).await?)
     }
 
+    /// Sessions most recently updated first, each with its latest execution.
+    pub async fn list_sessions(
+        &self,
+        principal: Option<&str>,
+        thread_key_prefix: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<(Session, Option<SessionExecution>)>, SessionRuntimeError> {
+        let sessions = self
+            .store
+            .list_sessions(principal, thread_key_prefix, limit)
+            .await?;
+        let keys: Vec<ThreadKey> = sessions
+            .iter()
+            .map(|session| session.thread_key.clone())
+            .collect();
+        let mut latest: HashMap<ThreadKey, SessionExecution> = self
+            .store
+            .latest_executions_for_threads(&keys)
+            .await?
+            .into_iter()
+            .map(|execution| (execution.thread_key.clone(), execution))
+            .collect();
+        Ok(sessions
+            .into_iter()
+            .map(|session| {
+                let execution = latest.remove(&session.thread_key);
+                (session, execution)
+            })
+            .collect())
+    }
+
+    pub async fn latest_execution(
+        &self,
+        thread_key: &ThreadKey,
+    ) -> Result<Option<SessionExecution>, SessionRuntimeError> {
+        Ok(self.store.latest_execution_for_thread(thread_key).await?)
+    }
+
     fn resolve_stored_persona(
         &self,
         persona_id: Option<&str>,

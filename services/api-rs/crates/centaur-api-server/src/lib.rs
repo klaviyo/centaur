@@ -612,6 +612,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_reads_admit_owners_and_refuse_cross_thread_listing() {
+        let get = |uri: &str, token: Option<String>| {
+            let mut request = Request::builder().uri(uri);
+            if let Some(token) = token {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            request.body(Body::empty()).unwrap()
+        };
+        // An unready runtime answers 503, so 503 means the caller got past
+        // authorization and only the missing database stopped it.
+        for (uri, token, expected) in [
+            ("/api/sessions", None, StatusCode::UNAUTHORIZED),
+            (
+                "/api/sessions",
+                Some(user_token("prn_user")),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "/api/sessions?limit=5&thread_key_prefix=cli%3A",
+                Some(console_token()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "/api/sessions",
+                Some(principal_token("prn_sandbox")),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "/api/sessions",
+                Some("test-slackbot-key".to_owned()),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "/api/session/slack%3AC123%3A123.456/summary",
+                Some(user_token("prn_user")),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "/api/session/slack%3AC123%3A123.456/summary",
+                Some("test-slackbot-key".to_owned()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "/api/session/discord%3A123%3A456/summary",
+                Some("test-slackbot-key".to_owned()),
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let response = build_router_with_app_state(AppState::unready(test_auth_with_slack()))
+                .oneshot(get(uri, token.clone()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "GET {uri} as {token:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn whoami_describes_the_authenticated_caller() {
         for (token, expected) in [
             (

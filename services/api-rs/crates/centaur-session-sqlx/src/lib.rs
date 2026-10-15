@@ -236,6 +236,33 @@ impl PgSessionStore {
         row.try_into()
     }
 
+    /// Sessions most recently updated first, optionally only those bound to
+    /// `principal` or whose thread key starts with `thread_key_prefix`.
+    pub async fn list_sessions(
+        &self,
+        principal: Option<&str>,
+        thread_key_prefix: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<Session>, SessionStoreError> {
+        let rows = sqlx::query_as::<_, SessionRow>(
+            r#"
+            select thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            from sessions
+            where ($1::text is null or iron_control_principal = $1)
+              and ($2::text is null or starts_with(thread_key, $2))
+            order by updated_at desc, thread_key desc
+            limit $3
+            "#,
+        )
+        .bind(principal)
+        .bind(thread_key_prefix)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
     pub async fn get_session_title(
         &self,
         thread_key: &ThreadKey,
@@ -534,6 +561,32 @@ impl PgSessionStore {
                 })
             })
             .collect()
+    }
+
+    /// The latest execution of each listed thread, in one query. Threads with
+    /// no executions are absent from the result.
+    pub async fn latest_executions_for_threads(
+        &self,
+        thread_keys: &[ThreadKey],
+    ) -> Result<Vec<SessionExecution>, SessionStoreError> {
+        if thread_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<&str> = thread_keys.iter().map(ThreadKey::as_str).collect();
+        let rows = sqlx::query_as::<_, SessionExecutionRow>(
+            r#"
+            select distinct on (thread_key)
+                execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
+            from session_executions
+            where thread_key = any($1)
+            order by thread_key, created_at desc, execution_id desc
+            "#,
+        )
+        .bind(&keys)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
     }
 
     pub async fn latest_execution_for_thread(
@@ -2097,7 +2150,7 @@ mod tests {
         time::{Duration, UNIX_EPOCH},
     };
 
-    use centaur_session_core::{HarnessType, ThreadKey};
+    use centaur_session_core::{HarnessType, Session, ThreadKey};
     use serde_json::json;
     use time::{Duration as TimeDuration, OffsetDateTime};
     use uuid::Uuid;
@@ -2117,6 +2170,88 @@ mod tests {
             .await
             .expect("run migrations");
         Some(store)
+    }
+
+    #[tokio::test]
+    async fn lists_sessions_by_recency_owner_and_prefix_with_latest_executions() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let prefix = format!("test:list-{}:", Uuid::new_v4().simple());
+        let key = |name: &str| ThreadKey::parse(format!("{prefix}{name}")).unwrap();
+        let (a, b, c) = (key("a"), key("b"), key("c"));
+        for thread_key in [&a, &b, &c] {
+            store
+                .create_or_get_session(
+                    thread_key,
+                    &HarnessType::Codex,
+                    None,
+                    json!({}),
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        // Each update bumps updated_at, so the expected recency is a, b, c.
+        store
+            .set_iron_control_principal(&b, Some("prn_other"))
+            .await
+            .unwrap();
+        store
+            .set_iron_control_principal(&a, Some("prn_owner"))
+            .await
+            .unwrap();
+
+        let listed = |sessions: Vec<Session>| {
+            sessions
+                .into_iter()
+                .map(|session| session.thread_key)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            listed(store.list_sessions(None, Some(&prefix), 10).await.unwrap()),
+            vec![a.clone(), b.clone(), c.clone()]
+        );
+        assert_eq!(
+            listed(store.list_sessions(None, Some(&prefix), 2).await.unwrap()),
+            vec![a.clone(), b.clone()]
+        );
+        assert_eq!(
+            listed(
+                store
+                    .list_sessions(Some("prn_owner"), Some(&prefix), 10)
+                    .await
+                    .unwrap()
+            ),
+            vec![a.clone()]
+        );
+
+        let first = store
+            .create_execution(&a, Some("first"), json!({}))
+            .await
+            .unwrap();
+        store
+            .complete_execution(&first.execution.execution_id)
+            .await
+            .unwrap();
+        let second = store
+            .create_execution(&a, Some("second"), json!({}))
+            .await
+            .unwrap();
+        let latest = store
+            .latest_executions_for_threads(&[a.clone(), b.clone(), c.clone()])
+            .await
+            .unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].thread_key, a);
+        assert_eq!(latest[0].execution_id, second.execution.execution_id);
+        assert!(
+            store
+                .latest_executions_for_threads(&[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
