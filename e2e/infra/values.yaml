@@ -30,6 +30,12 @@ apiRs:
 proxySync:
   replicaCount: 1
 
+# Reached from the host through `kubectl port-forward svc/centaur-centaur-console
+# 3000:3000`, so browser OAuth flows (e.g. `centaur login`) see this origin.
+# api-rs advertises it as the authorization server, and Rails admits the host.
+console:
+  publicUrl: http://localhost:3000
+
 slackbotv2:
   extraEnv:
     SLACK_API_URL: http://fake-slack.centaur-e2e-slack.svc.cluster.local:443/api/

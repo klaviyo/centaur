@@ -2,6 +2,7 @@
 members = [
     "crates/centaur-api-server",
     "crates/centaur-api-types",
+    "crates/centaur-cli",
     "crates/centaur-iron-control",
     "crates/centaur-iron-proxy",
     "crates/centaur-perms",
