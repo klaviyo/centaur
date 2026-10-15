@@ -1,8 +1,8 @@
-<% content_for :title, "Authorize MCP Client · Centaur Console" %>
+<% content_for :title, "Authorize #{@api_access ? "Centaur CLI" : "MCP Client"} · Centaur Console" %>
 
 <div class="mb-8 text-center">
   <%= image_tag "centaur-lockup-white.svg", alt: "Centaur", class: "mx-auto h-9 w-auto", width: 497, height: 127 %>
-  <p class="page-subtitle mt-4">Authorize MCP access.</p>
+  <p class="page-subtitle mt-4"><%= @api_access ? "Authorize Centaur API access." : "Authorize MCP access." %></p>
 </div>
 
 <div class="rounded-xl border border-ink-600 bg-ink-850/60 p-6">

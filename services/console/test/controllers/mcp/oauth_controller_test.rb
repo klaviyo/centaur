@@ -337,16 +337,162 @@ module Mcp
       assert_equal 0, @operator.mcp_oauth_refresh_tokens.usable.count
     end
 
+    test "metadata advertises API scopes and token revocation" do
+      get "/.well-known/oauth-authorization-server"
+
+      body = JSON.parse(response.body)
+      assert_equal "http://www.example.com/mcp/oauth/revoke", body.fetch("revocation_endpoint")
+      assert_includes body.fetch("scopes_supported"), "mcp:tools"
+      assert_includes body.fetch("scopes_supported"), "sessions:read"
+      assert_equal "centaur-cli", body.fetch("centaur_cli_client_id")
+    end
+
+    test "dynamic client registration refuses API scopes" do
+      assert_no_difference -> { McpOauthClient.count } do
+        post "/mcp/oauth/register",
+             params: {
+               client_name: "Centaur CLI",
+               redirect_uris: [ "http://127.0.0.1/callback" ],
+               scope: "sessions:read"
+             },
+             as: :json
+      end
+
+      assert_response :bad_request
+      assert_equal "invalid_client_metadata", JSON.parse(response.body).fetch("error")
+    end
+
+    test "API scopes mint an api-rs user token instead of an MCP token" do
+      client = create_api_client
+      code = authorize_code(client, api_authorize_params(client))
+      stored_code = McpOauthAuthorizationCode.find_usable(code)
+      assert_equal "centaur-api", stored_code.resource
+
+      exchange_authorization_code(client, code)
+
+      assert_response :ok
+      body = JSON.parse(response.body)
+      assert_equal "sessions:read", body.fetch("scope")
+      claims = CentaurJwt::Hs256.decode(
+        body.fetch("access_token"),
+        signing_secret: "test-secret",
+        aud: "centaur-api",
+        iss: "centaur-console"
+      )
+      assert_equal stored_code.principal.oid, claims.fetch("sub")
+      assert_equal "user", claims.fetch("token_use")
+      assert_equal "sessions:read", claims.fetch("scope")
+      assert_equal @operator.oid, claims.fetch("user_id")
+      assert_equal client.public_client_id, claims.fetch("client_id")
+      assert_nil claims["capabilities"]
+
+      post "/mcp/oauth/token",
+           params: {
+             grant_type: "refresh_token",
+             client_id: client.public_client_id,
+             refresh_token: body.fetch("refresh_token")
+           }
+      assert_response :ok
+      refreshed = decode_jwt_payload(JSON.parse(response.body).fetch("access_token"))
+      assert_equal "user", refreshed.fetch("token_use")
+      assert_equal "centaur-api", refreshed.fetch("aud")
+    end
+
+    test "an API client that omits scope receives its registered API scopes" do
+      client = create_api_client
+      code = authorize_code(client, api_authorize_params(client).except(:scope))
+      assert_equal McpOauthClient::API_SCOPES, McpOauthAuthorizationCode.find_usable(code).scopes
+
+      exchange_authorization_code(client, code)
+
+      assert_response :ok
+      assert_equal "user", decode_jwt_payload(JSON.parse(response.body).fetch("access_token")).fetch("token_use")
+    end
+
+    test "authorize rejects API scopes combined with MCP scopes" do
+      client = create_api_client
+      post login_url, params: { email: @operator.email, password: "password123456" }
+
+      get "/mcp/oauth/authorize",
+          params: api_authorize_params(client).merge(scope: "sessions:read mcp:tools")
+
+      assert_response :redirect
+      query = Rack::Utils.parse_nested_query(URI.parse(response.location).query)
+      assert_equal "invalid_scope", query.fetch("error")
+    end
+
+    test "authorize rejects API scopes the client did not register for" do
+      client = create_client
+      post login_url, params: { email: @operator.email, password: "password123456" }
+
+      get "/mcp/oauth/authorize", params: api_authorize_params(client)
+
+      assert_response :redirect
+      query = Rack::Utils.parse_nested_query(URI.parse(response.location).query)
+      assert_equal "invalid_scope", query.fetch("error")
+    end
+
+    test "authorize rejects API scopes aimed at the MCP resource" do
+      client = create_api_client
+      post login_url, params: { email: @operator.email, password: "password123456" }
+
+      get "/mcp/oauth/authorize",
+          params: api_authorize_params(client).merge(resource: "http://localhost:3000/mcp")
+
+      assert_response :redirect
+      query = Rack::Utils.parse_nested_query(URI.parse(response.location).query)
+      assert_equal "invalid_target", query.fetch("error")
+    end
+
+    test "revocation retires the refresh token for its own client only" do
+      client = create_api_client
+      exchange_authorization_code(client, authorize_code(client, api_authorize_params(client)))
+      refresh_token = JSON.parse(response.body).fetch("refresh_token")
+      other = create_client
+
+      post "/mcp/oauth/revoke", params: { client_id: other.public_client_id, token: refresh_token }
+      assert_response :ok
+      assert McpOauthRefreshToken.find_usable(refresh_token)
+
+      post "/mcp/oauth/revoke", params: { client_id: client.public_client_id, token: refresh_token }
+      assert_response :ok
+      assert_nil McpOauthRefreshToken.find_usable(refresh_token)
+
+      post "/mcp/oauth/token",
+           params: {
+             grant_type: "refresh_token",
+             client_id: client.public_client_id,
+             refresh_token: refresh_token
+           }
+      assert_response :bad_request
+      assert_equal "invalid_grant", JSON.parse(response.body).fetch("error")
+    end
+
+    test "revocation succeeds for unknown tokens and rejects unknown clients" do
+      client = create_api_client
+
+      post "/mcp/oauth/revoke", params: { client_id: client.public_client_id, token: "mcprt_unknown" }
+      assert_response :ok
+
+      post "/mcp/oauth/revoke", params: { client_id: "moc_unknown", token: "mcprt_unknown" }
+      assert_response :unauthorized
+      assert_equal "invalid_client", JSON.parse(response.body).fetch("error")
+    end
+
     private
 
-    def create_client(redirect_uris: [ redirect_uri ])
+    def create_client(redirect_uris: [ redirect_uri ], scopes: McpOauthClient::DEFAULT_SCOPES)
       McpOauthClient.create!(
         name: "Amp",
         redirect_uris: redirect_uris,
         grant_types: McpOauthClient::DEFAULT_GRANT_TYPES,
         response_types: McpOauthClient::DEFAULT_RESPONSE_TYPES,
-        scopes: McpOauthClient::DEFAULT_SCOPES
+        scopes: scopes
       )
+    end
+
+    def create_api_client
+      McpOauthClient.centaur_cli
     end
 
     def authorize_params(client)
@@ -362,8 +508,11 @@ module Mcp
       }
     end
 
-    def authorize_code(client)
-      approval_params = authorize_params(client)
+    def api_authorize_params(client)
+      authorize_params(client).merge(scope: "sessions:read").except(:resource)
+    end
+
+    def authorize_code(client, approval_params = authorize_params(client))
       post login_url, params: { email: @operator.email, password: "password123456" }
 
       assert_no_difference -> { McpOauthAuthorizationCode.count } do

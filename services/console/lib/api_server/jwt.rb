@@ -52,6 +52,28 @@ module ApiServer
       )
     end
 
+    # Access token for a person signed in through Console OAuth (the `centaur`
+    # CLI). api-rs derives capabilities from `scope` alone and checks session
+    # ownership against `sub`, the same principal subject sandbox tokens use.
+    def encode_for_user(user:, principal:, scopes:, client_id:, ttl_seconds:, now: Time.current)
+      issued_at = now.to_i
+      payload = {
+        "iss" => issuer,
+        "sub" => principal.oid,
+        "aud" => audience,
+        "exp" => issued_at + ttl_seconds,
+        "nbf" => issued_at - 5,
+        "iat" => issued_at,
+        "jti" => "usrjwt_#{SecureRandom.hex(16)}",
+        "token_use" => "user",
+        "scope" => scopes.join(" "),
+        "client_id" => client_id,
+        "user_id" => user.oid,
+        "email" => user.email
+      }
+      CentaurJwt::Hs256.encode(payload, signing_secret: ENV["CENTAUR_JWT_SIGNING_SECRET"])
+    end
+
     # Kept for callers that reason about rotation boundaries directly
     # (snapshot staleness checks, tests).
     def window_start_for(principal, timestamp)

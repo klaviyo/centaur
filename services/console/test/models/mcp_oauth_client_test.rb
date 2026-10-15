@@ -60,4 +60,31 @@ class McpOauthClientTest < ActiveSupport::TestCase
     refute client.redirect_uri_allowed?("http://127.evil.com/callback")
     refute client.redirect_uri_allowed?("http://127.0.0.1.evil.com/callback")
   end
+
+  test "the CLI client is one shared row kept in step with the code" do
+    client = McpOauthClient.centaur_cli
+    client.update_columns(scopes: [], name: "stale")
+
+    assert_no_difference -> { McpOauthClient.count } do
+      assert_equal client, McpOauthClient.find_by_public_client_id("centaur-cli")
+    end
+    client.reload
+    assert_equal "centaur-cli", client.public_client_id
+    assert_equal McpOauthClient::API_SCOPES, client.scopes
+    assert_equal "Centaur CLI", client.name
+    assert client.redirect_uri_allowed?("http://127.0.0.1:49152/callback")
+  end
+
+  test "only the CLI client may hold API scopes" do
+    client = McpOauthClient.new(
+      name: "Lookalike CLI",
+      redirect_uris: [ "http://127.0.0.1/callback" ],
+      grant_types: McpOauthClient::DEFAULT_GRANT_TYPES,
+      response_types: McpOauthClient::DEFAULT_RESPONSE_TYPES,
+      scopes: McpOauthClient::API_SCOPES
+    )
+
+    refute client.valid?
+    assert_includes client.errors[:scopes], "may not include API scopes"
+  end
 end
