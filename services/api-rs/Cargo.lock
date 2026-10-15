@@ -450,14 +450,18 @@ name = "centaur-cli"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "centaur-api-client",
  "centaur-api-types",
+ "centaur-session-core",
  "clap",
  "eyre",
+ "futures-util",
  "reqwest",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
+ "time",
  "tokio",
  "toml",
  "url",
