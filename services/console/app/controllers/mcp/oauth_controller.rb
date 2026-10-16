@@ -6,9 +6,9 @@ module Mcp
   class OauthController < ApplicationController
     layout "auth"
 
-    skip_before_action :require_login, only: %i[metadata register authorize token]
-    skip_before_action :require_active_account, only: %i[metadata register authorize token]
-    skip_forgery_protection only: %i[register token]
+    skip_before_action :require_login, only: %i[metadata register authorize token revoke]
+    skip_before_action :require_active_account, only: %i[metadata register authorize token revoke]
+    skip_forgery_protection only: %i[register token revoke]
 
     ACCESS_TOKEN_TTL_SECONDS = 1.hour.to_i
 
@@ -19,12 +19,17 @@ module Mcp
         authorization_endpoint: URI.join(public_base_url, "/mcp/oauth/authorize").to_s,
         token_endpoint: URI.join(public_base_url, "/mcp/oauth/token").to_s,
         registration_endpoint: URI.join(public_base_url, "/mcp/oauth/register").to_s,
+        revocation_endpoint: URI.join(public_base_url, "/mcp/oauth/revoke").to_s,
         response_types_supported: [ "code" ],
         grant_types_supported: McpOauthClient::DEFAULT_GRANT_TYPES,
         code_challenge_methods_supported: [ "S256" ],
         token_endpoint_auth_methods_supported: [ "none" ],
-        scopes_supported: McpOauthClient::DEFAULT_SCOPES,
-        resource_parameter_supported: true
+        revocation_endpoint_auth_methods_supported: [ "none" ],
+        scopes_supported: McpOauthClient::SUPPORTED_SCOPES,
+        resource_parameter_supported: true,
+        # Not an RFC 8414 field: the `centaur` CLI logs in as this client
+        # rather than registering one.
+        centaur_cli_client_id: McpOauthClient::CENTAUR_CLI_CLIENT_ID
       }
     end
 
@@ -107,6 +112,18 @@ module Mcp
       end
     end
 
+    # POST /mcp/oauth/revoke (RFC 7009). Only refresh tokens are revocable;
+    # access tokens are short-lived JWTs. Unknown tokens succeed so callers
+    # cannot probe which tokens exist.
+    def revoke
+      client = resolve_client(params[:client_id])
+      return oauth_error(:invalid_client, "Unknown client.", status: :unauthorized) unless client
+
+      refresh = McpOauthRefreshToken.find_usable(params[:token])
+      refresh.revoke! if refresh&.mcp_oauth_client == client
+      head :ok
+    end
+
     private
 
     def validated_authorization_request
@@ -138,8 +155,12 @@ module Mcp
         return authorization_request_error(client, :invalid_request, "code_challenge is required.")
       end
 
-      scopes = normalize_scope_param(params[:scope], McpOauthClient::DEFAULT_SCOPES)
-      unsupported = scopes - McpOauthClient::DEFAULT_SCOPES
+      # An omitted scope means the client's registered scopes when those are
+      # API-only, so an API client is never handed an MCP token by default.
+      default_scopes =
+        McpOauthClient.api_scopes?(client.scopes) ? client.scopes : McpOauthClient::DEFAULT_SCOPES
+      scopes = normalize_scope_param(params[:scope], default_scopes)
+      unsupported = scopes - McpOauthClient::SUPPORTED_SCOPES
       if unsupported.any?
         return authorization_request_error(
           client,
@@ -148,7 +169,26 @@ module Mcp
         )
       end
 
-      resource = resolve_requested_resource
+      if (scopes & McpOauthClient::API_SCOPES).any?
+        unless McpOauthClient.api_scopes?(scopes)
+          return authorization_request_error(
+            client,
+            :invalid_scope,
+            "API scopes cannot be combined with MCP scopes."
+          )
+        end
+        unregistered = scopes - client.scopes
+        if unregistered.any?
+          return authorization_request_error(
+            client,
+            :invalid_scope,
+            "Client is not registered for scope: #{unregistered.join(' ')}."
+          )
+        end
+        resource = resolve_requested_api_resource
+      else
+        resource = resolve_requested_resource
+      end
       return authorization_request_error(client, :invalid_target, "resource is required.") if resource.blank?
 
       { client: client, scopes: scopes, resource: resource }
@@ -163,6 +203,7 @@ module Mcp
       @client = authorization[:client]
       @scopes = authorization[:scopes]
       @resource = authorization[:resource]
+      @api_access = McpOauthClient.api_scopes?(@scopes)
       @redirect_uri = params[:redirect_uri].to_s
       @redirect_host = redirect_uri_host(@redirect_uri)
       @authorization_params = authorization_form_params(authorization)
@@ -353,8 +394,32 @@ module Mcp
     end
 
     def render_token_response(client:, user:, principal:, resource:, scopes:, refresh_token:)
-      now = Time.current.to_i
       ttl = access_token_ttl_seconds
+      access_token =
+        if McpOauthClient.api_scopes?(scopes)
+          ApiServer::Jwt.encode_for_user(
+            user: user,
+            principal: principal,
+            scopes: scopes,
+            client_id: client.public_client_id,
+            ttl_seconds: ttl
+          )
+        else
+          mcp_access_token(client:, user:, principal:, resource:, scopes:, ttl:)
+        end
+      render json: {
+        access_token: access_token,
+        token_type: "Bearer",
+        expires_in: ttl,
+        scope: scopes.join(" "),
+        refresh_token: refresh_token
+      }
+    rescue KeyError => e
+      oauth_error(:server_error, e.message, status: :service_unavailable)
+    end
+
+    def mcp_access_token(client:, user:, principal:, resource:, scopes:, ttl:)
+      now = Time.current.to_i
       payload = {
         iss: public_base_url,
         sub: user.oid,
@@ -370,15 +435,7 @@ module Mcp
         email: user.email,
         name: user.name.presence || user.email
       }
-      render json: {
-        access_token: Mcp::Jwt.encode(payload),
-        token_type: "Bearer",
-        expires_in: ttl,
-        scope: scopes.join(" "),
-        refresh_token: refresh_token
-      }
-    rescue KeyError => e
-      oauth_error(:server_error, e.message, status: :service_unavailable)
+      Mcp::Jwt.encode(payload)
     end
 
     def redirect_to_login
@@ -405,7 +462,7 @@ module Mcp
     end
 
     def resolve_client(client_id)
-      McpOauthClient.find_by_oid(client_id)
+      McpOauthClient.find_by_public_client_id(client_id)
     end
 
     def resolve_requested_resource
@@ -416,6 +473,15 @@ module Mcp
       requested = params[:resource].presence
       return nil if requested.present? && normalize_mcp_resource_url(requested) != configured
       configured
+    end
+
+    # api-rs identifies itself by its JWT audience rather than a URL, so that
+    # is the only resource an API-scoped token can target.
+    def resolve_requested_api_resource
+      audience = ApiServer::Jwt.audience
+      requested = params[:resource].presence
+      return nil if requested.present? && requested != audience
+      audience
     end
 
     def configured_mcp_resource_url

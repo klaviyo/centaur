@@ -7,6 +7,42 @@ class McpOauthClient < ApplicationRecord
   DEFAULT_GRANT_TYPES = %w[authorization_code refresh_token].freeze
   DEFAULT_RESPONSE_TYPES = %w[code].freeze
   DEFAULT_SCOPES = %w[mcp:tools].freeze
+  # Scopes for api-rs user tokens (the `centaur` CLI). They mint a different
+  # token than MCP scopes, so a request may not combine the two.
+  API_SCOPES = %w[sessions:read sessions:write].freeze
+  SUPPORTED_SCOPES = (DEFAULT_SCOPES + API_SCOPES).freeze
+  # The `centaur` CLI is a built-in public client with this well-known ID, so
+  # every login shares one client instead of registering its own.
+  CENTAUR_CLI_CLIENT_ID = "centaur-cli"
+
+  def self.api_scopes?(scopes)
+    scopes.present? && (scopes - API_SCOPES).empty?
+  end
+
+  def self.find_by_public_client_id(value)
+    value == CENTAUR_CLI_CLIENT_ID ? centaur_cli : find_by_oid(value)
+  end
+
+  # The CLI's client, created on first use and kept in step with this code.
+  def self.centaur_cli
+    client = create_or_find_by!(first_party_key: CENTAUR_CLI_CLIENT_ID) do |record|
+      record.assign_attributes(centaur_cli_attributes)
+    end
+    client.assign_attributes(centaur_cli_attributes)
+    client.save! if client.changed?
+    client
+  end
+
+  def self.centaur_cli_attributes
+    {
+      name: "Centaur CLI",
+      # Loopback with no port: the CLI listens on any port (RFC 8252 §7.3).
+      redirect_uris: [ "http://127.0.0.1/callback" ],
+      grant_types: DEFAULT_GRANT_TYPES,
+      response_types: DEFAULT_RESPONSE_TYPES,
+      scopes: API_SCOPES
+    }
+  end
 
   has_many :authorization_codes, class_name: "McpOauthAuthorizationCode", dependent: :destroy
   has_many :refresh_tokens, class_name: "McpOauthRefreshToken", dependent: :destroy
@@ -16,8 +52,9 @@ class McpOauthClient < ApplicationRecord
   validate :grant_types_supported
   validate :response_types_supported
   validate :scopes_supported
+  validate :api_scopes_first_party_only
 
-  def public_client_id = oid
+  def public_client_id = first_party_key || oid
 
   def redirect_uri_allowed?(uri)
     return false unless self.class.allowed_redirect_uri?(uri)
@@ -60,8 +97,15 @@ class McpOauthClient < ApplicationRecord
 
   def scopes_supported
     return errors.add(:scopes, "must be an array") unless scopes.is_a?(Array)
-    unsupported = scopes - DEFAULT_SCOPES
+    unsupported = scopes - SUPPORTED_SCOPES
     errors.add(:scopes, "contains unsupported values: #{unsupported.join(', ')}") if unsupported.any?
+  end
+
+  # API scopes mint api-rs user tokens; only the built-in CLI client gets them,
+  # so a self-registered client cannot pose as the CLI on the consent screen.
+  def api_scopes_first_party_only
+    return if first_party_key.present? || !scopes.is_a?(Array)
+    errors.add(:scopes, "may not include API scopes") if (scopes & API_SCOPES).any?
   end
 
   def self.allowed_redirect_uri?(value)
