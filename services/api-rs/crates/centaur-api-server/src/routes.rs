@@ -43,6 +43,7 @@ use sqlx::PgPool;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tower_http::trace::TraceLayer;
 use tracing::Span;
+use uuid::Uuid;
 
 use crate::{
     ApiError,
@@ -211,7 +212,7 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             "/api/session/{thread_key}",
             post(create_or_get_session).get(get_session_context),
         )
-        .route("/api/sessions", get(list_sessions))
+        .route("/api/sessions", get(list_sessions).post(create_session))
         .route(
             "/api/session/{thread_key}/summary",
             get(get_session_summary),
@@ -485,7 +486,8 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
         | (&Method::GET, "/api/session/{thread_key}/events") => {
             capability(Capability::SessionsRead)
         }
-        (&Method::POST, "/api/session/{thread_key}")
+        (&Method::POST, "/api/sessions")
+        | (&Method::POST, "/api/session/{thread_key}")
         | (&Method::POST, "/api/session/{thread_key}/messages")
         | (&Method::POST, "/api/session/{thread_key}/execute")
         | (&Method::POST, "/api/session/{thread_key}/interrupt") => {
@@ -604,6 +606,47 @@ async fn whoami(Extension(caller): Extension<AuthenticatedCaller>) -> Json<Whoam
             .map(|capability| capability.as_str().to_owned())
             .collect(),
     })
+}
+
+/// Thread-key family for sessions whose key the server generates. These
+/// threads have no chat destination.
+const GENERATED_THREAD_KEY_PREFIX: &str = "api:";
+
+/// Creates a session under a thread key the server generates, so the caller
+/// never chooses it. Chat ingresses, which address threads by their
+/// platform's own IDs, keep using `POST /api/session/{thread_key}`.
+async fn create_session(
+    State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
+    Json(request): Json<CreateSessionRequest>,
+) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
+    if caller.platform_prefixes().is_some() {
+        return Err(ApiError::Forbidden(
+            "ingress callers create sessions under their platform's thread keys".to_owned(),
+        ));
+    }
+    let runtime = state.runtime()?;
+    let thread_key = ThreadKey::parse(format!(
+        "{GENERATED_THREAD_KEY_PREFIX}{}",
+        Uuid::new_v4().simple()
+    ))?;
+    let outcome = runtime
+        .create_or_get_admitted_session(
+            &thread_key,
+            &request.harness_type,
+            request.persona_id.as_deref(),
+            request.metadata,
+            HarnessConflictPolicy::Reject,
+        )
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateSessionResponse {
+            session: outcome.session,
+            harness_switched: outcome.harness_switched,
+            unavailable_requested_persona_id: outcome.unavailable_requested_persona_id,
+        }),
+    ))
 }
 
 const DEFAULT_SESSION_LIST_LIMIT: u32 = 50;

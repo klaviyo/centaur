@@ -611,6 +611,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generated_key_session_creation_is_a_write_outside_ingress() {
+        let create = |token: Option<String>| {
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri("/api/sessions")
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(token) = token {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            request
+                .body(Body::from(r#"{"harness_type":"codex"}"#))
+                .unwrap()
+        };
+        // 503: authorized, and only the unready runtime stopped the create.
+        for (token, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some(console_token()), StatusCode::SERVICE_UNAVAILABLE),
+            (Some(user_token("prn_user")), StatusCode::FORBIDDEN),
+            (Some(principal_token("prn_sandbox")), StatusCode::FORBIDDEN),
+            (Some("test-slackbot-key".to_owned()), StatusCode::FORBIDDEN),
+        ] {
+            let response = build_router_with_app_state(AppState::unready(test_auth_with_slack()))
+                .oneshot(create(token.clone()))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                expected,
+                "POST /api/sessions as {token:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn session_reads_admit_owners_and_refuse_cross_thread_listing() {
         let get = |uri: &str, token: Option<String>| {
             let mut request = Request::builder().uri(uri);

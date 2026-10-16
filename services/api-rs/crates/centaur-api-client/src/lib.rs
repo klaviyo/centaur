@@ -83,6 +83,16 @@ impl CentaurClient {
         .await
     }
 
+    /// Creates a session under a thread key the server generates; the key is
+    /// in the response.
+    pub async fn create_session_with_generated_key(
+        &self,
+        request: CreateSessionRequest,
+    ) -> Result<CreateSessionResponse, ClientError> {
+        self.post_json(&format!("{}/api/sessions", self.base_url), &request)
+            .await
+    }
+
     /// Sessions most recently updated first; see `GET /api/sessions`.
     pub async fn list_sessions(
         &self,
