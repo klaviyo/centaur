@@ -23,7 +23,13 @@ pub(crate) async fn build_config(
     principal_id: i64,
     now: i64,
 ) -> Result<Config, ApiError> {
-    let loaded = load_credentials(&state.pool, principal_id, proxy.requester_principal_id).await?;
+    let loaded = load_credentials(
+        &state.pool,
+        principal_id,
+        proxy.requester_principal_id,
+        state.runlayer_resource_url.as_deref(),
+    )
+    .await?;
     let mut credentials = Vec::with_capacity(loaded.len());
     for credential in loaded {
         let deliverable = if credential.kind == CredentialKind::Static {

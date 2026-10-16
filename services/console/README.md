@@ -137,3 +137,20 @@ Rotating any of these keys makes previously encrypted data unreadable. Treat the
 `iron-control` exposes a JSON API under `/api/v1`. All resource endpoints authenticate with an API key sent as a bearer token (`Authorization: Bearer iak_...`); the one exception is `POST /api/v1/proxy/sync`, which `iron-proxy` instances call with a proxy bearer token.
 
 See [docs/API.md](docs/API.md) for the full reference: authentication, request/response conventions, pagination, error formats, the shared secret-source and request-rule shapes, and detailed payloads for every endpoint (static secrets, GCP auth secrets, OAuth token secrets, principals, roles, grants, API keys, proxies, and proxy sync).
+
+## Personal Runlayer connections
+
+Set `RUNLAYER_MCP_URL` in the Console web and worker environments to the exact
+HTTPS unified Plugin MCP URL. Use the same value for proxy-sync and sandboxes.
+The Integrations preset registers the OAuth client using this deployment
+configuration; there is no URL-entry field. Each user authorizes their own
+account, and Console stores and refreshes its tokens in the encrypted broker.
+Verified Slack SSO identities link those connections to Slack requester principals.
+Runlayer always uses the requester's own connection in DMs and channels. Shared
+accounts, email fallback and shared-role grants are rejected; personal
+availability is fixed rather than selectable.
+
+See [the Runlayer tool guide](../../tools/infra/runlayer/README.md) for client
+registration, callback URLs, endpoint configuration, token lifecycle and rollout
+checks. The deployed Rust proxy-sync service and Console's fallback sync path
+both enforce requester ownership and current credential eligibility.
