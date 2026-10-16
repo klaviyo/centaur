@@ -136,8 +136,7 @@ SMOKE
 
 COPY --chown=1001:1001 services/klaviyo-sandbox/pip.conf /home/agent/.pip/pip.conf
 
-# Configure matching Artifactory replacements and grants in iron-control
-# using configure_artifactory.py. The image contains only placeholders.
+# Iron-proxy replaces the pip.conf placeholders on JFrog package requests.
 # Docker-dependent tests still need a separately provided Docker daemon;
 # service integration tests need their databases and other dependencies.
 # ENTRYPOINT and CMD are inherited from the Centaur image.
