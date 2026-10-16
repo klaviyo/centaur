@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG CENTAUR_IMAGE=ghcr.io/paradigmxyz/centaur/centaur-agent:main-sha-445b3db@sha256:66797840d63ac7f3e673415a650f90f9f5da52cb1257ac6a62c328ffe7d8a17b
+ARG CENTAUR_IMAGE=klaviyo-centaur-agent:local
 ARG GO_VERSION=1.25.3
 ARG UV_VERSION=0.10.2
 
@@ -92,7 +92,7 @@ RUN --mount=type=cache,target=/root/go/pkg/mod \
     && GOBIN=/usr/local/bin go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.1 \
     && GOBIN=/usr/local/bin go install github.com/favadi/protoc-go-inject-tag@v1.4.0 \
     && GOBIN=/usr/local/bin go install honnef.co/go/tools/cmd/staticcheck@2025.1.1 \
-    && GOBIN=/usr/local/bin go install gotest.tools/gotestsum@v1.12.1
+    && GOBIN=/usr/local/bin go install gotest.tools/gotestsum@v1.13.0
 
 USER agent
 WORKDIR /home/agent
@@ -132,8 +132,10 @@ python3.10 -m venv "$smoke/venv"
 "$smoke/venv/bin/python" -m pip --version
 SMOKE
 
-# At runtime mount ~/.pip/pip.conf for the agent user: k-repo's
-# .pants.bootstrap reads it to configure Python and Go Artifactory access.
+# Runtime setup must still provide /home/agent/.pip/pip.conf for k-repo's
+# .pants.bootstrap. This image does not configure private package access.
+# Supply proxy-compatible configuration through the sandbox runtime;
+# keep real Artifactory credentials outside the image and sandbox.
 # Docker-dependent tests still need a separately provided Docker daemon;
 # service integration tests need their databases and other dependencies.
 # ENTRYPOINT and CMD are inherited from the Centaur image.
