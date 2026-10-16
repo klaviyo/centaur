@@ -98,8 +98,6 @@ RUN --mount=type=cache,target=/root/go/pkg/mod \
 USER agent
 WORKDIR /home/agent
 
-COPY --chown=1001:1001 services/klaviyo-sandbox/pip.conf /home/agent/.pip/pip.conf
-
 ENV GOPATH=/home/agent/go \
     GOCACHE=/home/agent/.cache/go-build \
     GOMODCACHE=/home/agent/go/pkg/mod \
@@ -135,6 +133,8 @@ CGO_ENABLED=1 go build -o "$smoke/cgo-smoke" "$smoke/main.go"
 python3.10 -m venv "$smoke/venv"
 "$smoke/venv/bin/python" -m pip --version
 SMOKE
+
+COPY --chown=1001:1001 services/klaviyo-sandbox/pip.conf /home/agent/.pip/pip.conf
 
 # Configure matching Artifactory replacements and grants in iron-control
 # using configure_artifactory.py. The image contains only placeholders.
