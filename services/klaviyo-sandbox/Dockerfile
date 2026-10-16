@@ -107,7 +107,7 @@ RUN mkdir -p /home/agent/go /home/agent/.cache/go-build \
     && bootstrap="$(mktemp -d)" \
     && printf '[GLOBAL]\npants_version = "%s"\n[anonymous-telemetry]\nenabled = false\n' \
          "${PANTS_VERSION}" > "${bootstrap}/pants.toml" \
-    && (cd "${bootstrap}" && pants --version) \
+    && (cd "${bootstrap}" && env -u PANTS_ENVIRONMENTS_PREVIEW_NAMES pants --version) \
     && rm -rf "${bootstrap}"
 
 RUN <<'SMOKE'
