@@ -93,6 +93,24 @@ mod tests {
         .unwrap()
     }
 
+    fn scoped_user_token(subject: &str, scope: &str, console_admin: bool) -> String {
+        encode(
+            &Header::new(Algorithm::HS256),
+            &json!({
+                "iss": "centaur-console",
+                "sub": subject,
+                "aud": "centaur-api",
+                "iat": 1_700_000_000i64,
+                "exp": 4_102_444_800i64,
+                "token_use": "user",
+                "scope": scope,
+                "console_admin": console_admin,
+            }),
+            &EncodingKey::from_secret(b"test-secret"),
+        )
+        .unwrap()
+    }
+
     fn principal_token(subject: &str) -> String {
         encode(
             &Header::new(Algorithm::HS256),
@@ -702,6 +720,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_write_scope_reaches_session_writes_but_not_operator_routes() {
+        let writer = scoped_user_token("prn_user", "sessions:read sessions:write", false);
+        let reader = scoped_user_token("prn_user", "sessions:read", true);
+        let request = |method: Method, uri: &str, token: &str| {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"harness_type":"codex","messages":[]}"#))
+                .unwrap()
+        };
+        // 503 means the route admitted the caller and only the unready
+        // runtime stopped it; ownership is then decided against the session.
+        for (method, uri, token, expected) in [
+            (
+                Method::POST,
+                "/api/sessions",
+                &writer,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                Method::POST,
+                "/api/session/api%3Amine",
+                &writer,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                Method::POST,
+                "/api/session/api%3Amine/messages",
+                &writer,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                Method::POST,
+                "/api/session/api%3Amine/execute",
+                &writer,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                Method::POST,
+                "/api/session/api%3Amine/interrupt",
+                &writer,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            // Admin status widens which sessions a scope reaches, never the scopes.
+            (
+                Method::POST,
+                "/api/sessions",
+                &reader,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Method::POST,
+                "/api/session/api%3Amine/messages",
+                &reader,
+                StatusCode::FORBIDDEN,
+            ),
+            // Pausing sandboxes stays an operator capability.
+            (
+                Method::POST,
+                "/api/session/api%3Amine/pause",
+                &writer,
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let response = build_router_with_app_state(AppState::unready(test_auth()))
+                .oneshot(request(method.clone(), uri, token))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{method} {uri}");
+        }
+    }
+
+    #[tokio::test]
     async fn whoami_describes_the_authenticated_caller() {
         for (token, expected) in [
             (
@@ -710,6 +803,15 @@ mod tests {
                     "class": "user",
                     "principal": "prn_user",
                     "capabilities": ["sessions_read"],
+                }),
+            ),
+            (
+                scoped_user_token("prn_admin", "sessions:read sessions:write", true),
+                json!({
+                    "class": "user",
+                    "principal": "prn_admin",
+                    "capabilities": ["sessions_read", "sessions_write"],
+                    "console_admin": true,
                 }),
             ),
             (
