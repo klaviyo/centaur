@@ -30,6 +30,8 @@ class OauthApp < ApplicationRecord
 
   encrypts :client_secret
 
+  before_validation :normalize_runlayer_resource
+
   # The slug is the app's whole identity: globally unique and URL-safe. It both
   # addresses the app in the API (oid or slug) and names the consent links, so it
   # must not start with the opaque-id prefix or the two forms would collide.
@@ -42,10 +44,14 @@ class OauthApp < ApplicationRecord
   validate :labels_is_a_hash
   validate :allowed_scopes_valid
   validate :shared_configuration_valid
+  validate :runlayer_configuration_valid
 
   # The provider strategy backing this app, or nil if the provider column somehow
   # holds an unknown key (the inclusion validation normally prevents that).
-  def provider_strategy = Oauth::Providers.fetch(provider)
+  def provider_strategy
+    strategy = Oauth::Providers.fetch(provider)
+    strategy.respond_to?(:for_app) ? strategy.for_app(self) : strategy
+  end
 
   # True when every requested scope is within the allowlist.
   def scopes_allowed?(requested) = (Array(requested) - Array(allowed_scopes)).empty?
@@ -59,10 +65,27 @@ class OauthApp < ApplicationRecord
   end
 
   def credential_needs_reconnect?(credential)
+    if provider == "runlayer" && !provider_strategy.credential_resource_matches?(credential)
+      return true
+    end
+
     credential.dead? || (required_scopes - Array(credential.scopes)).any?
   end
 
   private
+
+  def normalize_runlayer_resource
+    return unless provider == Oauth::Providers::Runlayer::KEY && provider_strategy.configured?
+
+    self.labels = labels.merge("mcp_url" => provider_strategy.resource_url)
+  end
+
+  def runlayer_configuration_valid
+    return unless provider == Oauth::Providers::Runlayer::KEY
+
+    errors.add(:shared, "must be false for personal Runlayer connections") if shared?
+    errors.add(:labels, "must include an exact HTTPS Runlayer MCP URL as mcp_url") if enabled? && !provider_strategy.configured?
+  end
 
   def shared_configuration_valid
     errors.add(:shared, "cannot be changed after creation") if persisted? && will_save_change_to_shared?

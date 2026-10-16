@@ -31,12 +31,12 @@ class PrincipalSyncConfigSnapshot < ApplicationRecord
     }
   end
 
-  def self.config_for(principal)
+  def self.config_for(principal, proxy: nil)
     served = served_credentials_for(principal)
     {
       "secrets" => proxy_secrets_for(served) + generated_proxy_secrets_for(principal),
       "transforms" => proxy_transforms_for(served),
-      "postgres" => sync_postgres_for(principal)
+      "postgres" => sync_postgres_for(principal, proxy: proxy)
     }
   end
 
@@ -176,7 +176,7 @@ class PrincipalSyncConfigSnapshot < ApplicationRecord
     # closed with the empty config instead of serving hoisted secrets alone.
     return rendered_principal_config_for_proxy(proxy) unless principal
 
-    served = served_credentials_for(principal, extra_static: requester_hoisted_statics_for(proxy.requester_principal))
+    served = served_credentials_for(principal, extra_static: requester_hoisted_statics_for(proxy.requester_principal), requester: proxy.requester_principal)
     {
       "secrets" => proxy_secrets_for(served) + generated_proxy_secrets_for(principal),
       "transforms" => proxy_transforms_for(served),
@@ -200,6 +200,12 @@ class PrincipalSyncConfigSnapshot < ApplicationRecord
   def self.rendered_principal_config_for_proxy(proxy)
     principal = proxy.principal
     return Principal::EMPTY_CONFIG.deep_dup unless principal
+
+    # Personal OAuth expiry and owner/app disablement must be checked on each
+    # sync, including DMs that have no separate requester binding.
+    if principal.grants.joins(static_secret: { broker_credential: :oauth_app }).where(oauth_apps: { provider: "runlayer" }).exists?
+      return config_for(principal, proxy: proxy)
+    end
 
     snapshot = fetch_for(principal)
     copy = snapshot.config.deep_dup
@@ -327,9 +333,16 @@ class PrincipalSyncConfigSnapshot < ApplicationRecord
   # are dropped first (the proxy can't resolve a value for them) so a
   # non-deliverable winner never suppresses a credential that would otherwise
   # serve.
-  def self.served_credentials_for(principal, extra_static: [])
+  def self.served_credentials_for(principal, extra_static: [], requester: nil)
     static = principal.granted_static_secrets.select { |ss| ss.source&.deliverable? }
     static = merge_static_credentials(static, extra_static) if extra_static.any?
+    actor = requester || principal
+    reconciliation = PrincipalCredentialReconciliation.new
+    static.select! do |secret|
+      credential = secret.broker_credential
+      credential&.oauth_app&.provider != "runlayer" ||
+        (reconciliation.runlayer_owner?(actor, credential) && actor.grants.exists?(static_secret: secret))
+    end
     gcp_auth = principal.granted_gcp_auth_secrets.to_a
     gcp_id_token = principal.granted_gcp_id_token_secrets.to_a
     aws_auth = principal.granted_aws_auth_secrets.to_a

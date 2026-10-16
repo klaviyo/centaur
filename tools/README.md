@@ -92,3 +92,7 @@ SESSION_SANDBOX_PASSTHROUGH_ENV=TOOLS_PATH,TOOLS_OVERLAY_PATH
 
 The repo-cache is responsible for syncing `acme/centaur-overlay`; sandbox
 startup only points `centaur-tools` at the already-mounted source tree.
+
+- `runlayer`: discover and call the current requester's Runlayer Plugin tools
+  through a personal OAuth connection configured in Console Integrations.
+  See [configuration and consent](infra/runlayer/README.md).
