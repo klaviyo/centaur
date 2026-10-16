@@ -40,6 +40,11 @@ steps:
         command: |
           docker build --platform linux/amd64 --target sandbox --build-arg RUST_BUILD_PROFILE=release -f services/sandbox/Dockerfile -t 340433579684.dkr.ecr.us-east-1.amazonaws.com/klaviyo-centaur-agent:${BUILDKITE_COMMIT} .
 
+      - label: "Build Klaviyo sandbox (AMD64)"
+        timeout_in_minutes: 120
+        command: |
+          docker build --platform linux/amd64 -f services/klaviyo-sandbox/Dockerfile -t 340433579684.dkr.ecr.us-east-1.amazonaws.com/klaviyo-centaur-sandbox:${BUILDKITE_COMMIT} .
+
       - label: "Build iron-proxy (AMD64)"
         timeout_in_minutes: 120
         command: |
@@ -83,6 +88,11 @@ steps:
         timeout_in_minutes: 120
         command: |
           kbc docker-utils build-and-publish -f services/sandbox/Dockerfile --target sandbox -i klaviyo-centaur-agent -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
+
+      - label: "Publish Klaviyo sandbox (AMD64)"
+        timeout_in_minutes: 120
+        command: |
+          kbc docker-utils build-and-publish -f services/klaviyo-sandbox/Dockerfile -i klaviyo-centaur-sandbox -t ${BUILDKITE_COMMIT} -a eng -a dev
 
       - label: "Publish iron-proxy (AMD64)"
         timeout_in_minutes: 120
