@@ -16,7 +16,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use url::Url;
 use uuid::Uuid;
 
-use crate::{ThreadsCommand, TurnArgs, auth};
+use crate::{ThreadsCommand, TurnArgs, auth, oauth};
 
 /// Identifies this client in session and message metadata.
 const SOURCE: &str = "centaur-cli";
@@ -31,6 +31,13 @@ pub(crate) async fn run(
     command: ThreadsCommand,
 ) -> Result<()> {
     let credentials = auth::resolve_credentials(http, profile, api_url).await?;
+    let writes = matches!(
+        command,
+        ThreadsCommand::New { .. } | ThreadsCommand::Send { .. } | ThreadsCommand::Interrupt { .. }
+    );
+    if writes && credentials.login_lacks_scope(oauth::WRITE_SCOPE) {
+        bail!("your login can only read threads; run `centaur login` again to get write access");
+    }
     let client =
         CentaurClient::with_bearer_token(credentials.api_url.as_str(), &credentials.access_token)
             .wrap_err("configure API client")?;
@@ -41,11 +48,7 @@ pub(crate) async fn run(
             json,
         } => list(&client, prefix, limit, json).await,
         ThreadsCommand::Show { thread_key, json } => show(&client, &thread_key, json).await,
-        ThreadsCommand::New {
-            thread_key,
-            harness,
-            turn,
-        } => new(&client, thread_key, harness, turn).await,
+        ThreadsCommand::New { harness, turn } => new(&client, harness, turn).await,
         ThreadsCommand::Send { thread_key, turn } => {
             let message = turn_message(turn.message.clone(), true)?
                 .ok_or_else(|| eyre!("pass a message or pipe one on stdin"))?;
@@ -167,31 +170,19 @@ fn print_summary(summary: &SessionSummary) {
     }
 }
 
-async fn new(
-    client: &CentaurClient,
-    thread_key: Option<ThreadKey>,
-    harness: HarnessType,
-    turn: TurnArgs,
-) -> Result<()> {
-    let thread_key = match thread_key {
-        Some(thread_key) => thread_key,
-        None => ThreadKey::parse(format!("cli:{}", Uuid::new_v4().simple()))?,
-    };
+async fn new(client: &CentaurClient, harness: HarnessType, turn: TurnArgs) -> Result<()> {
     // Resolve the message first so a bad one does not leave an empty thread.
     let message = turn_message(turn.message.clone(), false)?;
     if message.is_none() && turn.wait {
         bail!("--wait needs a message to start a turn");
     }
     let created = client
-        .create_session(
-            &thread_key,
-            CreateSessionRequest {
-                harness_type: harness,
-                persona_id: None,
-                metadata: Some(json!({ "source": SOURCE })),
-                on_harness_conflict: None,
-            },
-        )
+        .create_session_with_generated_key(CreateSessionRequest {
+            harness_type: harness,
+            persona_id: None,
+            metadata: Some(json!({ "source": SOURCE })),
+            on_harness_conflict: None,
+        })
         .await
         .map_err(api_error)?;
     let Some(message) = message else {
@@ -202,12 +193,13 @@ async fn new(
         println!("{}", created.session.thread_key);
         return Ok(());
     };
+    let thread_key = created.session.thread_key;
     if turn.json || turn.wait {
         // stdout belongs to the execution JSON or the turn's NDJSON, both of
         // which identify the thread.
-        eprintln!("Created {}.", created.session.thread_key);
+        eprintln!("Created {thread_key}.");
     } else {
-        println!("{}", created.session.thread_key);
+        println!("{thread_key}");
     }
     send(client, &thread_key, &message, &turn).await
 }

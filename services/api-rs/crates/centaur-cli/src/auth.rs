@@ -117,6 +117,7 @@ pub(crate) async fn whoami(
                 "principal": identity.principal,
                 "email": token_claim(&target.access_token, "email"),
                 "capabilities": identity.capabilities,
+                "console_admin": identity.console_admin,
             }))?
         );
         return Ok(());
@@ -138,6 +139,9 @@ pub(crate) async fn whoami(
             identity.capabilities.join(", ")
         }
     );
+    if identity.console_admin {
+        println!("Console admin: yes (reaches every thread)");
+    }
     println!("Credentials:  {}", target.source);
     Ok(())
 }
@@ -167,12 +171,24 @@ async fn fetch_whoami(
         .wrap_err_with(|| format!("GET {url} returned invalid JSON"))
 }
 
+const STORED_LOGIN: &str = "stored login";
+
 /// The credentials a command runs with.
 pub(crate) struct Credentials {
     pub(crate) api_url: Url,
     pub(crate) access_token: String,
     /// Where the token came from, for display. Never the token itself.
     pub(crate) source: &'static str,
+}
+
+impl Credentials {
+    /// Whether a stored login lacks `scope`. Static tokens are opaque here,
+    /// so only api-rs can say what they allow.
+    pub(crate) fn login_lacks_scope(&self, scope: &str) -> bool {
+        self.source == STORED_LOGIN
+            && !token_claim(&self.access_token, "scope")
+                .is_some_and(|scopes| scopes.split_whitespace().any(|granted| granted == scope))
+    }
 }
 
 /// `CENTAUR_API_TOKEN` wins so operators and tests can use static keys;
@@ -217,7 +233,7 @@ pub(crate) async fn resolve_credentials(
             return Ok(Credentials {
                 api_url: profile_url,
                 access_token: profile.access_token.clone(),
-                source: "stored login",
+                source: STORED_LOGIN,
             });
         }
         if lock.is_none() {
@@ -242,7 +258,7 @@ pub(crate) async fn resolve_credentials(
                 Ok(Credentials {
                     api_url: profile_url,
                     access_token: tokens.access_token,
-                    source: "stored login",
+                    source: STORED_LOGIN,
                 })
             }
             // The profile stays so `centaur login` can reuse its API URL.
@@ -273,6 +289,27 @@ fn token_claim(token: &str, claim: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spots_stored_logins_that_predate_write_access() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let credentials = |scope: &str, source: &'static str| Credentials {
+            api_url: Url::parse("https://api.example.com").unwrap(),
+            access_token: format!(
+                "e30.{}.sig",
+                URL_SAFE_NO_PAD.encode(serde_json::json!({ "scope": scope }).to_string())
+            ),
+            source,
+        };
+        assert!(credentials("sessions:read", STORED_LOGIN).login_lacks_scope("sessions:write"));
+        assert!(
+            !credentials("sessions:read sessions:write", STORED_LOGIN)
+                .login_lacks_scope("sessions:write")
+        );
+        // Static keys are opaque; api-rs decides what they may do.
+        assert!(!credentials("", "CENTAUR_API_TOKEN").login_lacks_scope("sessions:write"));
+    }
 
     #[test]
     fn reads_display_claims_without_trusting_them() {

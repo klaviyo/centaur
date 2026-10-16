@@ -16,7 +16,10 @@ use tokio::{
 use url::Url;
 use uuid::Uuid;
 
-pub(crate) const SCOPE: &str = "sessions:read";
+const READ_SCOPE: &str = "sessions:read";
+/// Requested whenever the console offers it; a console without it still
+/// grants a read-only login.
+pub(crate) const WRITE_SCOPE: &str = "sessions:write";
 /// Console matches loopback redirects on host and path and lets the port vary
 /// (RFC 8252 §7.3), so its CLI client covers every ephemeral port.
 const REDIRECT_PATH: &str = "/callback";
@@ -34,6 +37,21 @@ pub(crate) struct AuthorizationServer {
     scopes_supported: Vec<String>,
     /// Console's built-in public client for this CLI, shared by every login.
     pub(crate) centaur_cli_client_id: Option<String>,
+}
+
+impl AuthorizationServer {
+    /// The space-delimited scopes this CLI asks for at this server.
+    fn requested_scope(&self) -> String {
+        let mut scopes = vec![READ_SCOPE];
+        if self
+            .scopes_supported
+            .iter()
+            .any(|scope| scope == WRITE_SCOPE)
+        {
+            scopes.push(WRITE_SCOPE);
+        }
+        scopes.join(" ")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,8 +127,12 @@ pub(crate) async fn discover(
         };
     let metadata_url = issuer.join("/.well-known/oauth-authorization-server")?;
     let server: AuthorizationServer = get_json(http, &metadata_url).await?;
-    if !server.scopes_supported.iter().any(|scope| scope == SCOPE) {
-        bail!("{issuer} does not offer the {SCOPE} scope; upgrade Console");
+    if !server
+        .scopes_supported
+        .iter()
+        .any(|scope| scope == READ_SCOPE)
+    {
+        bail!("{issuer} does not offer the {READ_SCOPE} scope; upgrade Console");
     }
     Ok(server)
 }
@@ -156,7 +178,7 @@ pub(crate) async fn authorize(
         .append_pair("response_type", "code")
         .append_pair("client_id", client_id)
         .append_pair("redirect_uri", &redirect_uri)
-        .append_pair("scope", SCOPE)
+        .append_pair("scope", &server.requested_scope())
         .append_pair("state", &state)
         .append_pair("code_challenge", &code_challenge(&verifier))
         .append_pair("code_challenge_method", "S256");
@@ -409,6 +431,25 @@ pub(crate) fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requests_write_access_only_where_offered() {
+        let server = |scopes: &[&str]| AuthorizationServer {
+            authorization_endpoint: String::new(),
+            token_endpoint: String::new(),
+            centaur_cli_client_id: None,
+            revocation_endpoint: None,
+            scopes_supported: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+        };
+        assert_eq!(
+            server(&["mcp:tools", "sessions:read", "sessions:write"]).requested_scope(),
+            "sessions:read sessions:write"
+        );
+        assert_eq!(
+            server(&["sessions:read"]).requested_scope(),
+            "sessions:read"
+        );
+    }
 
     #[test]
     fn code_challenge_matches_rfc_7636_appendix_b() {
