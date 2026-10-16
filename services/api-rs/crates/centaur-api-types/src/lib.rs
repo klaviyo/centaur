@@ -204,6 +204,19 @@ impl From<&str> for SessionEventName {
     }
 }
 
+/// `GET /api/auth/whoami`. Class and capability names are strings rather than
+/// enums so a client keeps working when the server adds new ones.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WhoamiResponse {
+    pub class: String,
+    /// The principal ID ownership checks compare against, when the caller has
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
 /// `GET /.well-known/oauth-protected-resource` (RFC 9728).
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProtectedResourceMetadata {
@@ -221,6 +234,25 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn whoami_tolerates_missing_optionals_and_new_fields() {
+        let whoami: WhoamiResponse = serde_json::from_value(json!({
+            "class": "admin",
+            "capabilities": ["sessions_read", "capability_from_the_future"],
+            "field_from_the_future": true,
+        }))
+        .unwrap();
+        assert_eq!(whoami.class, "admin");
+        assert_eq!(whoami.principal, None);
+        assert_eq!(whoami.capabilities.len(), 2);
+        assert!(
+            serde_json::to_value(&whoami)
+                .unwrap()
+                .get("principal")
+                .is_none()
+        );
+    }
 
     #[test]
     fn protected_resource_metadata_defaults_missing_lists() {
