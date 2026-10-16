@@ -4,10 +4,12 @@
 //! clients such as the `centaur` CLI can depend on it cheaply.
 
 use centaur_session_core::{
-    HarnessType, SESSION_OUTPUT_LINE_EVENT, Session, SessionMessageInput, ThreadKey,
+    ExecutionStatus, HarnessType, SESSION_OUTPUT_LINE_EVENT, Session, SessionMessageInput,
+    SessionStatus, ThreadKey,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CreateSessionRequest {
@@ -215,6 +217,64 @@ pub struct WhoamiResponse {
     pub principal: Option<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
+}
+
+/// `GET /api/sessions` query. The server clamps `limit` to its maximum.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ListSessionsQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Only sessions whose thread key starts with this, e.g. `slack:` or `cli:`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_key_prefix: Option<String>,
+}
+
+/// `GET /api/sessions`: most recently updated first. Admin and Console callers
+/// see every session; user callers see the sessions bound to their principal.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ListSessionsResponse {
+    pub sessions: Vec<SessionSummary>,
+}
+
+/// One session as `GET /api/sessions` lists it, and the body of
+/// `GET /api/session/{thread_key}/summary`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SessionSummary {
+    pub thread_key: ThreadKey,
+    /// `slack`, `discord`, `linear`, `github`, or `unknown`.
+    pub platform: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub harness_type: HarnessType,
+    pub status: SessionStatus,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_execution: Option<ExecutionSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ExecutionSummary {
+    pub execution_id: String,
+    pub status: ExecutionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub started_at: Option<OffsetDateTime>,
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub completed_at: Option<OffsetDateTime>,
 }
 
 /// `GET /.well-known/oauth-protected-resource` (RFC 9728).
