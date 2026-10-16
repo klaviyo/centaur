@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Brings up the e2e stack on a dedicated kind cluster and runs the scenarios.
 #
-#   e2e/stack.sh up            create/update the cluster and deploy everything
-#   e2e/stack.sh test [files]  run the e2e scenarios (or the given files)
-#   e2e/stack.sh logs          print pods, events, and component logs
-#   e2e/stack.sh down          delete the cluster
+#   e2e/stack.sh up                   create/update the cluster and deploy everything
+#   e2e/stack.sh reload <service...>  rebuild and roll out only the given images
+#   e2e/stack.sh test [files]         run the e2e scenarios (or the given files)
+#   e2e/stack.sh logs                 print pods, events, and component logs
+#   e2e/stack.sh down                 delete the cluster
 #
 # The stack is the chart's Slack path (Postgres, console, proxy-sync, api-rs,
 # slackbotv2, sandboxes, per-sandbox iron-proxies) plus two fakes for the
@@ -14,6 +15,9 @@
 #
 # Images are built from the working tree and loaded into kind by default. Set
 # CENTAUR_E2E_IMAGE_TAG (e.g. main or sha-abc1234) to pull published images.
+# `reload` is the fast path after `up`: it rebuilds only the named images
+# (api-rs, proxy-sync, iron-proxy, slackbotv2, agent, console) and keeps every
+# other release value. A reloaded agent image applies to new sandboxes only.
 #
 # CENTAUR_E2E_AUTH_MODE picks how the harnesses authenticate, for both Codex
 # and Claude Code: api_key (default) or access_token, the ChatGPT and Claude.ai
@@ -64,6 +68,28 @@ apply_stdin() {
   kubectl apply -f - > /dev/null
 }
 
+# Builds a service's image from the working tree, loads it into kind, and
+# appends the Helm values that select it to the caller's image_args.
+build_and_load_image() {
+  local service="$1" key="$2" tag
+  just build-one "$service"
+  # Tag by content so a rebuilt image changes the release values and Helm
+  # rolls exactly the pods whose image changed.
+  tag="e2e-$(docker image inspect -f '{{.Id}}' "centaur-${service}:latest" | cut -c8-19)"
+  docker tag "centaur-${service}:latest" "centaur-${service}:${tag}"
+  kind load docker-image --name "$CLUSTER" "centaur-${service}:${tag}"
+  image_args+=(
+    --set "${key}.image.repository=centaur-${service}"
+    --set "${key}.image.tag=${tag}"
+  )
+}
+
+build_chart_dependencies() {
+  # The chart's 1Password Connect dependency resolves only from a registered repo.
+  helm repo add onepassword https://1password.github.io/connect-helm-charts --force-update > /dev/null
+  helm dependency build contrib/chart > /dev/null
+}
+
 up() {
   if kind get clusters | grep -qx "$CLUSTER"; then
     use_cluster
@@ -85,7 +111,7 @@ up() {
     --dry-run=client -o yaml | apply_stdin
   kubectl -n kube-system rollout restart deploy/coredns > /dev/null
 
-  local image_args=() entry service key tag
+  local image_args=() entry service key
   for entry in "${IMAGES[@]}"; do
     service="${entry%%:*}" key="${entry#*:}"
     if [[ -n "${CENTAUR_E2E_IMAGE_TAG:-}" ]]; then
@@ -99,16 +125,7 @@ up() {
           "ghcr.io/paradigmxyz/centaur/centaur-agent:${CENTAUR_E2E_IMAGE_TAG}"
       fi
     else
-      just build-one "$service"
-      # Tag by content so a rebuilt image changes the release values and Helm
-      # rolls exactly the pods whose image changed.
-      tag="e2e-$(docker image inspect -f '{{.Id}}' "centaur-${service}:latest" | cut -c8-19)"
-      docker tag "centaur-${service}:latest" "centaur-${service}:${tag}"
-      kind load docker-image --name "$CLUSTER" "centaur-${service}:${tag}"
-      image_args+=(
-        --set "${key}.image.repository=centaur-${service}"
-        --set "${key}.image.tag=${tag}"
-      )
+      build_and_load_image "$service" "$key"
     fi
   done
 
@@ -133,9 +150,7 @@ up() {
   if helm status "$RELEASE" -n "$NAMESPACE" -o json 2> /dev/null | grep -q '"status":"pending-'; then
     helm uninstall "$RELEASE" -n "$NAMESPACE" --wait > /dev/null
   fi
-  # The chart's 1Password Connect dependency resolves only from a registered repo.
-  helm repo add onepassword https://1password.github.io/connect-helm-charts --force-update > /dev/null
-  helm dependency build contrib/chart > /dev/null
+  build_chart_dependencies
   helm upgrade --install "$RELEASE" contrib/chart -n "$NAMESPACE" \
     -f contrib/chart/values.dev.yaml -f e2e/infra/values.yaml \
     --set "sandbox.codexAuthMode=${AUTH_MODE}" --set "sandbox.claudeCodeAuthMode=${AUTH_MODE}" \
@@ -148,6 +163,43 @@ up() {
   fi
   wait "$helm_pid"
   kubectl apply -f e2e/infra/test-access.yaml > /dev/null
+  wait_for_test_access
+}
+
+# Rebuilds only the named images and rolls them out on the release `up`
+# deployed, reusing its values so auth mode and image tags for every other
+# service stay as they are.
+reload() {
+  if [[ "$#" -eq 0 ]]; then
+    echo "usage: $0 reload <service...> (one of: ${IMAGES[*]%%:*})" >&2
+    exit 2
+  fi
+  if ! kind get clusters | grep -qx "$CLUSTER"; then
+    echo "cluster $CLUSTER does not exist; run e2e/stack.sh up first" >&2
+    exit 1
+  fi
+  use_cluster
+  if ! helm status "$RELEASE" -n "$NAMESPACE" > /dev/null 2>&1; then
+    echo "release $RELEASE is not deployed; run e2e/stack.sh up first" >&2
+    exit 1
+  fi
+
+  local image_args=() requested entry key
+  for requested in "$@"; do
+    key=""
+    for entry in "${IMAGES[@]}"; do
+      [[ "${entry%%:*}" == "$requested" ]] && key="${entry#*:}"
+    done
+    if [[ -z "$key" ]]; then
+      echo "unknown service $requested (one of: ${IMAGES[*]%%:*})" >&2
+      exit 2
+    fi
+    build_and_load_image "$requested" "$key"
+  done
+
+  build_chart_dependencies
+  helm upgrade "$RELEASE" contrib/chart -n "$NAMESPACE" --reuse-values \
+    "${image_args[@]}" --wait --timeout 10m
   wait_for_test_access
 }
 
@@ -275,8 +327,9 @@ remove_sandboxes() {
 
 case "${1:-}" in
   up) up ;;
+  reload) shift; reload "$@" ;;
   test) shift; run_tests "$@" ;;
   logs) use_cluster; dump_logs ;;
   down) kind delete cluster --name "$CLUSTER" ;;
-  *) echo "usage: $0 up|test|logs|down" >&2; exit 2 ;;
+  *) echo "usage: $0 up|reload|test|logs|down" >&2; exit 2 ;;
 esac

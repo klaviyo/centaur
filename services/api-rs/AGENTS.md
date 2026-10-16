@@ -21,6 +21,7 @@ Important crate boundaries:
 - `centaur-iron-control`, `centaur-iron-proxy`, and `centaur-perms`: credential
   control-plane integration and authorization resources.
 - `centaur-telemetry`: shared tracing and metrics support.
+- `centaur-cli`: the `centaur` command for people managing threads.
 
 Read the relevant RFC under `rfcs/` before changing a core protocol.
 
