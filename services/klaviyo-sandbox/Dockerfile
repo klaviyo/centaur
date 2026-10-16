@@ -31,7 +31,8 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
 ENV LANG=en_US.UTF-8 \
     LC_ALL=en_US.UTF-8 \
     UV_PYTHON_INSTALL_DIR=/opt/krepo/python \
-    PANTS_CA_CERTS_PATH=/etc/ssl/certs/ca-certificates.crt
+    PANTS_CA_CERTS_PATH=/firewall-certs/ca-cert.pem \
+    UV_NATIVE_TLS=true
 ENV PATH="/usr/local/go/bin:/home/agent/go/bin:${PATH}"
 
 ARG PYTHON_310=3.10.18
@@ -97,6 +98,8 @@ RUN --mount=type=cache,target=/root/go/pkg/mod \
 USER agent
 WORKDIR /home/agent
 
+COPY --chown=1001:1001 services/klaviyo-sandbox/pip.conf /home/agent/.pip/pip.conf
+
 ENV GOPATH=/home/agent/go \
     GOCACHE=/home/agent/.cache/go-build \
     GOMODCACHE=/home/agent/go/pkg/mod \
@@ -107,7 +110,8 @@ RUN mkdir -p /home/agent/go /home/agent/.cache/go-build \
     && bootstrap="$(mktemp -d)" \
     && printf '[GLOBAL]\npants_version = "%s"\n[anonymous-telemetry]\nenabled = false\n' \
          "${PANTS_VERSION}" > "${bootstrap}/pants.toml" \
-    && (cd "${bootstrap}" && env -u PANTS_ENVIRONMENTS_PREVIEW_NAMES pants --version) \
+    && (cd "${bootstrap}" && env -u PANTS_ENVIRONMENTS_PREVIEW_NAMES \
+         PANTS_CA_CERTS_PATH=/etc/ssl/certs/ca-certificates.crt pants --version) \
     && rm -rf "${bootstrap}"
 
 RUN <<'SMOKE'
@@ -132,10 +136,8 @@ python3.10 -m venv "$smoke/venv"
 "$smoke/venv/bin/python" -m pip --version
 SMOKE
 
-# Runtime setup must still provide /home/agent/.pip/pip.conf for k-repo's
-# .pants.bootstrap. This image does not configure private package access.
-# Supply proxy-compatible configuration through the sandbox runtime;
-# keep real Artifactory credentials outside the image and sandbox.
+# Configure matching Artifactory replacements and grants in iron-control
+# using configure_artifactory.py. The image contains only placeholders.
 # Docker-dependent tests still need a separately provided Docker daemon;
 # service integration tests need their databases and other dependencies.
 # ENTRYPOINT and CMD are inherited from the Centaur image.
