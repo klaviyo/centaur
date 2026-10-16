@@ -1,0 +1,607 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $ingressSourceNamespaces := default .Values.networkPolicy.ingressControllerNamespaces .Values.networkPolicy.ingressSourceNamespaces }}
+{{- $console := include "centaur.consoleValues" . | fromYaml }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.fullname" . }}-default-deny
+  labels:
+{{ include "centaur.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.fullname" . }}-allow-dns
+  labels:
+{{ include "centaur.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+{{- if .Values.postgres.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "postgres") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "postgres") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "postgres") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+{{- if .Values.apiRs.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 14 }}
+        # Python workflow-host sandboxes connect to Postgres directly via
+        # DATABASE_URL (the host process, not its tool calls, which go through
+        # the per-sandbox iron-proxy). api-rs labels them
+        # centaur.ai/component=workflow-run.
+        - podSelector:
+            matchLabels:
+              centaur.ai/component: workflow-run
+{{- end }}
+{{- if .Values.slackbotv2.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "slackbotv2") | nindent 14 }}
+{{- end }}
+{{- if .Values.linearbot.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "linearbot") | nindent 14 }}
+{{- end }}
+{{- if .Values.githubbot.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "githubbot") | nindent 14 }}
+{{- end }}
+{{- if .Values.discordbot.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "discordbot") | nindent 14 }}
+{{- end }}
+{{- if .Values.teamsbot.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "teamsbot") | nindent 14 }}
+{{- end }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "console") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "proxy-sync") | nindent 14 }}
+{{- if .Values.experimentalCompanyContext.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "company-context") | nindent 14 }}
+{{- end }}
+        # console Solid Queue worker (bin/jobs) reaches the app + queue DBs.
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "console-worker") | nindent 14 }}
+        # iron-proxy pods forward the tool-server sidecar's pool to Postgres
+        # (the sidecar reaches the core DB through the per-sandbox proxy, not
+        # directly), so the proxy must be allowed to connect.
+        - podSelector:
+            matchLabels:
+              centaur.ai/iron-proxy: "true"
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+{{- end }}
+{{- if .Values.apiRs.enabled }}
+# Python workflow-host sandboxes (centaur.ai/component=workflow-run) are spawned
+# by api-rs, so the per-sandbox egress policy api-rs renders already covers their
+# proxy, the control plane, and DNS. The host process additionally talks to
+# Postgres directly (DATABASE_URL) and may make direct outbound HTTPS calls
+# (mirroring api-rs), neither of which the per-sandbox policy grants -- without
+# this the host fails to start with ECONNREFUSED to Postgres under any enforcing
+# CNI (the default-deny denies all egress).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.fullname" . }}-workflow-run
+  labels:
+{{ include "centaur.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      centaur.ai/component: workflow-run
+  policyTypes:
+    - Egress
+  egress:
+    {{- include "centaur.postgresEgress" . | nindent 4 }}
+    # Trusted workflow code may make direct outbound HTTPS calls (mirrors api-rs).
+    - ports:
+        - protocol: TCP
+          port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "api-rs") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "api-rs") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+{{- if .Values.slackbotv2.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "slackbotv2") | nindent 14 }}
+{{- end }}
+{{- if .Values.linearbot.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "linearbot") | nindent 14 }}
+{{- end }}
+{{- if .Values.githubbot.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "githubbot") | nindent 14 }}
+{{- end }}
+{{- if .Values.discordbot.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "discordbot") | nindent 14 }}
+{{- end }}
+{{- if .Values.teamsbot.enabled }}
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "teamsbot") | nindent 14 }}
+{{- end }}
+        # Console pages call api-rs for admin-backed views such as ETLs.
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "console") | nindent 14 }}
+        # Console background jobs call api-rs for sync ingestion/checkpoints.
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "console-worker") | nindent 14 }}
+        # Sandboxes reach authenticated api-rs routes through their paired
+        # iron-proxy; sandbox pods never connect to api-rs directly.
+        - podSelector:
+            matchLabels:
+              centaur.ai/iron-proxy: "true"
+{{- range .Values.networkPolicy.apiIngressSourceNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.apiRs.port }}
+---
+# Only iron-proxy pods may call api-rs on behalf of sandboxes. api-rs enforces
+# the principal JWT's endpoint capabilities; sandbox pods remain limited to
+# their paired proxy by the per-sandbox policies rendered by api-rs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.fullname" . }}-proxy-api-server
+  labels:
+{{ include "centaur.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      centaur.ai/iron-proxy: "true"
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.apiRs.port }}
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "proxy-sync") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.proxySync.port }}
+---
+{{- if .Values.networkPolicy.observabilityEgress.enabled }}
+{{- if not .Values.networkPolicy.observabilityEgress.destinations }}
+{{- fail "networkPolicy.observabilityEgress.destinations must contain at least one destination when networkPolicy.observabilityEgress.enabled is true" }}
+{{- end }}
+# Sandboxes with the observability capability may call the configured
+# in-cluster observability backends.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.fullname" . }}-observability-egress
+  labels:
+{{ include "centaur.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      centaur.ai/observability-enabled: "true"
+  policyTypes:
+    - Egress
+  egress:
+{{- range $index, $destination := .Values.networkPolicy.observabilityEgress.destinations }}
+{{- if not $destination.ports }}
+{{- fail (printf "networkPolicy.observabilityEgress.destinations[%d].ports must contain at least one port" $index) }}
+{{- end }}
+    - to:
+        - namespaceSelector:
+{{- if $destination.namespaceSelector }}
+{{ toYaml $destination.namespaceSelector | nindent 12 }}
+{{- else }}
+            matchLabels:
+              kubernetes.io/metadata.name: {{ required (printf "networkPolicy.observabilityEgress.destinations[%d].namespace is required when namespaceSelector is unset" $index) $destination.namespace | quote }}
+{{- end }}
+{{- with $destination.podSelector }}
+          podSelector:
+{{ toYaml . | nindent 12 }}
+{{- end }}
+      ports:
+{{- range $portIndex, $port := $destination.ports }}
+        - protocol: {{ default "TCP" $port.protocol }}
+          port: {{ required (printf "networkPolicy.observabilityEgress.destinations[%d].ports[%d].port is required" $index $portIndex) $port.port }}
+{{- end }}
+{{- end }}
+---
+{{- end }}
+{{- if .Values.networkPolicy.otlpEgress.enabled }}
+# Pods with observability enabled may call the configured in-cluster OTLP
+# collector. Without the centaur.ai/observability-enabled=true label, default
+# deny blocks access to Laminar or other OTLP endpoints.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.fullname" . }}-otlp-egress
+  labels:
+{{ include "centaur.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      centaur.ai/observability-enabled: "true"
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ required "networkPolicy.otlpEgress.namespace is required when networkPolicy.otlpEgress.enabled" .Values.networkPolicy.otlpEgress.namespace | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.otlpEgress.port }}
+---
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "api-rs") }}-egress
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "api-rs") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    {{- include "centaur.postgresEgress" . | nindent 4 }}
+    # Per-sandbox iron-proxy listeners (HTTP proxy + postgres + management API).
+    - to:
+        - podSelector:
+            matchLabels:
+              centaur.ai/iron-proxy: "true"
+      ports:
+        - protocol: TCP
+          port: {{ .Values.ironProxy.service.proxyPort }}
+        - protocol: TCP
+          port: {{ .Values.ironProxy.service.pgPort }}
+        - protocol: TCP
+          port: {{ .Values.ironProxy.service.managementPort }}
+    # console control plane: register principals/roles/grants and per-sandbox proxies.
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "console") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ $console.service.httpPort }}
+    - ports:
+        - protocol: TCP
+          port: 443
+    # Kubernetes API egress. The kubernetes.default ClusterIP (:443) is DNAT'd
+    # to the real endpoint port (6443 on k3s/kubeadm); enforcing CNIs match
+    # egress post-DNAT, so allow that port or api-rs can't manage sandboxes.
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.apiServerPort }}
+---
+{{- end }}
+{{- if .Values.slackbotv2.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "slackbotv2") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "slackbotv2") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "slackbotv2") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+{{- range $ingressSourceNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: 3001
+  egress:
+{{- if .Values.apiRs.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.apiRs.port }}
+{{- end }}
+    {{- include "centaur.postgresEgress" . | nindent 4 }}
+    # Slack API egress (direct HTTPS; slackbotv2 does not use the firewall proxy).
+    - ports:
+        - protocol: TCP
+          port: 443
+---
+{{- end }}
+{{- if .Values.linearbot.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "linearbot") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "linearbot") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "linearbot") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+{{- range $ingressSourceNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: 3001
+  egress:
+{{- if .Values.apiRs.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.apiRs.port }}
+{{- end }}
+    {{- include "centaur.postgresEgress" . | nindent 4 }}
+    # Linear GraphQL API egress (direct HTTPS; linearbot does not use the firewall proxy).
+    - ports:
+        - protocol: TCP
+          port: 443
+---
+{{- end }}
+{{- if .Values.githubbot.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "githubbot") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "githubbot") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "githubbot") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+{{- range $ingressSourceNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: 3001
+  egress:
+{{- if .Values.apiRs.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.apiRs.port }}
+{{- end }}
+    {{- include "centaur.postgresEgress" . | nindent 4 }}
+    # GitHub REST API egress (direct HTTPS; githubbot does not use the firewall proxy).
+    - ports:
+        - protocol: TCP
+          port: 443
+---
+{{- end }}
+{{- if .Values.discordbot.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "discordbot") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "discordbot") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "discordbot") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Only health probes reach discordbot; nothing routes traffic to it (the Gateway is outbound).
+    - from:
+{{- range $ingressSourceNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: 3001
+  egress:
+{{- if .Values.apiRs.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.apiRs.port }}
+{{- end }}
+    {{- include "centaur.postgresEgress" . | nindent 4 }}
+    # Discord Gateway (wss), REST, and CDN all need direct HTTPS egress. The Gateway cannot be
+    # proxied (discord.js ignores HTTPS_PROXY), so this rule is load-bearing.
+    - ports:
+        - protocol: TCP
+          port: 443
+---
+{{- end }}
+{{- if .Values.teamsbot.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "teamsbot") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "teamsbot") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "teamsbot") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+{{- range $ingressSourceNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+{{- end }}
+      ports:
+        - protocol: TCP
+          port: 3100
+  egress:
+{{- if .Values.apiRs.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.apiRs.port }}
+{{- end }}
+    {{- include "centaur.postgresEgress" . | nindent 4 }}
+    # Teams Bot Framework, Graph, SharePoint, and proactive activity delivery use direct HTTPS.
+    - ports:
+        - protocol: TCP
+          port: 443
+---
+{{- end }}
+{{- if eq .Values.ironProxy.secretSource "onepassword-connect" }}
+# Targets the 1Password Connect subchart's pods, which carry
+# `app: <applicationName>` (default `onepassword-connect`).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.fullname" . }}-onepassword-connect
+  labels:
+{{ include "centaur.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ include "centaur.onepasswordConnectAppName" . | quote }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              centaur.ai/iron-proxy: "true"
+      ports:
+        - protocol: TCP
+          port: {{ include "centaur.onepasswordConnectPort" . }}
+  egress:
+    # connect-sync needs outbound HTTPS to my.1password.com.
+    - ports:
+        - protocol: TCP
+          port: 443
+---
+{{- end }}
+{{- if .Values.repoCache.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "repo-cache") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "repo-cache") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "repo-cache") | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+{{- range .Values.repoCache.egressPorts }}
+    - ports:
+        - protocol: TCP
+          port: {{ . }}
+{{- end }}
+---
+{{- end }}
+{{- end }}

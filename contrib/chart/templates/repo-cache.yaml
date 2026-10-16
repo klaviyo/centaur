@@ -1,0 +1,172 @@
+{{- if .Values.repoCache.enabled }}
+{{- $overlaySources := include "centaur.overlaySources" . | fromJsonArray -}}
+{{- $repoCacheRepositories := list -}}
+{{- $repoCacheRepositoryVisibilities := dict -}}
+{{- $repoCacheRepositoryRefs := list -}}
+{{- $repoCacheRepositoryRefRepos := list -}}
+{{- range $repo, $ref := .Values.repoCache.repositoryRefs }}
+{{- $repoCacheRepositoryRefs = append $repoCacheRepositoryRefs (printf "%s=%s" $repo $ref) -}}
+{{- $repoCacheRepositoryRefRepos = append $repoCacheRepositoryRefRepos $repo -}}
+{{- end }}
+{{- range .Values.repoCache.repositories }}
+{{- if kindIs "string" . -}}
+{{- $repo := . -}}
+{{- if $repo -}}
+{{- $repoCacheRepositories = append $repoCacheRepositories $repo -}}
+{{- $_ := set $repoCacheRepositoryVisibilities $repo "private" -}}
+{{- end -}}
+{{- else -}}
+{{- $repo := get . "repo" | default "" -}}
+{{- if $repo -}}
+{{- $repoCacheRepositories = append $repoCacheRepositories $repo -}}
+{{- $_ := set $repoCacheRepositoryVisibilities $repo (include "centaur.repositoryVisibility" (get . "visibility")) -}}
+{{- $ref := get . "ref" | default "" -}}
+{{- if and $ref (not (has $repo $repoCacheRepositoryRefRepos)) -}}
+{{- $repoCacheRepositoryRefs = append $repoCacheRepositoryRefs (printf "%s=%s" $repo $ref) -}}
+{{- $repoCacheRepositoryRefRepos = append $repoCacheRepositoryRefRepos $repo -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+{{- range $source := $overlaySources }}
+{{- with (get $source "repo") }}
+{{- $repoCacheRepositories = append $repoCacheRepositories . -}}
+{{- $_ := set $repoCacheRepositoryVisibilities . (get $source "visibility" | default "private") -}}
+{{- end }}
+{{- end }}
+{{- $repoCacheRepositories = uniq $repoCacheRepositories -}}
+{{- if $repoCacheRepositories }}
+{{- $repoCacheHasGithubToken := or .Values.repoCache.githubToken.existingSecretName .Values.repoCache.githubToken.token -}}
+{{- $repoCacheImageRepository := default .Values.sandbox.image.repository .Values.repoCache.image.repository -}}
+{{- $repoCacheImageTag := default .Values.sandbox.image.tag .Values.repoCache.image.tag -}}
+{{- $repoCacheImagePullPolicy := default .Values.sandbox.image.pullPolicy .Values.repoCache.image.pullPolicy -}}
+{{- $repoCacheStorageType := include "centaur.repoCacheStorageType" . -}}
+{{- $repoCacheUsePvc := eq $repoCacheStorageType "persistentVolumeClaim" -}}
+{{- $repoCachePvcName := include "centaur.repoCachePvcName" . -}}
+{{- $repoCacheCreatePvc := and $repoCacheUsePvc .Values.repoCache.storage.persistentVolumeClaim.create (not .Values.repoCache.storage.persistentVolumeClaim.existingClaim) -}}
+{{- range $source := $overlaySources }}
+{{- $repo := get $source "repo" | default "" -}}
+{{- $ref := get $source "ref" | default "" -}}
+{{- if and $repo $ref (not (has $repo $repoCacheRepositoryRefRepos)) }}
+{{- $repoCacheRepositoryRefs = append $repoCacheRepositoryRefs (printf "%s=%s" $repo $ref) -}}
+{{- $repoCacheRepositoryRefRepos = append $repoCacheRepositoryRefRepos $repo -}}
+{{- end }}
+{{- end }}
+{{- $repoCacheRepositoryVisibilityEntries := list -}}
+{{- range $repo := $repoCacheRepositories }}
+{{- $repoCacheRepositoryVisibilityEntries = append $repoCacheRepositoryVisibilityEntries (printf "%s=%s" $repo (get $repoCacheRepositoryVisibilities $repo | default "private")) -}}
+{{- end }}
+{{- if $repoCacheCreatePvc }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $repoCachePvcName }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "repo-cache") | nindent 4 }}
+spec:
+  accessModes:
+{{ toYaml .Values.repoCache.storage.persistentVolumeClaim.accessModes | nindent 4 }}
+{{- with .Values.repoCache.storage.persistentVolumeClaim.storageClassName }}
+  storageClassName: {{ . | quote }}
+{{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.repoCache.storage.persistentVolumeClaim.size | quote }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: {{ ternary "Deployment" "DaemonSet" $repoCacheUsePvc }}
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "repo-cache") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "repo-cache") | nindent 4 }}
+spec:
+{{- if $repoCacheUsePvc }}
+  replicas: 1
+  strategy:
+    type: Recreate
+{{- end }}
+  selector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "repo-cache") | nindent 6 }}
+  template:
+    metadata:
+{{- if $repoCacheHasGithubToken }}
+      annotations:
+        checksum/github-token: {{ include "centaur.secretResourceVersion" (dict "root" . "name" (include "centaur.repoCacheGithubTokenSecretName" .)) | sha256sum }}
+{{- end }}
+      labels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "repo-cache") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+{{- include "centaur.podScheduling" (dict "values" .Values.repoCache "indent" 6) }}
+      containers:
+        - name: repo-cache
+          image: {{ printf "%s:%s" $repoCacheImageRepository $repoCacheImageTag | quote }}
+          imagePullPolicy: {{ $repoCacheImagePullPolicy }}
+          command:
+            - /usr/local/bin/repo-cache-sync
+          env:
+            - name: REPOSITORIES
+              value: {{ join " " $repoCacheRepositories | quote }}
+            - name: REPOSITORY_REFS
+              value: {{ join " " $repoCacheRepositoryRefs | quote }}
+            - name: REPOSITORY_VISIBILITIES
+              value: {{ join " " $repoCacheRepositoryVisibilityEntries | quote }}
+            - name: SYNC_INTERVAL_SECONDS
+              value: {{ .Values.repoCache.syncIntervalSeconds | quote }}
+            - name: GIT_TERMINAL_PROMPT
+              value: "0"
+          readinessProbe:
+            exec:
+              command:
+                - /usr/local/bin/repo-cache-sync
+                - --check-ready
+            initialDelaySeconds: {{ .Values.repoCache.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.repoCache.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.repoCache.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.repoCache.readinessProbe.failureThreshold }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            runAsGroup: 0
+            runAsUser: 0
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+{{ toYaml .Values.repoCache.resources | nindent 12 }}
+          volumeMounts:
+            - name: repo-cache
+              mountPath: /cache
+{{- if $repoCacheHasGithubToken }}
+            - name: github-token
+              mountPath: /github-token
+              readOnly: true
+{{- end }}
+      volumes:
+        - name: repo-cache
+{{- if $repoCacheUsePvc }}
+          persistentVolumeClaim:
+            claimName: {{ $repoCachePvcName | quote }}
+{{- else }}
+          hostPath:
+            path: {{ .Values.repoCache.hostPath | quote }}
+            type: DirectoryOrCreate
+{{- end }}
+{{- if $repoCacheHasGithubToken }}
+        - name: github-token
+          secret:
+            secretName: {{ include "centaur.repoCacheGithubTokenSecretName" . }}
+            defaultMode: 256
+            items:
+              - key: {{ .Values.repoCache.githubToken.secretKey | quote }}
+                path: token
+{{- end }}
+{{- end }}
+{{- end }}

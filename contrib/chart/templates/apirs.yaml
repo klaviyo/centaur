@@ -1,0 +1,687 @@
+{{- if .Values.apiRs.enabled }}
+{{- $console := include "centaur.consoleValues" . | fromYaml -}}
+{{- $mcpPublicUrl := default .Values.slackbotv2.mcpPublicUrl .Values.apiRs.mcpPublicUrl -}}
+{{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
+{{- $repoCacheStorageType := include "centaur.repoCacheStorageType" . -}}
+{{- $repoCacheUsePvc := eq $repoCacheStorageType "persistentVolumeClaim" -}}
+{{- $repoCachePvcName := include "centaur.repoCachePvcName" . -}}
+{{- $reposPath := .Values.sandbox.reposPath -}}
+{{- if and .Values.repoCache.enabled (not $reposPath) -}}
+{{- $reposPath = .Values.repoCache.hostPath -}}
+{{- end -}}
+{{- $overlaySources := include "centaur.overlaySources" . | fromJsonArray -}}
+{{- $toolSources := list -}}
+{{- $publicToolSources := list -}}
+{{- $apiWorkflowDirList := list -}}
+{{- $sandboxWorkflowDirList := list -}}
+{{- $skillDirs := list -}}
+{{- $publicSkillDirs := list -}}
+{{- range $source := $overlaySources -}}
+{{- $repo := get $source "repo" | default "" -}}
+{{- $visibility := get $source "visibility" | default "private" -}}
+{{- if $repo -}}
+{{- with (get $source "toolsSubdir") -}}
+{{- $toolSource := dict "repo" $repo "subdir" . "visibility" $visibility -}}
+{{- with (get $source "ref") }}{{- $_ := set $toolSource "ref" . -}}{{- end -}}
+{{- $toolSources = append $toolSources $toolSource -}}
+{{- if eq $visibility "public" -}}
+{{- $publicToolSources = append $publicToolSources $toolSource -}}
+{{- end -}}
+{{- end -}}
+{{- with (get $source "workflowsSubdir") -}}
+{{- $apiWorkflowDirList = append $apiWorkflowDirList (printf "%s/%s/%s" $.Values.repoCache.hostPath $repo .) -}}
+{{- $sandboxWorkflowDirList = append $sandboxWorkflowDirList (printf "/home/agent/github/%s/%s" $repo .) -}}
+{{- end -}}
+{{- with (get $source "skillsSubdir") -}}
+{{- $skillDir := printf "/home/agent/github/%s/%s" $repo . -}}
+{{- $skillDirs = append $skillDirs $skillDir -}}
+{{- if eq $visibility "public" -}}
+{{- $publicSkillDirs = append $publicSkillDirs $skillDir -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $toolsUseRepoCache := and .Values.repoCache.enabled (gt (len $toolSources) 0) -}}
+{{- $useOverlayRepoCache := and .Values.repoCache.enabled (gt (len $overlaySources) 0) -}}
+{{- $toolDirs := list "/app/tools" -}}
+{{- $workflowDirs := "/app/workflows" -}}
+{{- if $toolsUseRepoCache -}}
+{{- $toolDirs = list -}}
+{{- range $source := $toolSources }}
+{{- $toolDirs = append $toolDirs (printf "%s/%s/%s" $.Values.repoCache.hostPath (get $source "repo") (get $source "subdir")) -}}
+{{- end -}}
+{{- end -}}
+{{- $publicToolDirs := list -}}
+{{- if and .Values.repoCache.enabled (gt (len $publicToolSources) 0) -}}
+{{- range $source := $publicToolSources }}
+{{- $publicToolDirs = append $publicToolDirs (printf "%s/%s/%s" $.Values.repoCache.hostPath (get $source "repo") (get $source "subdir")) -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.repoCache.enabled (gt (len $apiWorkflowDirList) 0) -}}
+{{- $workflowDirs = join ":" $apiWorkflowDirList -}}
+{{- end -}}
+{{- $sandboxWorkflowDirs := "" -}}
+{{- if and .Values.repoCache.enabled (gt (len $sandboxWorkflowDirList) 0) -}}
+{{- $sandboxWorkflowDirs = join ":" $sandboxWorkflowDirList -}}
+{{- end -}}
+{{- $apiRsMetricsAnnotations := dict -}}
+{{- if .Values.apiRs.metrics.scrapeAnnotations -}}
+{{- $apiRsMetricsAnnotations = dict "prometheus.io/scrape" "true" "prometheus.io/path" .Values.apiRs.metrics.path "prometheus.io/port" (printf "%v" .Values.apiRs.port) -}}
+{{- $apiRsMetricsAnnotations = mergeOverwrite $apiRsMetricsAnnotations (.Values.apiRs.metrics.annotations | default dict) -}}
+{{- end -}}
+{{- $apiRsEtl := .Values.apiRs.etl | default dict -}}
+{{- $companyContextV1Enabled := .Values.companyContextV1.enabled -}}
+{{- $companyContextEmbeddingsEnabled := dig "companyContextEmbeddings" "enabled" false $apiRsEtl -}}
+{{- $companyContextEmbeddingsModel := dig "companyContextEmbeddings" "model" "text-embedding-3-small" $apiRsEtl -}}
+{{- $companyContextEmbeddingsDimensions := dig "companyContextEmbeddings" "dimensions" 1536 $apiRsEtl -}}
+{{- $apiRsEtlEnv := list
+  (dict "name" "SLACK_ETL_ENABLED" "value" (and $companyContextV1Enabled (dig "slack" "enabled" false $apiRsEtl)))
+  (dict "name" "SLACK_SYNC_INTERVAL_SECONDS" "value" (dig "slack" "syncIntervalSeconds" 3600 $apiRsEtl))
+  (dict "name" "SLACK_SYNC_BACKFILL_LOOKBACK_DAYS" "value" (dig "slack" "syncBackfillLookbackDays" 30 $apiRsEtl))
+  (dict "name" "SLACK_SYNC_THREAD_LOOKBACK_DAYS" "value" (dig "slack" "syncThreadLookbackDays" 3 $apiRsEtl))
+  (dict "name" "SLACK_SYNC_INDEX_PRIVATE_CHANNELS" "value" (dig "slack" "indexPrivateChannels" false $apiRsEtl))
+  (dict "name" "SLACK_ETL_EXCLUDED_CHANNEL_PATTERNS" "value" (dig "slack" "excludedChannelPatterns" "" $apiRsEtl))
+  (dict "name" "SLACK_ETL_ATTACHMENTS_ENABLED" "value" (dig "slack" "attachments" "enabled" true $apiRsEtl))
+  (dict "name" "SLACK_ETL_ATTACHMENT_MAX_BYTES" "value" (dig "slack" "attachments" "maxBytes" 10485760 $apiRsEtl))
+  (dict "name" "SLACK_BACKFILL_ENABLED" "value" (dig "slack" "backfill" "enabled" true $apiRsEtl))
+  (dict "name" "SLACK_BACKFILL_INTERVAL_SECONDS" "value" (dig "slack" "backfill" "intervalSeconds" 600 $apiRsEtl))
+  (dict "name" "SLACK_BACKFILL_CHANNEL_BATCH_LIMIT" "value" (dig "slack" "backfill" "channelBatchLimit" 50 $apiRsEtl))
+  (dict "name" "SLACK_BACKFILL_CHANNEL_PAGES_PER_JOB" "value" (dig "slack" "backfill" "channelPagesPerJob" 5 $apiRsEtl))
+  (dict "name" "SLACK_RETENTION_ENABLED" "value" (and $companyContextV1Enabled (dig "slack" "retention" "enabled" true $apiRsEtl)))
+  (dict "name" "SLACK_RETENTION_INTERVAL_MINUTES" "value" (dig "slack" "retention" "intervalMinutes" 60 $apiRsEtl))
+  (dict "name" "SLACK_ETL_RETENTION_DAYS" "value" (dig "slack" "retention" "etlDays" 0 $apiRsEtl))
+  (dict "name" "SLACK_DM_RETENTION_DAYS" "value" (dig "slack" "retention" "dmDays" 0 $apiRsEtl))
+  (dict "name" "LINEAR_ETL_ENABLED" "value" (dig "linear" "enabled" false $apiRsEtl))
+  (dict "name" "LINEAR_SYNC_INTERVAL_SECONDS" "value" (dig "linear" "syncIntervalSeconds" 14400 $apiRsEtl))
+  (dict "name" "GOOGLE_DRIVE_ETL_ENABLED" "value" (dig "googleDrive" "enabled" false $apiRsEtl))
+  (dict "name" "GOOGLE_DRIVE_SYNC_INTERVAL_SECONDS" "value" (dig "googleDrive" "syncIntervalSeconds" 14400 $apiRsEtl))
+  (dict "name" "GOOGLE_CALENDAR_ETL_ENABLED" "value" (dig "googleCalendar" "enabled" false $apiRsEtl))
+  (dict "name" "GOOGLE_CALENDAR_SYNC_INTERVAL_SECONDS" "value" (dig "googleCalendar" "syncIntervalSeconds" 14400 $apiRsEtl))
+  (dict "name" "COMPANY_CONTEXT_DOCUMENTS_ENABLED" "value" (dig "companyContextDocuments" "enabled" true $apiRsEtl))
+  (dict "name" "COMPANY_CONTEXT_DOCUMENTS_INTERVAL_SECONDS" "value" (dig "companyContextDocuments" "intervalSeconds" 14400 $apiRsEtl))
+  (dict "name" "COMPANY_CONTEXT_DOCUMENTS_MAX_WINDOW_SECONDS" "value" (dig "companyContextDocuments" "maxWindowSeconds" 21600 $apiRsEtl))
+  (dict "name" "COMPANY_CONTEXT_DOCUMENTS_BATCH_SIZE" "value" (dig "companyContextDocuments" "batchSize" 50 $apiRsEtl))
+  (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_ENABLED" "value" $companyContextEmbeddingsEnabled)
+  (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_INTERVAL_SECONDS" "value" (dig "companyContextEmbeddings" "intervalSeconds" 300 $apiRsEtl))
+  (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_BATCH_SIZE" "value" (dig "companyContextEmbeddings" "batchSize" 250 $apiRsEtl))
+  (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_MAX_INPUT_CHARS" "value" (dig "companyContextEmbeddings" "maxInputChars" 8192 $apiRsEtl))
+  (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_MODEL" "value" $companyContextEmbeddingsModel)
+  (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS" "value" $companyContextEmbeddingsDimensions)
+-}}
+{{- $apiRsEtlPassthroughNames := list -}}
+{{- range $env := $apiRsEtlEnv -}}
+{{- $apiRsEtlPassthroughNames = append $apiRsEtlPassthroughNames $env.name -}}
+{{- end -}}
+{{- with (get .Values.apiRs.extraEnv "SESSION_SANDBOX_PASSTHROUGH_ENV") -}}
+{{- range $name := splitList "," (toString .) -}}
+{{- $trimmedName := trim $name -}}
+{{- if $trimmedName -}}
+{{- $apiRsEtlPassthroughNames = append $apiRsEtlPassthroughNames $trimmedName -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $apiRsEtlPassthroughNames = uniq $apiRsEtlPassthroughNames -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $apiRsName }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "api-rs") | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "api-rs-sandbox-manager") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "api-rs") | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list", "patch", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["delete", "get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "delete", "get", "list", "patch", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/attach", "pods/exec"]
+    verbs: ["create", "get"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete", "get"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "delete", "get", "list", "patch", "watch"]
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "api-rs-sandbox-manager") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "api-rs") | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $apiRsName }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "centaur.componentName" (dict "root" . "component" "api-rs-sandbox-manager") }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $apiRsName }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "api-rs") | nindent 4 }}
+spec:
+  replicas: {{ .Values.apiRs.replicaCount }}
+  selector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/infra-secrets: {{ include "centaur.infraSecretsChecksum" . }}
+        checksum/overlay: {{ dict "overlay" .Values.overlay "overlays" .Values.overlays | toJson | sha256sum }}
+{{- with $apiRsMetricsAnnotations }}
+{{ toYaml . | nindent 8 }}
+{{- end }}
+      labels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 8 }}
+        centaur.ai/observability-enabled: "true"
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.apiRs.terminationGracePeriodSeconds }}
+{{- with .Values.apiRs.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+{{- end }}
+      automountServiceAccountToken: true
+      serviceAccountName: {{ $apiRsName }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+{{- include "centaur.podScheduling" (dict "values" .Values.apiRs "indent" 6) }}
+      containers:
+        - name: api-rs
+          image: {{ printf "%s:%s" .Values.apiRs.image.repository .Values.apiRs.image.tag | quote }}
+          imagePullPolicy: {{ .Values.apiRs.image.pullPolicy }}
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sDATABASE_URL" .Values.secretManager.envPrefix }}
+            - name: CENTAUR_JWT_SIGNING_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sCENTAUR_JWT_SIGNING_SECRET" .Values.secretManager.envPrefix }}
+{{- range $ingress := list
+  (dict "enabled" .Values.slackbotv2.enabled "key" "SLACKBOT_API_KEY")
+  (dict "enabled" .Values.discordbot.enabled "key" "DISCORDBOT_API_KEY")
+  (dict "enabled" .Values.githubbot.enabled "key" "GITHUBBOT_API_KEY")
+  (dict "enabled" .Values.linearbot.enabled "key" "LINEARBOT_API_KEY")
+  (dict "enabled" .Values.teamsbot.enabled "key" "TEAMSBOT_API_KEY")
+}}
+{{- if $ingress.enabled }}
+            - name: {{ $ingress.key }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" $ }}
+                  key: {{ printf "%s%s" $.Values.secretManager.envPrefix $ingress.key }}
+{{- end }}
+{{- end }}
+            - name: BIND_ADDR
+              value: {{ printf "0.0.0.0:%v" .Values.apiRs.port | quote }}
+            - name: SLACK_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sSLACK_BOT_TOKEN" .Values.secretManager.envPrefix }}
+                  optional: true
+{{- if $mcpPublicUrl }}
+            - name: CENTAUR_MCP_PUBLIC_URL
+              value: {{ $mcpPublicUrl | quote }}
+{{- end }}
+{{- if $console.publicUrl }}
+            - name: CENTAUR_CONSOLE_PUBLIC_URL
+              value: {{ $console.publicUrl | quote }}
+{{- end }}
+            - name: RUN_MIGRATIONS
+              value: {{ .Values.apiRs.runMigrations | quote }}
+{{- if not (hasKey .Values.apiRs.extraEnv "DATABASE_TEXT_SEARCH") }}
+            - name: DATABASE_TEXT_SEARCH
+              value: {{ ternary "paradedb" (default "postgres" .Values.externalDatabase.textSearch) .Values.postgres.enabled | quote }}
+{{- end }}
+{{- if not (hasKey .Values.apiRs.extraEnv "CENTAUR_SESSION_PRINCIPAL_ADMISSION") }}
+            - name: CENTAUR_SESSION_PRINCIPAL_ADMISSION
+              value: {{ .Values.apiRs.sessionPrincipalAdmission | quote }}
+{{- end }}
+{{- if not (hasKey .Values.apiRs.extraEnv "CENTAUR_MCP_V2_ENABLED") }}
+            - name: CENTAUR_MCP_V2_ENABLED
+              value: {{ .Values.apiRs.mcpV2Enabled | quote }}
+{{- end }}
+            - name: IRON_CONTROL_SYNC_INFRA_SECRETS
+              value: {{ .Values.apiRs.syncInfraSecrets | quote }}
+            - name: RUST_LOG
+              value: info
+            - name: TOOL_DIRS
+              value: {{ join ":" $toolDirs | quote }}
+{{- if gt (len $publicToolDirs) 0 }}
+            - name: KUBERNETES_PUBLIC_TOOL_DIRS
+              value: {{ join ":" $publicToolDirs | quote }}
+{{- end }}
+            - name: WORKFLOW_DIRS
+              value: {{ $workflowDirs | quote }}
+{{- if $sandboxWorkflowDirs }}
+            - name: KUBERNETES_WORKFLOW_DIRS
+              value: {{ $sandboxWorkflowDirs | quote }}
+{{- end }}
+{{- if not (hasKey .Values.apiRs.extraEnv "WORKFLOW_HOST_SANDBOX") }}
+            - name: WORKFLOW_HOST_SANDBOX
+              value: {{ .Values.apiRs.workflowHostSandbox | quote }}
+{{- end }}
+{{- if not (hasKey .Values.apiRs.extraEnv "WORKFLOW_ENABLE_MODE") }}
+            - name: WORKFLOW_ENABLE_MODE
+              value: {{ .Values.apiRs.workflowEnableMode | quote }}
+{{- end }}
+{{- if not (hasKey .Values.apiRs.extraEnv "WORKFLOW_ALLOWED_NAMES") }}
+            - name: WORKFLOW_ALLOWED_NAMES
+              value: {{ .Values.apiRs.workflowAllowedNames | quote }}
+{{- end }}
+{{- if and .Values.apiRs.workflowHostResources (not (hasKey .Values.apiRs.extraEnv "WORKFLOW_HOST_RESOURCES")) }}
+            - name: WORKFLOW_HOST_RESOURCES
+              value: {{ toJson .Values.apiRs.workflowHostResources | quote }}
+{{- end }}
+{{- range $env := $apiRsEtlEnv }}
+{{- if not (hasKey $.Values.apiRs.extraEnv $env.name) }}
+            - name: {{ $env.name }}
+              value: {{ $env.value | toString | quote }}
+{{- end }}
+{{- end }}
+            # Forward the chart-rendered ETL workflow config into workflow-host
+            # sandboxes. Operators should set apiRs.etl.* values, not maintain
+            # SESSION_SANDBOX_PASSTHROUGH_ENV by hand.
+            - name: SESSION_SANDBOX_PASSTHROUGH_ENV
+              value: {{ join "," $apiRsEtlPassthroughNames | quote }}
+{{- if .Values.overlay.systemPrompt }}
+            - name: CENTAUR_OVERLAY_DIR
+              value: {{ .Values.overlay.mountPath | quote }}
+{{- end }}
+            # Default harness for warm sandboxes. Per-session sandboxes run
+            # their session's harness regardless (pinned via container args).
+            - name: SESSION_SANDBOX_HARNESS
+              value: {{ .Values.sandbox.harnessEngine | quote }}
+            - name: SESSION_SANDBOX_READY_TIMEOUT_SECS
+              value: {{ .Values.apiRs.sandboxReadyTimeoutSecs | quote }}
+            - name: SESSION_SANDBOX_WARM_POOL_SIZE
+              value: {{ .Values.apiRs.sandboxWarmPoolSize | quote }}
+            - name: SESSION_SANDBOX_WARM_POOL_REPLENISH_INTERVAL_SECS
+              value: {{ .Values.apiRs.sandboxWarmPoolReplenishIntervalSecs | quote }}
+            - name: SESSION_SANDBOX_RUNNING_LIMIT
+              value: {{ .Values.apiRs.sandboxRunningLimit | quote }}
+            - name: SESSION_SANDBOX_MAX_LIFETIME_SECS
+              value: {{ .Values.apiRs.sandboxMaxLifetimeSecs | quote }}
+            - name: SESSION_SANDBOX_REAP_INTERVAL_SECS
+              value: {{ .Values.apiRs.sandboxReapIntervalSecs | quote }}
+            - name: SESSION_EVENTS_RETENTION_DAYS
+              value: {{ .Values.apiRs.sessionEventsRetentionDays | default 0 | quote }}
+            - name: SESSION_EVENTS_RETENTION_SWEEP_INTERVAL_SECS
+              value: {{ .Values.apiRs.sessionEventsRetentionSweepIntervalSecs | quote }}
+            - name: SESSION_SANDBOX_ORPHAN_SWEEP_GRACE_SECS
+              value: {{ .Values.apiRs.sandboxOrphanSweepGraceSecs | quote }}
+            - name: SESSION_SANDBOX_CLEANUP_INTERVAL_SECS
+              value: {{ .Values.apiRs.sandboxCleanupIntervalSecs | quote }}
+            - name: SESSION_SANDBOX_IDLE_CLEANUP_BACKSTOP_SECS
+              value: {{ .Values.apiRs.sandboxIdleCleanupBackstopSecs | quote }}
+            - name: SESSION_ACTIVITY_SUMMARY_ENABLED
+              value: {{ .Values.apiRs.activitySummary.enabled | quote }}
+{{- if .Values.apiRs.activitySummary.enabled }}
+            - name: SESSION_ACTIVITY_SUMMARY_MODEL
+              value: {{ .Values.apiRs.activitySummary.model | quote }}
+            - name: SESSION_ACTIVITY_SUMMARY_OPENAI_BASE_URL
+              value: {{ .Values.apiRs.activitySummary.openaiBaseUrl | quote }}
+            - name: SESSION_ACTIVITY_SUMMARY_MIN_INTERVAL_SECS
+              value: {{ .Values.apiRs.activitySummary.minIntervalSecs | quote }}
+            - name: SESSION_ACTIVITY_SUMMARY_TIMEOUT_SECS
+              value: {{ .Values.apiRs.activitySummary.timeoutSecs | quote }}
+            - name: SESSION_ACTIVITY_SUMMARY_MAX_FACTS
+              value: {{ .Values.apiRs.activitySummary.maxFacts | quote }}
+            - name: SESSION_ACTIVITY_SUMMARY_MAX_OUTPUT_TOKENS
+              value: {{ .Values.apiRs.activitySummary.maxOutputTokens | quote }}
+            - name: SESSION_ACTIVITY_SUMMARY_REASONING_EFFORT
+              value: {{ .Values.apiRs.activitySummary.reasoningEffort | default "" | quote }}
+{{- end }}
+            - name: SESSION_SANDBOX_K8S_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: SESSION_SANDBOX_IMAGE
+              value: {{ printf "%s:%s" .Values.sandbox.image.repository .Values.sandbox.image.tag | quote }}
+            - name: SESSION_SANDBOX_IMAGE_PULL_POLICY
+              value: {{ .Values.sandbox.image.pullPolicy | quote }}
+{{- if .Values.sandbox.stateVolume.enabled }}
+            - name: SESSION_SANDBOX_STATE_VOLUME_ENABLED
+              value: "true"
+{{- if and .Values.sandbox.stateVolume.size (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_STATE_VOLUME_SIZE")) }}
+            - name: SESSION_SANDBOX_STATE_VOLUME_SIZE
+              value: {{ .Values.sandbox.stateVolume.size | quote }}
+{{- end }}
+{{- if and .Values.sandbox.stateVolume.storageClassName (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_STATE_VOLUME_STORAGE_CLASS_NAME")) }}
+            - name: SESSION_SANDBOX_STATE_VOLUME_STORAGE_CLASS_NAME
+              value: {{ .Values.sandbox.stateVolume.storageClassName | quote }}
+{{- end }}
+{{- end }}
+{{- if and .Values.sandbox.resources (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_RESOURCES")) }}
+            - name: SESSION_SANDBOX_RESOURCES
+              value: {{ toJson .Values.sandbox.resources | quote }}
+{{- end }}
+{{- if .Values.global.imagePullSecrets }}
+            - name: SESSION_SANDBOX_IMAGE_PULL_SECRETS
+              value: "{{- range $index, $secret := .Values.global.imagePullSecrets }}{{- if $index }},{{ end -}}{{ $secret.name }}{{- end }}"
+{{- end }}
+            # Node steering for sandbox + iron-proxy pods. Passed to the control
+            # plane rather than templated onto a pod: api-rs creates those pods
+            # at runtime, so nothing this chart renders can reach them.
+{{- if and .Values.sandbox.nodeSelector (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_NODE_SELECTOR")) }}
+            - name: SESSION_SANDBOX_NODE_SELECTOR
+              value: {{ toJson .Values.sandbox.nodeSelector | quote }}
+{{- end }}
+{{- if and .Values.sandbox.podAnnotations (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_POD_ANNOTATIONS")) }}
+            - name: SESSION_SANDBOX_POD_ANNOTATIONS
+              value: {{ toJson .Values.sandbox.podAnnotations | quote }}
+{{- end }}
+{{- if and .Values.sandbox.tolerations (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_TOLERATIONS")) }}
+            - name: SESSION_SANDBOX_TOLERATIONS
+              value: {{ toJson .Values.sandbox.tolerations | quote }}
+{{- end }}
+{{- if and .Values.sandbox.runtimeClassName (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_RUNTIME_CLASS_NAME")) }}
+            - name: SESSION_SANDBOX_RUNTIME_CLASS_NAME
+              value: {{ .Values.sandbox.runtimeClassName | quote }}
+{{- end }}
+{{- if and .Values.sandbox.serviceAccountName (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_SERVICE_ACCOUNT_NAME")) }}
+            - name: SESSION_SANDBOX_SERVICE_ACCOUNT_NAME
+              value: {{ .Values.sandbox.serviceAccountName | quote }}
+{{- end }}
+{{- if and .Values.sandbox.priorityClassName (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_PRIORITY_CLASS_NAME")) }}
+            - name: SESSION_SANDBOX_PRIORITY_CLASS_NAME
+              value: {{ .Values.sandbox.priorityClassName | quote }}
+{{- end }}
+            # Sandboxes call back into this control plane via the in-cluster Service.
+            - name: SESSION_SANDBOX_CENTAUR_API_URL
+              value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}
+{{- if $reposPath }}
+            - name: REPOS_PATH
+              value: {{ $reposPath | quote }}
+{{- if $repoCacheUsePvc }}
+            - name: REPOS_PVC
+              value: {{ $repoCachePvcName | quote }}
+{{- end }}
+{{- end }}
+            - name: KUBERNETES_IRON_PROXY_IMAGE
+              value: {{ printf "%s:%s" .Values.ironProxy.image.repository .Values.ironProxy.image.tag | quote }}
+            - name: KUBERNETES_IRON_PROXY_IMAGE_PULL_POLICY
+              value: {{ .Values.ironProxy.image.pullPolicy | quote }}
+            - name: KUBERNETES_IRON_PROXY_UPSTREAM_DENY_CIDRS
+              value: {{ join "," .Values.ironProxy.upstreamDenyCidrs | quote }}
+{{- if and (not .Values.postgres.enabled) .Values.externalDatabase.cidrs }}
+            # Per-sandbox iron-proxies forward the tool-server sidecar's pool to
+            # the core database; allow them to reach the external database.
+            - name: KUBERNETES_IRON_PROXY_DATABASE_CIDRS
+              value: {{ join "," .Values.externalDatabase.cidrs | quote }}
+            - name: KUBERNETES_IRON_PROXY_DATABASE_PORT
+              value: {{ .Values.externalDatabase.port | quote }}
+{{- end }}
+{{- if and .Values.ironProxy.resources (not (hasKey .Values.apiRs.extraEnv "KUBERNETES_IRON_PROXY_RESOURCES")) }}
+            - name: KUBERNETES_IRON_PROXY_RESOURCES
+              value: {{ toJson .Values.ironProxy.resources | quote }}
+{{- end }}
+            - name: KUBERNETES_FIREWALL_CA_SECRET_NAME
+              value: {{ include "centaur.trustedCaSecretName" . | quote }}
+            - name: KUBERNETES_FIREWALL_CA_KEY_SECRET_NAME
+              value: {{ include "centaur.trustedCaKeySecretName" . | quote }}
+            - name: KUBERNETES_FIREWALL_CA_SECRET_KEY
+              value: {{ .Values.firewall.existingCaSecretKey | default "ca-cert.pem" | quote }}
+            - name: KUBERNETES_FIREWALL_CA_KEY_SECRET_KEY
+              value: {{ .Values.firewall.existingCaKeySecretKey | default "ca-key.pem" | quote }}
+            - name: KUBERNETES_SECRET_ENV_NAME
+              value: {{ include "centaur.secretEnvName" . | quote }}
+{{- if .Values.secrets.bootstrapSecretName }}
+            - name: KUBERNETES_BOOTSTRAP_SECRET_NAME
+              value: {{ .Values.secrets.bootstrapSecretName | quote }}
+{{- end }}
+            # Lets the per-sandbox iron-proxy NetworkPolicies target this control
+            # plane's pods (callback + postgres-listener access).
+            - name: KUBERNETES_API_POD_LABEL_SELECTOR
+              value: {{ printf "app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s,app.kubernetes.io/component=api-rs" (include "centaur.name" .) .Release.Name | quote }}
+            - name: KUBERNETES_IRON_PROXY_SYNC_POD_LABEL_SELECTOR
+              value: {{ printf "app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s,app.kubernetes.io/component=proxy-sync" (include "centaur.name" .) .Release.Name | quote }}
+{{- if .Values.experimentalCompanyContext.enabled }}
+            # Sandboxes call the company-context query API through their proxy.
+            - name: KUBERNETES_IRON_PROXY_COMPANY_CONTEXT_URL
+              value: {{ printf "http://%s:%v" (include "centaur.componentName" (dict "root" . "component" "company-context")) .Values.experimentalCompanyContext.port | quote }}
+            - name: KUBERNETES_IRON_PROXY_COMPANY_CONTEXT_POD_LABEL_SELECTOR
+              value: {{ printf "app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s,app.kubernetes.io/component=company-context" (include "centaur.name" .) .Release.Name | quote }}
+{{- end }}
+            - name: FIREWALL_MANAGER_SECRET_SOURCE
+              value: {{ .Values.ironProxy.secretSource | quote }}
+            - name: FIREWALL_MANAGER_SECRET_TTL
+              value: {{ .Values.ironProxy.secretTtl | quote }}
+{{- if .Values.apiRs.opVault }}
+            - name: OP_VAULT
+              value: {{ .Values.apiRs.opVault | quote }}
+{{- end }}
+{{- if eq .Values.ironProxy.secretSource "onepassword-connect" }}
+            - name: KUBERNETES_OP_CONNECT_HOST
+              value: {{ include "centaur.onepasswordConnectUrl" . | quote }}
+{{- end }}
+            # Harness auth modes: single source of truth (sandbox.*AuthMode).
+            # api-rs reads these to register the matching iron-proxy credential
+            # and propagates them into each sandbox so the agent's auth.json
+            # and the injected credential agree.
+            - name: CODEX_AUTH_MODE
+              value: {{ .Values.sandbox.codexAuthMode | quote }}
+            - name: CLAUDE_CODE_AUTH_MODE
+              value: {{ .Values.sandbox.claudeCodeAuthMode | quote }}
+{{- if .Values.codex.customProviders }}
+            # Shared provider catalog: api-rs derives hostname-scoped proxy
+            # credentials from the same JSON sandboxes use for Codex config.
+            - name: CODEX_CUSTOM_PROVIDERS
+              value: {{ .Values.codex.customProviders | toJson | quote }}
+{{- end }}
+            # Which harness's auth fragment iron-proxy registers (and therefore
+            # which placeholder credential lands in the sandbox env). Must agree
+            # with the harness the sandbox image CMD actually runs.
+            - name: KUBERNETES_IRON_PROXY_HARNESS_ENGINE
+              value: {{ .Values.sandbox.harnessEngine | quote }}
+{{- $sandboxEnvList := list }}
+{{- if and .Values.repoCache.enabled (gt (len $skillDirs) 0) }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_SKILL_DIRS" "value" (join ":" $skillDirs)) }}
+{{- end }}
+{{- if and .Values.repoCache.enabled (gt (len $publicSkillDirs) 0) }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_PUBLIC_SKILL_DIRS" "value" (join ":" $publicSkillDirs)) }}
+{{- end }}
+{{- if not (hasKey .Values.sandbox.extraEnv "COMPANY_CONTEXT_EMBEDDINGS_ENABLED") }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_ENABLED" "value" ($companyContextEmbeddingsEnabled | toString)) }}
+{{- end }}
+{{- if not (hasKey .Values.sandbox.extraEnv "COMPANY_CONTEXT_EMBEDDINGS_MODEL") }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_MODEL" "value" $companyContextEmbeddingsModel) }}
+{{- end }}
+{{- if not (hasKey .Values.sandbox.extraEnv "COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS") }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS" "value" ($companyContextEmbeddingsDimensions | toString)) }}
+{{- end }}
+{{- if and .Values.experimentalCompanyContext.enabled (not (hasKey .Values.sandbox.extraEnv "COMPANY_CONTEXT_API_URL")) }}
+{{- /* The company_context tool's v2 commands call this query API through the proxy. */}}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "COMPANY_CONTEXT_API_URL" "value" (printf "http://%s:%v" (include "centaur.componentName" (dict "root" . "component" "company-context")) .Values.experimentalCompanyContext.port)) }}
+{{- end }}
+{{- if .Values.codex.customProviders }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CODEX_CUSTOM_PROVIDERS" "value" (.Values.codex.customProviders | toJson)) }}
+{{- end }}
+{{- if not (hasKey .Values.sandbox.extraEnv "CENTAUR_TELEMETRY_CAPTURE_TRANSCRIPTS") }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_TELEMETRY_CAPTURE_TRANSCRIPTS" "value" (.Values.sandbox.telemetry.captureTranscripts | toString)) }}
+{{- end }}
+{{- range $k, $v := .Values.sandbox.extraEnv }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" $k "value" ($v | toString)) }}
+{{- end }}
+{{- if and $sandboxEnvList (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_EXTRA_ENV")) }}
+            # Operator sandbox env (sandbox.extraEnv) plus chart-rendered
+            # overlay skill dirs, applied to every codex sandbox api-rs creates.
+            # Carries the harness OTLP trace wiring (endpoint, service name,
+            # NO_PROXY extras) that codex needs to export usage/cost spans.
+            # Same contract as the Python control plane's
+            # KUBERNETES_SANDBOX_EXTRA_ENV.
+            - name: SESSION_SANDBOX_EXTRA_ENV
+              value: {{ $sandboxEnvList | toJson | quote }}
+{{- end }}
+            # console control plane: principals/roles/grants. Per-sandbox
+            # proxies sync their config from proxy-sync.
+            - name: IRON_CONTROL_URL
+              value: {{ include "centaur.consoleUrl" . | quote }}
+            - name: IRON_CONTROL_PROXY_SYNC_URL
+              value: {{ include "centaur.proxySyncUrl" . | quote }}
+            - name: IRON_CONTROL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sIRON_CONTROL_INITIAL_API_KEY" .Values.secretManager.envPrefix }}
+{{- if and .Values.toolServer.enabled (not .Values.toolServer.repo) (eq (len $toolSources) 0) }}
+{{- fail "toolServer.repo (owner/name) must be set when toolServer.enabled=true" }}
+{{- end }}
+{{- if gt (len $toolSources) 0 }}
+{{- $firstToolSource := index $toolSources 0 }}
+{{- $extraToolSources := list }}
+{{- range $index, $source := $toolSources }}
+{{- if gt $index 0 }}
+{{- $extraToolSources = append $extraToolSources $source }}
+{{- end }}
+{{- end }}
+            # Ordered overlay tools are copied into each sandbox at boot by a
+            # tools-bootstrap init container, so adding a tool is a push to the
+            # repo, not an api-rs image rebuild. api-rs reads the same ordered
+            # source list for tool-secret discovery and refreshes grants
+            # in-process.
+            - name: KUBERNETES_TOOLS_REPO
+              value: {{ get $firstToolSource "repo" | quote }}
+{{- with (get $firstToolSource "ref") }}
+            - name: KUBERNETES_TOOLS_REF
+              value: {{ . | quote }}
+{{- end }}
+            - name: KUBERNETES_TOOLS_SUBDIR
+              value: {{ get $firstToolSource "subdir" | quote }}
+            - name: KUBERNETES_TOOLS_VISIBILITY
+              value: {{ get $firstToolSource "visibility" | default "private" | quote }}
+{{- if $extraToolSources }}
+            - name: KUBERNETES_TOOLS_EXTRA_SOURCES
+              value: {{ toJson $extraToolSources | quote }}
+{{- end }}
+{{- if $toolsUseRepoCache }}
+            - name: KUBERNETES_TOOLS_REPO_CACHE_PATH
+              value: {{ .Values.repoCache.hostPath | quote }}
+            - name: KUBERNETES_TOOLS_AUTO_RELOAD
+              value: {{ .Values.repoCache.autoReload | quote }}
+{{- if $repoCacheUsePvc }}
+            - name: KUBERNETES_TOOLS_REPO_CACHE_PVC
+              value: {{ $repoCachePvcName | quote }}
+{{- end }}
+{{- end }}
+            - name: KUBERNETES_TOOLS_RUNNER_IMAGE
+              value: {{ printf "%s:%s" (default .Values.sandbox.image.repository .Values.toolServer.runnerImage.repository) (default .Values.sandbox.image.tag .Values.toolServer.runnerImage.tag) | quote }}
+            - name: KUBERNETES_TOOLS_RUNNER_IMAGE_PULL_POLICY
+              value: {{ default .Values.sandbox.image.pullPolicy .Values.toolServer.runnerImage.pullPolicy | quote }}
+{{- if and .Values.toolServer.githubToken.existingSecretName (not $toolsUseRepoCache) }}
+            - name: KUBERNETES_TOOLS_GITHUB_TOKEN_SECRET
+              value: {{ .Values.toolServer.githubToken.existingSecretName | quote }}
+            - name: KUBERNETES_TOOLS_GITHUB_TOKEN_SECRET_KEY
+              value: {{ .Values.toolServer.githubToken.secretKey | quote }}
+{{- end }}
+{{- end }}
+{{- range $name, $value := .Values.apiRs.extraEnv }}
+{{- if ne $name "SESSION_SANDBOX_PASSTHROUGH_ENV" }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+{{- end }}
+{{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ include "centaur.secretEnvName" . }}
+{{- if and (eq .Values.ironProxy.secretSource "onepassword") .Values.secrets.bootstrapSecretName }}
+            - secretRef:
+                name: {{ .Values.secrets.bootstrapSecretName | quote }}
+{{- end }}
+          ports:
+            - containerPort: {{ .Values.apiRs.port }}
+              name: http
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.apiRs.port }}
+            failureThreshold: {{ .Values.apiRs.startupProbe.failureThreshold }}
+            periodSeconds: {{ .Values.apiRs.startupProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.apiRs.startupProbe.timeoutSeconds }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: {{ .Values.apiRs.port }}
+            failureThreshold: {{ .Values.apiRs.readinessProbe.failureThreshold }}
+            periodSeconds: {{ .Values.apiRs.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.apiRs.readinessProbe.timeoutSeconds }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.apiRs.port }}
+            failureThreshold: {{ .Values.apiRs.livenessProbe.failureThreshold }}
+            periodSeconds: {{ .Values.apiRs.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.apiRs.livenessProbe.timeoutSeconds }}
+          securityContext:
+{{ toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+{{ toYaml .Values.apiRs.resources | nindent 12 }}
+{{- if $useOverlayRepoCache }}
+          volumeMounts:
+            - name: repo-cache
+              mountPath: {{ .Values.repoCache.hostPath | quote }}
+              readOnly: true
+{{- end }}
+{{- if $useOverlayRepoCache }}
+      volumes:
+        - name: repo-cache
+{{- if $repoCacheUsePvc }}
+          persistentVolumeClaim:
+            claimName: {{ $repoCachePvcName | quote }}
+            readOnly: true
+{{- else }}
+          hostPath:
+            path: {{ .Values.repoCache.hostPath | quote }}
+            type: DirectoryOrCreate
+{{- end }}
+{{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $apiRsName }}
+{{- with $apiRsMetricsAnnotations }}
+  annotations:
+{{ toYaml . | nindent 4 }}
+{{- end }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "api-rs") | nindent 4 }}
+spec:
+  selector:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.apiRs.port }}
+      targetPort: {{ .Values.apiRs.port }}
+{{- end }}
