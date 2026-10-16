@@ -571,6 +571,7 @@ fn session_thread_key_from_path(path: &str) -> Option<ThreadKey> {
 
 async fn create_or_get_session(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
     Path(raw_thread_key): Path<String>,
     Json(request): Json<CreateSessionRequest>,
 ) -> Result<Json<CreateSessionResponse>, ApiError> {
@@ -581,15 +582,35 @@ async fn create_or_get_session(
         Some(OnHarnessConflict::Restart) => HarnessConflictPolicy::Restart,
         Some(OnHarnessConflict::Reject) | None => HarnessConflictPolicy::Reject,
     };
-    let outcome = runtime
-        .create_or_get_admitted_session(
-            &thread_key,
-            &harness_type,
-            request.persona_id.as_deref(),
-            request.metadata,
-            on_harness_conflict,
-        )
-        .await?;
+    let principal = match caller.class() {
+        CallerClass::User => existing_session_principal(&runtime, &caller, &thread_key).await?,
+        _ => None,
+    };
+    let outcome = match principal {
+        Some(principal) => {
+            runtime
+                .create_or_get_session_with_principal(
+                    &thread_key,
+                    &harness_type,
+                    request.persona_id.as_deref(),
+                    request.metadata,
+                    on_harness_conflict,
+                    Some(&principal),
+                )
+                .await?
+        }
+        None => {
+            runtime
+                .create_or_get_admitted_session(
+                    &thread_key,
+                    &harness_type,
+                    request.persona_id.as_deref(),
+                    request.metadata,
+                    on_harness_conflict,
+                )
+                .await?
+        }
+    };
     Ok(Json(CreateSessionResponse {
         session: outcome.session,
         harness_switched: outcome.harness_switched,
@@ -605,6 +626,7 @@ async fn whoami(Extension(caller): Extension<AuthenticatedCaller>) -> Json<Whoam
             .capabilities()
             .map(|capability| capability.as_str().to_owned())
             .collect(),
+        console_admin: caller.is_console_admin(),
     })
 }
 
@@ -630,15 +652,34 @@ async fn create_session(
         "{GENERATED_THREAD_KEY_PREFIX}{}",
         Uuid::new_v4().simple()
     ))?;
-    let outcome = runtime
-        .create_or_get_admitted_session(
-            &thread_key,
-            &request.harness_type,
-            request.persona_id.as_deref(),
-            request.metadata,
-            HarnessConflictPolicy::Reject,
-        )
-        .await?;
+    // A session a CLI user creates belongs to them: it binds to their
+    // principal, so they pass later ownership checks and its sandbox runs with
+    // their grants. Other callers get the principal derived from the key.
+    let outcome = match caller.principal_subject() {
+        Some(principal) if caller.class() == CallerClass::User => {
+            runtime
+                .create_or_get_session_with_principal(
+                    &thread_key,
+                    &request.harness_type,
+                    request.persona_id.as_deref(),
+                    request.metadata,
+                    HarnessConflictPolicy::Reject,
+                    Some(principal),
+                )
+                .await?
+        }
+        _ => {
+            runtime
+                .create_or_get_admitted_session(
+                    &thread_key,
+                    &request.harness_type,
+                    request.persona_id.as_deref(),
+                    request.metadata,
+                    HarnessConflictPolicy::Reject,
+                )
+                .await?
+        }
+    };
     Ok((
         StatusCode::CREATED,
         Json(CreateSessionResponse {
@@ -662,6 +703,7 @@ async fn list_sessions(
 ) -> Result<Json<ListSessionsResponse>, ApiError> {
     let principal = match caller.class() {
         CallerClass::Admin | CallerClass::Console => None,
+        CallerClass::User if caller.is_console_admin() => None,
         CallerClass::User => Some(
             caller
                 .principal_subject()
@@ -701,7 +743,7 @@ async fn get_session_summary(
 ) -> Result<Json<SessionSummary>, ApiError> {
     let runtime = state.runtime()?;
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
-    authorize_principal_session_read(&runtime, &caller, &thread_key).await?;
+    authorize_session_access(&runtime, &caller, &thread_key).await?;
     let session = runtime.session(&thread_key).await?;
     let execution = runtime.latest_execution(&thread_key).await?;
     Ok(Json(session_summary(session, execution)))
@@ -743,7 +785,7 @@ async fn get_session_context(
 ) -> Result<Json<SessionContextResponse>, ApiError> {
     let runtime = state.runtime()?;
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
-    authorize_principal_session_read(&runtime, &caller, &thread_key).await?;
+    authorize_session_access(&runtime, &caller, &thread_key).await?;
     let platform = thread_platform(&thread_key);
     let destination = thread_key.chat_destination();
     let (slack, discord, linear, github) = match destination {
@@ -831,12 +873,14 @@ async fn get_session_context(
 
 async fn append_messages(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
     Path(raw_thread_key): Path<String>,
     Json(request): Json<AppendMessagesRequest>,
 ) -> Result<Json<AppendMessagesResponse>, ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
-    let message_ids = state
-        .runtime()?
+    let runtime = state.runtime()?;
+    authorize_session_access(&runtime, &caller, &thread_key).await?;
+    let message_ids = runtime
         .append_messages(&thread_key, &request.messages)
         .await?;
     Ok(Json(AppendMessagesResponse {
@@ -852,9 +896,10 @@ async fn execute_session(
     Json(request): Json<ExecuteSessionRequest>,
 ) -> Result<Json<ExecuteSessionResponse>, ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let runtime = state.runtime()?;
+    authorize_session_access(&runtime, &caller, &thread_key).await?;
     let metadata = sanitize_execute_metadata(caller.class(), request.metadata);
-    let execution = state
-        .runtime()?
+    let execution = runtime
         .enqueue_session_execution(
             &thread_key,
             ExecuteSessionInput {
@@ -892,18 +937,20 @@ fn sanitize_execute_metadata(
 
 async fn interrupt_session_execution(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
     Path(raw_thread_key): Path<String>,
     Json(request): Json<InterruptSessionExecutionRequest>,
 ) -> Result<Json<InterruptSessionExecutionResponse>, ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let runtime = state.runtime()?;
+    authorize_session_access(&runtime, &caller, &thread_key).await?;
     let reason = request
         .reason
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("Interrupted from Slack");
-    let outcome = state
-        .runtime()?
+    let outcome = runtime
         .interrupt_active_execution(&thread_key, reason)
         .await?;
     Ok(Json(InterruptSessionExecutionResponse {
@@ -961,7 +1008,7 @@ async fn stream_events(
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
     let runtime = state.runtime()?;
-    authorize_principal_session_read(&runtime, &caller, &thread_key).await?;
+    authorize_session_access(&runtime, &caller, &thread_key).await?;
     let events = runtime
         .stream_events(
             &thread_key,
@@ -991,21 +1038,47 @@ async fn stream_events(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-async fn authorize_principal_session_read(
+/// Callers with a principal subject (sandboxes and CLI users) reach only the
+/// sessions bound to it; console admins signed in through the CLI reach every
+/// session. Used for both reads and writes.
+async fn authorize_session_access(
     runtime: &SessionRuntime,
     caller: &AuthenticatedCaller,
     thread_key: &ThreadKey,
 ) -> Result<(), ApiError> {
-    let Some(subject) = caller.principal_subject() else {
+    if caller.principal_subject().is_none() || caller.is_console_admin() {
         return Ok(());
-    };
+    }
     let session = runtime.session(thread_key).await?;
-    if principal_subject_owns_session(Some(subject), session.iron_control_principal.as_deref()) {
+    authorize_session_principal(caller, session.iron_control_principal.as_deref())
+}
+
+fn authorize_session_principal(
+    caller: &AuthenticatedCaller,
+    session_principal: Option<&str>,
+) -> Result<(), ApiError> {
+    if caller.is_console_admin()
+        || principal_subject_owns_session(caller.principal_subject(), session_principal)
+    {
         return Ok(());
     }
     Err(ApiError::Forbidden(
         "caller is not authorized for this session".to_owned(),
     ))
+}
+
+/// CLI users never choose thread keys; they create sessions with
+/// `POST /api/sessions`. On the keyed create route they can only resolve a
+/// session that already exists and that they can reach, which keeps its
+/// principal: bindings are immutable.
+async fn existing_session_principal(
+    runtime: &SessionRuntime,
+    caller: &AuthenticatedCaller,
+    thread_key: &ThreadKey,
+) -> Result<Option<String>, ApiError> {
+    let session = runtime.session(thread_key).await?;
+    authorize_session_principal(caller, session.iron_control_principal.as_deref())?;
+    Ok(session.iron_control_principal)
 }
 
 fn principal_subject_owns_session(subject: Option<&str>, session_principal: Option<&str>) -> bool {
@@ -1014,8 +1087,73 @@ fn principal_subject_owns_session(subject: Option<&str>, session_principal: Opti
 
 #[cfg(test)]
 mod session_authorization_tests {
-    use super::{CallerClass, principal_subject_owns_session, sanitize_execute_metadata};
+    use axum::http::{HeaderMap, header};
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde_json::json;
+
+    use super::{
+        ApiError, CallerClass, authorize_session_principal, principal_subject_owns_session,
+        sanitize_execute_metadata,
+    };
+    use crate::auth::{ApiAuthConfig, AuthenticatedCaller};
+
+    fn caller(claims: serde_json::Value) -> AuthenticatedCaller {
+        let mut claims = claims;
+        for (claim, value) in [
+            ("iss", json!("centaur-console")),
+            ("aud", json!("centaur-api")),
+            ("iat", json!(1_700_000_000i64)),
+            ("exp", json!(4_102_444_800i64)),
+        ] {
+            claims[claim] = value;
+        }
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(b"jwt-secret"),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        ApiAuthConfig::testing("jwt-secret")
+            .authenticate(&headers)
+            .unwrap()
+    }
+
+    #[test]
+    fn users_reach_their_own_sessions_and_admins_reach_every_session() {
+        let user = |console_admin: bool| {
+            caller(json!({
+                "sub": "prn_user",
+                "token_use": "user",
+                "scope": "sessions:read sessions:write",
+                "console_admin": console_admin,
+            }))
+        };
+        let allowed = |caller: &AuthenticatedCaller, principal: Option<&str>| {
+            match authorize_session_principal(caller, principal) {
+                Ok(()) => true,
+                Err(ApiError::Forbidden(_)) => false,
+                Err(error) => panic!("unexpected error: {error}"),
+            }
+        };
+
+        let member = user(false);
+        assert!(allowed(&member, Some("prn_user")));
+        assert!(!allowed(&member, Some("prn_other")));
+        assert!(!allowed(&member, None));
+
+        let admin = user(true);
+        assert!(allowed(&admin, Some("prn_other")));
+        assert!(allowed(&admin, None));
+
+        // A sandbox principal never gains admin reach, whatever it claims.
+        let sandbox = caller(json!({ "sub": "prn_sandbox", "console_admin": true }));
+        assert!(!allowed(&sandbox, Some("prn_other")));
+    }
 
     #[test]
     fn principal_session_reads_require_exact_persisted_owner() {

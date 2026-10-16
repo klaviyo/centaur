@@ -56,8 +56,10 @@ impl Capability {
 
 /// OAuth scopes Console grants to user tokens, and the capability each one
 /// carries. Anything not listed here grants nothing.
-const USER_SCOPE_CAPABILITIES: &[(&str, Capability)] =
-    &[("sessions:read", Capability::SessionsRead)];
+const USER_SCOPE_CAPABILITIES: &[(&str, Capability)] = &[
+    ("sessions:read", Capability::SessionsRead),
+    ("sessions:write", Capability::SessionsWrite),
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CallerClass {
@@ -89,6 +91,9 @@ pub(crate) struct AuthenticatedCaller {
     capabilities: BTreeSet<Capability>,
     platform_prefixes: Option<&'static [&'static str]>,
     principal_subject: Option<String>,
+    /// A console admin signed in through the CLI. Their user token reaches
+    /// every session instead of only the ones bound to their principal.
+    console_admin: bool,
 }
 
 impl AuthenticatedCaller {
@@ -114,6 +119,10 @@ impl AuthenticatedCaller {
 
     pub(crate) fn principal_subject(&self) -> Option<&str> {
         self.principal_subject.as_deref()
+    }
+
+    pub(crate) const fn is_console_admin(&self) -> bool {
+        self.console_admin
     }
 }
 
@@ -255,6 +264,7 @@ impl ApiAuthConfig {
                     capabilities: Capability::ALL.into_iter().collect(),
                     platform_prefixes: None,
                     principal_subject: None,
+                    console_admin: false,
                 })
             }
             Some(ApiJwtTokenUse::ConsoleService) => Err(ApiError::Unauthorized(
@@ -272,6 +282,7 @@ impl ApiAuthConfig {
                     capabilities: user_scope_capabilities(claims.scope.as_deref()),
                     platform_prefixes: None,
                     principal_subject: Some(subject),
+                    console_admin: claims.console_admin.unwrap_or(false),
                 })
             }
             None => {
@@ -301,6 +312,7 @@ impl ApiAuthConfig {
                     capabilities,
                     platform_prefixes: None,
                     principal_subject: Some(subject),
+                    console_admin: false,
                 })
             }
         }
@@ -322,6 +334,8 @@ struct ApiJwtClaims {
     capabilities: Option<ApiJwtCapabilities>,
     /// Space-delimited OAuth scopes; only read for user tokens.
     scope: Option<String>,
+    /// Set by the console for admin users; only read for user tokens.
+    console_admin: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -419,6 +433,7 @@ fn static_caller(
             capabilities: capabilities.into_iter().collect(),
             platform_prefixes,
             principal_subject: None,
+            console_admin: false,
         },
     }
 }
@@ -648,7 +663,7 @@ mod tests {
             "iat": 1_700_000_000i64,
             "exp": 4_102_444_800i64,
             "token_use": "user",
-            "scope": "sessions:write mcp:tools *",
+            "scope": "sessions:admin mcp:tools *",
             "capabilities": {
                 "sessions_read": true,
                 "workflows_read": true,
@@ -659,6 +674,45 @@ mod tests {
         let caller = auth.authenticate(&headers).unwrap();
         assert_eq!(caller.class(), CallerClass::User);
         assert_eq!(caller.capabilities().count(), 0);
+    }
+
+    #[test]
+    fn user_jwt_write_scope_and_console_admin_claim() {
+        let auth = ApiAuthConfig::testing("jwt-secret");
+        let claims = |token_use: Option<&str>, console_admin: bool| {
+            let mut claims = json!({
+                "iss": "centaur-console",
+                "sub": "prn_user",
+                "aud": "centaur-api",
+                "iat": 1_700_000_000i64,
+                "exp": 4_102_444_800i64,
+                "scope": "sessions:read sessions:write",
+                "console_admin": console_admin,
+            });
+            if let Some(token_use) = token_use {
+                claims["token_use"] = json!(token_use);
+            }
+            bearer_headers(claims)
+        };
+
+        let caller = auth.authenticate(&claims(Some("user"), true)).unwrap();
+        assert_eq!(caller.class(), CallerClass::User);
+        assert!(caller.is_console_admin());
+        assert_eq!(
+            caller.capabilities().collect::<Vec<_>>(),
+            vec![Capability::SessionsRead, Capability::SessionsWrite]
+        );
+        assert!(
+            !auth
+                .authenticate(&claims(Some("user"), false))
+                .unwrap()
+                .is_console_admin()
+        );
+        // Only user tokens carry admin status; a sandbox principal token that
+        // claims it is still scoped to its principal.
+        let principal = auth.authenticate(&claims(None, true)).unwrap();
+        assert_eq!(principal.class(), CallerClass::Principal);
+        assert!(!principal.is_console_admin());
     }
 
     #[test]

@@ -217,6 +217,9 @@ pub struct WhoamiResponse {
     pub principal: Option<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// A console admin's user token, which reaches every session.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub console_admin: bool,
 }
 
 /// `POST /api/session/{thread_key}/pause`. `paused` is false when the session
