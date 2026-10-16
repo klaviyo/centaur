@@ -70,7 +70,7 @@ enum Command {
 enum ThreadsCommand {
     /// List threads you can see, most recently updated first.
     List {
-        /// Only threads whose key starts with this (e.g. `slack:` or `cli:`).
+        /// Only threads whose key starts with this (e.g. `slack:` or `api:`).
         #[arg(long)]
         prefix: Option<String>,
         /// How many threads to show (the server caps this at 200).
@@ -86,11 +86,8 @@ enum ThreadsCommand {
         json: bool,
     },
     /// Start a new thread and, given a message, run its first turn. Prints the
-    /// thread key.
+    /// thread key, which the server assigns.
     New {
-        /// Thread key to use; defaults to a new `cli:<id>` key.
-        #[arg(long)]
-        thread_key: Option<ThreadKey>,
         /// Harness to run the thread on: codex, claudecode, amp, nanocodex,
         /// hermes, pi, or omp.
         #[arg(long, default_value = "codex")]
@@ -221,14 +218,6 @@ mod tests {
                 "claudecode",
                 "hello",
                 "--wait",
-            ],
-            vec![
-                "centaur",
-                "threads",
-                "new",
-                "--thread-key",
-                "cli:mine",
-                "hi",
             ],
             vec!["centaur", "threads", "send", "cli:abc", "hello", "--json"],
             vec![
