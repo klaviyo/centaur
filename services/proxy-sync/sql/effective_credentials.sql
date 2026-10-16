@@ -32,7 +32,7 @@ effective_grants AS (
     LEFT JOIN oauth_apps oa ON oa.id = bc.oauth_app_id
     LEFT JOIN principals actor ON actor.id = COALESCE($2, $1)
     WHERE oa.provider IS DISTINCT FROM 'runlayer' OR (
-        g.role_id IS NULL AND g.principal_id = actor.id AND (
+        NOT oa.shared AND g.role_id IS NULL AND g.principal_id = actor.id AND (
             (actor.kind = 'console_user' AND actor.console_user_id = bc.created_by_id) OR
             (actor.kind IS DISTINCT FROM 'console_user' AND EXISTS (
                 SELECT 1 FROM user_identities ui
@@ -127,7 +127,7 @@ sources AS (
                 CASE WHEN NOT bc.dead AND (bc.expires_at IS NULL OR bc.expires_at > CURRENT_TIMESTAMP)
                      AND (bc.oauth_app_id IS NULL OR oa.enabled)
                      AND (oa.provider IS DISTINCT FROM 'runlayer' OR
-                          (credential_owner.status = 'active' AND oa.labels->>'mcp_url' = bc.labels->>'runlayer_resource'
+                          (credential_owner.status = 'active' AND $3::text = bc.labels->>'runlayer_resource'
                            AND sr.kind = 'static' AND EXISTS (
                                SELECT 1 FROM static_secrets wrapper
                                WHERE wrapper.id = sr.credential_id AND wrapper.broker_credential_id = bc.id

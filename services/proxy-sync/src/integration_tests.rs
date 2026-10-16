@@ -79,6 +79,7 @@ impl Fixture {
                 vec![]
             },
             console_host: None,
+            runlayer_resource_url: Some("https://tenant.runlayer.test/mcp".to_owned()),
             sync_cache: Arc::new(SyncCache::default()),
             metrics: PrometheusBuilder::new().build_recorder().handle(),
         };
@@ -939,7 +940,7 @@ async fn unknown_or_missing_proxy_tokens_are_rejected() {
 
 #[tokio::test]
 async fn personal_runlayer_credentials_follow_the_owner_and_stop_after_revocation() {
-    let Some(f) = Fixture::new().await else {
+    let Some(mut f) = Fixture::new().await else {
         return;
     };
     sqlx::query("UPDATE users SET status = 'active' WHERE id = $1")
@@ -964,7 +965,7 @@ async fn personal_runlayer_credentials_follow_the_owner_and_stop_after_revocatio
         .unwrap();
     }
     let app = f.oauth_app("runlayer", true).await;
-    sqlx::query("UPDATE oauth_apps SET provider = 'runlayer', labels = jsonb_build_object('mcp_url', 'https://tenant.runlayer.test/mcp') WHERE id = $1")
+    sqlx::query("UPDATE oauth_apps SET provider = 'runlayer' WHERE id = $1")
         .bind(app)
         .execute(&f.pool)
         .await
@@ -1062,11 +1063,9 @@ async fn personal_runlayer_credentials_follow_the_owner_and_stop_after_revocatio
     .execute(&f.pool)
     .await
     .unwrap();
-    sqlx::query("UPDATE oauth_apps SET labels = jsonb_build_object('mcp_url', 'https://changed.runlayer.test/mcp') WHERE id = $1")
-        .bind(app).execute(&f.pool).await.unwrap();
+    f.state.runlayer_resource_url = Some("https://changed.runlayer.test/mcp".to_owned());
     assert!(secret_hosts(&f.sync(&dm).await).is_empty());
-    sqlx::query("UPDATE oauth_apps SET labels = jsonb_build_object('mcp_url', 'https://tenant.runlayer.test/mcp') WHERE id = $1")
-        .bind(app).execute(&f.pool).await.unwrap();
+    f.state.runlayer_resource_url = Some("https://tenant.runlayer.test/mcp".to_owned());
     sqlx::query("UPDATE oauth_apps SET enabled = false WHERE id = $1")
         .bind(app)
         .execute(&f.pool)
@@ -1099,7 +1098,7 @@ async fn personal_runlayer_requires_the_owners_verified_slack_team_and_active_ac
     .await
     .unwrap();
     let app = f.oauth_app("runlayer-slack", true).await;
-    sqlx::query("UPDATE oauth_apps SET provider = 'runlayer', labels = jsonb_build_object('mcp_url', 'https://tenant.runlayer.test/mcp') WHERE id = $1")
+    sqlx::query("UPDATE oauth_apps SET provider = 'runlayer' WHERE id = $1")
         .bind(app)
         .execute(&f.pool)
         .await

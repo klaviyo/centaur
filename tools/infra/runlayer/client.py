@@ -39,7 +39,7 @@ def _https_url(value: str) -> str:
                 return value
     except ValueError:
         pass
-    raise RunlayerError("Runlayer requires an exact HTTPS Plugin MCP URL.")
+    raise RunlayerError("Set RUNLAYER_MCP_URL to an exact HTTPS Plugin MCP URL.")
 
 
 class RunlayerClient:
@@ -61,6 +61,7 @@ class RunlayerClient:
     def _connection(self) -> None:
         if self.url:
             return
+        resource_url = _https_url(os.getenv("RUNLAYER_MCP_URL", "").strip())
         console = os.getenv("CENTAUR_CONSOLE_URL", "http://centaur-console:3000").rstrip("/")
         try:
             response = self.http.get(f"{console}/api/v1/sandbox/oauth_apps")
@@ -71,10 +72,9 @@ class RunlayerClient:
         if not isinstance(apps, list):
             raise RunlayerError("Centaur Console returned an invalid OAuth-app catalog.")
         matches = [app for app in apps if isinstance(app, dict) and app.get("provider") == "runlayer"]
-        labels = matches[0].get("labels") if len(matches) == 1 else None
-        if not isinstance(labels, dict) or not labels.get("mcp_url"):
+        if len(matches) != 1:
             raise RunlayerError("Ask an administrator to configure one personal Runlayer integration in Console.")
-        self.url = _https_url(labels["mcp_url"])
+        self.url = resource_url
         self.connect_url = matches[0].get("start_url")
 
     def initialize(self) -> None:

@@ -10,18 +10,10 @@ module Oauth
       KEY = "runlayer"
       SCOPE = "mcp:proxy"
 
-      def initialize(resource_url: nil)
-        @resource_url = resource_url
-      end
-
-      def for_app(app)
-        with_resource_url(app.labels.is_a?(Hash) ? app.labels["mcp_url"] : nil)
-      end
-      def with_resource_url(url) = self.class.new(resource_url: url)
       def key = KEY
       def display_name = "Runlayer"
       def configured? = resource_uri.present?
-      def resource_url = resource_uri&.to_s
+      def resource_url = configured? ? ENV["RUNLAYER_MCP_URL"].to_s.strip : nil
       def authorization_endpoint = endpoint("authorize")
       def token_endpoint = endpoint("token")
       def registration_endpoint = endpoint("register")
@@ -44,8 +36,7 @@ module Oauth
 
       def preset
         { slug: KEY, description: "Your Runlayer tools and permissions.",
-          allowed_scopes: [ SCOPE ], shared: false, always_available: true,
-          labels: { "mcp_url" => resource_url } }
+          allowed_scopes: [ SCOPE ], shared: false, always_available: true }
       end
 
       def identity_for_user(user)
@@ -75,7 +66,7 @@ module Oauth
       private
 
       def resource_uri
-        raw = @resource_url.to_s.strip
+        raw = ENV["RUNLAYER_MCP_URL"].to_s.strip
         return nil if raw.empty?
 
         uri = URI.parse(raw)
@@ -89,7 +80,7 @@ module Oauth
       end
 
       def resource_uri!
-        resource_uri || raise(Broker::ExchangeError.new("Configure an exact HTTPS Runlayer MCP URL", stage: "config"))
+        resource_uri || raise(Broker::ExchangeError.new("Set RUNLAYER_MCP_URL to an exact HTTPS Runlayer MCP URL", stage: "config"))
       end
 
       def endpoint(action)

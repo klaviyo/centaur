@@ -26,7 +26,7 @@
         <% if app.description.present? && !app.shared? %>
           <p class="line-clamp-2 text-xs text-zinc-500" title="<%= app.description %>"><%= app.description %></p>
         <% end %>
-        <p class="text-xs text-zinc-500"><%= app.shared? ? "Shared with your agents." : app.always_available? ? "Used automatically whenever you ask the bot." : "Used only in your DMs with the bot." %></p>
+        <p class="text-xs text-zinc-500"><%= app.provider == "runlayer" ? "Uses your own Runlayer account in DMs and channels." : app.shared? ? "Shared with your agents." : app.always_available? ? "Used automatically whenever you ask the bot." : "Used only in your DMs with the bot." %></p>
         <div class="mt-auto flex items-center justify-between gap-3 pt-1">
           <% credential = @credentials_by_app_id[app.id] %>
           <% if credential %>
@@ -57,15 +57,7 @@
           <h2 class="font-mono text-sm font-semibold text-zinc-100"><%= provider.display_name %></h2>
         </div>
         <p class="text-xs text-zinc-500"><%= provider.preset[:description] %></p>
-        <% if provider.respond_to?(:with_resource_url) %>
-          <%= form_with url: console_oauth_app_preset_path(provider: provider.key), data: { turbo: false }, class: "space-y-3" do %>
-            <label class="form-label" for="<%= provider.key %>_resource_url">MCP URL</label>
-            <%= url_field_tag :resource_url, nil, id: "#{provider.key}_resource_url", required: true, placeholder: "https://your-tenant.runlayer.com/mcp", class: "form-input" %>
-            <%= submit_tag "Connect", class: "btn-primary" %>
-          <% end %>
-        <% else %>
-          <%= button_to "Connect", console_oauth_app_preset_path(provider: provider.key), class: "btn-primary", form: { data: { turbo: false } } %>
-        <% end %>
+        <%= button_to "Connect", console_oauth_app_preset_path(provider: provider.key), class: "btn-primary", form: { data: { turbo: false } } %>
       </div>
     <% end %>
   </div>

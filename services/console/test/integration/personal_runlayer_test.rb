@@ -4,8 +4,10 @@ class PersonalRunlayerTest < ActionDispatch::IntegrationTest
   RESOURCE = "https://runlayer.example.test/mcp"
 
   setup do
+    @previous_resource_url = ENV["RUNLAYER_MCP_URL"]
+    ENV["RUNLAYER_MCP_URL"] = RESOURCE
     @app = OauthApp.create!(slug: "runlayer", provider: "runlayer", client_id: "registered-client",
-      client_secret: "synthetic-client-secret", labels: { "mcp_url" => RESOURCE }, allowed_scopes: [ "mcp:proxy" ], always_available: true,
+      client_secret: "synthetic-client-secret", allowed_scopes: [ "mcp:proxy" ],
       created_by: users(:acme_admin))
     @alice = users(:member_user)
     @bob = users(:acme_admin)
@@ -20,6 +22,7 @@ class PersonalRunlayerTest < ActionDispatch::IntegrationTest
   end
 
   teardown do
+    @previous_resource_url.nil? ? ENV.delete("RUNLAYER_MCP_URL") : ENV["RUNLAYER_MCP_URL"] = @previous_resource_url
     Console::OauthAppsController.registration_client_factory = -> { Oauth::DynamicRegistration.new }
     Oauth::FlowsController.exchange_client_factory = -> { Broker::AuthorizationCodeClient.new }
     Console::IntegrationsController.disconnect_service_factory = -> { Oauth::DisconnectRunlayer.new }
@@ -90,7 +93,7 @@ class PersonalRunlayerTest < ActionDispatch::IntegrationTest
   test "callback rejects tenant changes and invalid states" do
     login(@alice)
     state = start_flow
-    @app.update!(labels: { "mcp_url" => "https://other.example.test/mcp" })
+    ENV["RUNLAYER_MCP_URL"] = "https://other.example.test/mcp"
     get oauth_callback_url(slug: @app.slug), params: { state: state, code: "unused" }
     assert_response :bad_request
     get oauth_callback_url(slug: @app.slug), params: { state: "tampered", code: "unused" }
@@ -109,7 +112,7 @@ class PersonalRunlayerTest < ActionDispatch::IntegrationTest
     credential.refresh!
     @proxy.update!(requester_principal: @alice_principal)
     assert_equal [ "synthetic-after" ], runlayer_entries.map { |entry| entry.dig("source", "value") }
-    @app.update!(labels: { "mcp_url" => "https://changed.example.test/mcp" })
+    ENV["RUNLAYER_MCP_URL"] = "https://changed.example.test/mcp"
     credential.reload
     assert @app.credential_needs_reconnect?(credential)
     assert_empty runlayer_entries
@@ -185,7 +188,7 @@ class PersonalRunlayerTest < ActionDispatch::IntegrationTest
     end
     assert_response :ok
     app = JSON.parse(response.body).fetch("data").find { |row| row["provider"] == "runlayer" }
-    assert_equal RESOURCE, app.dig("labels", "mcp_url")
+    refute app.fetch("labels").key?("mcp_url")
     refute app.key?("client_secret")
     refute app.key?("client_id")
     login(@alice)
@@ -207,28 +210,33 @@ class PersonalRunlayerTest < ActionDispatch::IntegrationTest
     refute @app.valid?
     provider = @app.provider_strategy
     [ "http://runlayer.example.test/mcp", "https://user:password@example.test/mcp", "https://example.test/mcp?token=x", "https://example.test/*" ].each do |url|
-      refute provider.with_resource_url(url).configured?
+      with_env("RUNLAYER_MCP_URL" => url) { refute provider.configured? }
     end
   end
 
-  test "Runlayer configuration belongs to each OAuth app and does not change the registry" do
-    second = @app.dup
-    second.slug = "second-runlayer"
-    second.labels = { "mcp_url" => "https://second.example.test/mcp" }
-    second.save!
+  test "Runlayer uses deployment configuration and fixes personal requester availability" do
+    @app.labels = { "mcp_url" => "https://ignored.example.test/mcp" }
     assert_equal RESOURCE, @app.provider_strategy.resource_url
-    assert_equal "https://second.example.test/mcp", second.provider_strategy.resource_url
-    refute Oauth::Providers.fetch("runlayer").configured?
-    second.labels = "invalid"
-    refute second.valid?
-    assert second.errors.added?(:labels, "must be a hash")
+    @app.always_available = false
+    assert @app.valid?
+    assert @app.always_available?
+    with_env("RUNLAYER_MCP_URL" => nil) do
+      refute @app.valid?
+      login(@bob)
+      get console_integrations_url
+      assert_select "form[action=?]", console_oauth_app_preset_path(provider: "runlayer"), count: 0
+    end
+    login(@bob)
+    get edit_console_oauth_app_form_path(@app.oid)
+    assert_select "input[name='oauth_app[always_available]'][disabled]"
+    assert_select "input[name='oauth_app[shared]'][disabled]"
   end
 
-  test "admin preset registers the supplied tenant and stores it on the integration" do
+  test "admin preset registers the deployment tenant without accepting a URL from the UI" do
     @app.destroy!
     login(@bob)
     get console_integrations_url
-    assert_select "input[name=resource_url][type=url][required]"
+    assert_select "input[name=resource_url]", count: 0
     calls = []
     transport = ->(**request) do
       calls << request
@@ -239,15 +247,17 @@ class PersonalRunlayerTest < ActionDispatch::IntegrationTest
       HttpClient::Response.new(status: 201, body: { client_id: "registered-client", client_secret: "synthetic-client-secret" }.to_json)
     end
     Console::OauthAppsController.registration_client_factory = -> { Oauth::DynamicRegistration.new(http: HttpClient.new(http: transport)) }
-    assert_no_difference "OauthApp.count" do
-      post console_oauth_app_preset_path(provider: "runlayer"), params: { resource_url: "http://invalid.example.test/mcp" }
+    with_env("RUNLAYER_MCP_URL" => nil) do
+      assert_no_difference "OauthApp.count" do
+        post console_oauth_app_preset_path(provider: "runlayer")
+      end
     end
     assert_empty calls
     assert_difference "OauthApp.count", 1 do
-      post console_oauth_app_preset_path(provider: "runlayer"), params: { resource_url: RESOURCE }
+      post console_oauth_app_preset_path(provider: "runlayer"), params: { resource_url: "https://ignored.example.test/mcp" }
     end
     @app = OauthApp.find_by!(slug: "runlayer")
-    assert_equal({ "mcp_url" => RESOURCE }, @app.labels)
+    assert_empty @app.labels
     assert @app.always_available?
     refute @app.shared?
     assert_redirected_to oauth_start_path(slug: "runlayer")

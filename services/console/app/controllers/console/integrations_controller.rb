@@ -26,7 +26,8 @@ class Console::IntegrationsController < ApplicationController
     @presets = if acting_admin?
       configured = OauthApp.distinct.pluck(:provider)
       Oauth::Providers.registry.values.select do |provider|
-        provider.respond_to?(:preset) && provider.respond_to?(:registration_endpoint) && !configured.include?(provider.key)
+        provider.respond_to?(:preset) && provider.respond_to?(:registration_endpoint) &&
+          (!provider.respond_to?(:configured?) || provider.configured?) && !configured.include?(provider.key)
       end
     else
       []

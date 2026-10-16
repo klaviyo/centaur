@@ -14,12 +14,13 @@ def response(request, result, **kwargs):
 
 def test_configuration_lifecycle_pagination_and_schema(monkeypatch):
     monkeypatch.setenv("CENTAUR_CONSOLE_URL", "http://console.local")
+    monkeypatch.setenv("RUNLAYER_MCP_URL", URL)
     seen = []
     def handler(request):
         seen.append(request)
         assert "Authorization" not in request.headers  # injected outside the sandbox
         if request.url.host == "console.local":
-            return httpx.Response(200, json={"data": [{"provider": "runlayer", "labels": {"mcp_url": URL}, "start_url": "https://console.test/oauth/runlayer/start"}]})
+            return httpx.Response(200, json={"data": [{"provider": "runlayer", "labels": {}, "start_url": "https://console.test/oauth/runlayer/start"}]})
         if request.method == "DELETE":
             return httpx.Response(204)
         body = json.loads(request.content)

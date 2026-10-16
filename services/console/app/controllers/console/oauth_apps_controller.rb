@@ -37,11 +37,9 @@ module Console
       preset = provider.preset
       app = OauthApp.find_by(slug: preset.fetch(:slug))
       unless app
-        provider = provider.with_resource_url(params[:resource_url]) if provider.respond_to?(:with_resource_url)
         if provider.respond_to?(:configured?) && !provider.configured?
-          return redirect_to console_integrations_path, alert: "Enter the exact HTTPS MCP URL for this integration."
+          return redirect_to console_integrations_path, alert: "Configure the integration URL in the deployment environment."
         end
-        preset = provider.preset
         registration = registration_client_factory.call.register(
           endpoint: provider.registration_endpoint,
           redirect_uri: oauth_callback_redirect_uri(preset.fetch(:slug)),

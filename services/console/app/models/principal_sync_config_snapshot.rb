@@ -341,7 +341,7 @@ class PrincipalSyncConfigSnapshot < ApplicationRecord
     static.select! do |secret|
       credential = secret.broker_credential
       credential&.oauth_app&.provider != "runlayer" ||
-        (reconciliation.runlayer_owner?(actor, credential) && actor.grants.exists?(static_secret: secret))
+        (!credential.oauth_app.shared? && reconciliation.runlayer_owner?(actor, credential) && actor.grants.exists?(static_secret: secret))
     end
     gcp_auth = principal.granted_gcp_auth_secrets.to_a
     gcp_id_token = principal.granted_gcp_id_token_secrets.to_a

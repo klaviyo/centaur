@@ -140,12 +140,15 @@ See [docs/API.md](docs/API.md) for the full reference: authentication, request/r
 
 ## Personal Runlayer connections
 
-Enter the exact HTTPS unified Plugin MCP URL on the Runlayer preset in Console
-Integrations. It is saved as the OAuth App's `mcp_url` label with its registered
-client. Each user authorizes their own account; Console
-stores and refreshes its tokens in the existing encrypted broker. Verified Slack
-SSO identities link those connections to Slack requester principals. Runlayer
-connections use owner identity only, with no email fallback or shared-role grants.
+Set `RUNLAYER_MCP_URL` in the Console web and worker environments to the exact
+HTTPS unified Plugin MCP URL. Use the same value for proxy-sync and sandboxes.
+The Integrations preset registers the OAuth client using this deployment
+configuration; there is no URL-entry field. Each user authorizes their own
+account, and Console stores and refreshes its tokens in the encrypted broker.
+Verified Slack SSO identities link those connections to Slack requester principals.
+Runlayer always uses the requester's own connection in DMs and channels. Shared
+accounts, email fallback and shared-role grants are rejected; personal
+availability is fixed rather than selectable.
 
 See [the Runlayer tool guide](../../tools/infra/runlayer/README.md) for client
 registration, callback URLs, endpoint configuration, token lifecycle and rollout
