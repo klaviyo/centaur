@@ -122,6 +122,26 @@ class PersonalRunlayerTest < ActionDispatch::IntegrationTest
     assert_empty runlayer_entries
   end
 
+  test "missing or malformed deployment configuration defers refresh without killing the connection" do
+    credential = connect(@alice, "synthetic-before")
+    credential.refresh_client = Broker::RefreshClient.new(http: ->(**) { flunk "unconfigured provider must not contact upstream" })
+    [ nil, "http://invalid.example.test/mcp" ].each do |url|
+      with_env("RUNLAYER_MCP_URL" => url) do
+        credential.update!(next_attempt_at: Time.current)
+        credential.refresh!
+        refute credential.dead?
+        assert_equal "synthetic-before", credential.access_token
+        assert_equal "synthetic-refresh", credential.refresh_token
+        assert_operator credential.next_attempt_at, :>, Time.current
+        @proxy.update!(requester_principal: @alice_principal)
+        assert_empty runlayer_entries
+      end
+    end
+    credential.reload
+    refute @app.credential_needs_reconnect?(credential)
+    assert_equal [ "synthetic-before" ], runlayer_entries.map { |entry| entry.dig("source", "value") }
+  end
+
   test "disconnect is owner scoped and removes delivery even when remote revoke fails" do
     credential = connect(@alice, "synthetic-alice")
     login(@bob)

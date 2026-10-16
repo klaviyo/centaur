@@ -53,6 +53,10 @@ module Oauth
       end
 
       def refresh_resource(credential)
+        unless configured?
+          raise Broker::RefreshError.new("Runlayer configuration is unavailable; refresh deferred", stage: "config", code: "configuration_unavailable", retryable: true)
+        end
+
         unless credential_resource_matches?(credential)
           raise Broker::RefreshError.new("Runlayer configuration changed; reconnect", stage: "oauth", code: "invalid_grant", retryable: false)
         end
