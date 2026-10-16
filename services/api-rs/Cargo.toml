@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/centaur-api-server",
+    "crates/centaur-api-types",
     "crates/centaur-iron-control",
     "crates/centaur-iron-proxy",
     "crates/centaur-perms",
@@ -36,6 +37,7 @@ absurd-sdk = { path = "../../crates/absurd-sdk" }
 axum = "0.8.9"
 bytes = { version = "1", features = ["serde"] }
 centaur-api-server = { path = "crates/centaur-api-server" }
+centaur-api-types = { path = "crates/centaur-api-types" }
 centaur-iron-control = { path = "crates/centaur-iron-control" }
 centaur-iron-proxy = { path = "crates/centaur-iron-proxy" }
 centaur-sandbox-core = { path = "crates/centaur-sandbox-core" }

@@ -384,6 +384,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.23.1",
+ "centaur-api-types",
  "centaur-iron-control",
  "centaur-iron-proxy",
  "centaur-sandbox-agent-k8s",
@@ -418,6 +419,15 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "urlencoding",
+]
+
+[[package]]
+name = "centaur-api-types"
+version = "0.1.0"
+dependencies = [
+ "centaur-session-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

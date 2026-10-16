@@ -13,6 +13,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose};
+use centaur_api_types::ProtectedResourceMetadata;
 use centaur_sandbox_core::SandboxError;
 use centaur_session_runtime::{
     SessionRuntime, SessionRuntimeError, ToolHostCallInput, ToolHostCallOutput, ToolHostCallPolicy,
@@ -48,16 +49,15 @@ pub(crate) async fn mcp_get() -> Response {
         .into_response()
 }
 
-pub(crate) async fn mcp_protected_resource_metadata(headers: HeaderMap) -> Json<Value> {
-    let authorization_servers = mcp_authorization_server_url()
-        .into_iter()
-        .collect::<Vec<_>>();
-    Json(json!({
-        "resource": mcp_resource_url(&headers),
-        "authorization_servers": authorization_servers,
-        "bearer_methods_supported": ["header"],
-        "scopes_supported": ["mcp:tools"],
-    }))
+pub(crate) async fn mcp_protected_resource_metadata(
+    headers: HeaderMap,
+) -> Json<ProtectedResourceMetadata> {
+    Json(ProtectedResourceMetadata {
+        resource: mcp_resource_url(&headers),
+        authorization_servers: mcp_authorization_server_url().into_iter().collect(),
+        bearer_methods_supported: vec!["header".to_owned()],
+        scopes_supported: vec!["mcp:tools".to_owned()],
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -2101,6 +2101,7 @@ def search(query, limit=20):
         let Json(metadata) = mcp_protected_resource_metadata(HeaderMap::new())
             .now_or_never()
             .unwrap();
+        let metadata = serde_json::to_value(metadata).unwrap();
 
         assert_eq!(metadata["resource"], "http://localhost:3000/mcp");
         assert_eq!(
@@ -2121,6 +2122,7 @@ def search(query, limit=20):
         let Json(metadata) = mcp_protected_resource_metadata(HeaderMap::new())
             .now_or_never()
             .unwrap();
+        let metadata = serde_json::to_value(metadata).unwrap();
 
         assert_eq!(metadata["authorization_servers"], json!([]));
     }
