@@ -35,10 +35,12 @@ steps:
         command: |
           docker build --platform linux/amd64 --build-arg RUST_BUILD_PROFILE=release -f services/githubbot/Dockerfile -t 340433579684.dkr.ecr.us-east-1.amazonaws.com/klaviyo-centaur-githubbot:${BUILDKITE_COMMIT} .
 
-      - label: "Build agent (AMD64)"
+      - label: "Build agent and Klaviyo sandbox (AMD64)"
         timeout_in_minutes: 120
         command: |
+          set -euo pipefail
           docker build --platform linux/amd64 --target sandbox --build-arg RUST_BUILD_PROFILE=release -f services/sandbox/Dockerfile -t 340433579684.dkr.ecr.us-east-1.amazonaws.com/klaviyo-centaur-agent:${BUILDKITE_COMMIT} .
+          docker build --platform linux/amd64 --build-arg CENTAUR_IMAGE=340433579684.dkr.ecr.us-east-1.amazonaws.com/klaviyo-centaur-agent:${BUILDKITE_COMMIT} -f services/klaviyo-sandbox/Dockerfile -t 340433579684.dkr.ecr.us-east-1.amazonaws.com/klaviyo-centaur-sandbox:${BUILDKITE_COMMIT} .
 
       - label: "Build iron-proxy (AMD64)"
         timeout_in_minutes: 120
@@ -79,10 +81,12 @@ steps:
         command: |
           kbc docker-utils build-and-publish -f services/githubbot/Dockerfile -i klaviyo-centaur-githubbot -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
 
-      - label: "Publish agent (AMD64)"
+      - label: "Publish agent and Klaviyo sandbox (AMD64)"
         timeout_in_minutes: 120
         command: |
+          set -euo pipefail
           kbc docker-utils build-and-publish -f services/sandbox/Dockerfile --target sandbox -i klaviyo-centaur-agent -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
+          kbc docker-utils build-and-publish -f services/klaviyo-sandbox/Dockerfile -i klaviyo-centaur-sandbox -t ${BUILDKITE_COMMIT} -b CENTAUR_IMAGE=340433579684.dkr.ecr.us-east-1.amazonaws.com/klaviyo-centaur-agent:${BUILDKITE_COMMIT} -a eng -a dev
 
       - label: "Publish iron-proxy (AMD64)"
         timeout_in_minutes: 120
