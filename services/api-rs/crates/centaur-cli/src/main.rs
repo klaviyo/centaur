@@ -4,8 +4,9 @@
 //! surface can be reviewed with `centaur --help`. Unimplemented commands exit
 //! with an error.
 
-use std::{ffi::OsString, time::Duration};
+use std::{ffi::OsString, process::ExitCode, time::Duration};
 
+use centaur_session_core::{HarnessType, ThreadKey};
 use clap::{Args, Parser, Subcommand};
 use eyre::{Result, bail};
 use url::Url;
@@ -13,6 +14,7 @@ use url::Url;
 mod auth;
 mod oauth;
 mod store;
+mod threads;
 
 #[derive(Debug, Parser)]
 #[command(name = "centaur", version, about = "Manage Centaur threads")]
@@ -66,56 +68,82 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum ThreadsCommand {
-    /// List threads you can see.
+    /// List threads you can see, most recently updated first.
     List {
-        /// Only threads from this platform (slack, github, linear, ...).
+        /// Only threads whose key starts with this (e.g. `slack:` or `cli:`).
         #[arg(long)]
-        platform: Option<String>,
+        prefix: Option<String>,
+        /// How many threads to show (the server caps this at 200).
         #[arg(long, default_value_t = 50)]
         limit: u32,
         #[arg(long)]
         json: bool,
     },
-    /// Show a thread's session, sandbox, and latest execution.
+    /// Show a thread's harness, status, and latest run.
     Show {
-        thread_key: String,
+        thread_key: ThreadKey,
         #[arg(long)]
         json: bool,
     },
-    /// Start a new thread.
+    /// Start a new thread and, given a message, run its first turn. Prints the
+    /// thread key.
     New {
-        /// Harness to run the thread on (codex, claude-code, pi, ...).
+        /// Thread key to use; defaults to a new `cli:<id>` key.
         #[arg(long)]
-        harness: Option<String>,
-        /// First message; read from stdin when omitted.
-        #[arg(long)]
-        message: Option<String>,
+        thread_key: Option<ThreadKey>,
+        /// Harness to run the thread on: codex, claudecode, amp, nanocodex,
+        /// hermes, pi, or omp.
+        #[arg(long, default_value = "codex")]
+        harness: HarnessType,
+        #[command(flatten)]
+        turn: TurnArgs,
     },
     /// Send a message to a thread and run a turn.
-    Send(SendArgs),
-    /// Interrupt a thread's running execution.
+    Send {
+        thread_key: ThreadKey,
+        #[command(flatten)]
+        turn: TurnArgs,
+    },
+    /// Interrupt a thread's running turn.
     Interrupt {
-        thread_key: String,
+        thread_key: ThreadKey,
+        /// Recorded with the interrupt; defaults to naming this CLI.
         #[arg(long)]
         reason: Option<String>,
     },
-    /// Pause a thread's idle sandbox.
-    Pause { thread_key: String },
+    /// Pause a thread's idle sandbox. Needs an operator credential.
+    Pause { thread_key: ThreadKey },
 }
 
+/// A user message and how to wait for the turn it starts.
 #[derive(Debug, Args)]
-struct SendArgs {
-    thread_key: String,
-    /// Message text; read from stdin when omitted.
+struct TurnArgs {
+    /// Message text; read from stdin when omitted and stdin is piped.
     message: Option<String>,
-    /// Wait for the turn to finish and print the final reply.
+    /// Follow the turn, printing the harness's raw output lines (NDJSON) to
+    /// stdout, and exit when it finishes. Exits non-zero if it fails.
     #[arg(long)]
     wait: bool,
+    /// Print the started execution as JSON instead of a status line. With
+    /// `new` and no message, print the created thread as JSON.
+    #[arg(long, conflicts_with = "wait")]
+    json: bool,
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
+async fn main() -> ExitCode {
+    match run(Cli::parse()).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            // The cause chain on one line; eyre's default report adds source
+            // locations, which mean nothing to someone running the CLI.
+            eprintln!("Error: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(cli: Cli) -> Result<()> {
     let http = reqwest::Client::builder()
         .user_agent(concat!("centaur-cli/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
@@ -136,6 +164,7 @@ async fn main() -> Result<()> {
         }
         Command::Logout => auth::logout(&http, &cli.profile).await,
         Command::Whoami { json } => auth::whoami(&http, &cli.profile, cli.api_url, json).await,
+        Command::Threads(command) => threads::run(&http, &cli.profile, cli.api_url, command).await,
         command => bail!(
             "`centaur {}` is not implemented yet",
             command_name(&command)
@@ -148,15 +177,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::Login { .. } => "login",
         Command::Logout => "logout",
         Command::Whoami { .. } => "whoami",
+        Command::Threads(_) => "threads",
         Command::Connect { .. } => "connect",
-        Command::Threads(threads) => match threads {
-            ThreadsCommand::List { .. } => "threads list",
-            ThreadsCommand::Show { .. } => "threads show",
-            ThreadsCommand::New { .. } => "threads new",
-            ThreadsCommand::Send(_) => "threads send",
-            ThreadsCommand::Interrupt { .. } => "threads interrupt",
-            ThreadsCommand::Pause { .. } => "threads pause",
-        },
     }
 }
 
@@ -181,6 +203,59 @@ mod tests {
         ] {
             Cli::try_parse_from(args).unwrap();
         }
+    }
+
+    #[test]
+    fn parses_every_threads_command() {
+        for args in [
+            vec![
+                "centaur", "threads", "list", "--prefix", "cli:", "--limit", "5", "--json",
+            ],
+            vec!["centaur", "threads", "show", "slack:C123:123.456"],
+            vec!["centaur", "threads", "new"],
+            vec![
+                "centaur",
+                "threads",
+                "new",
+                "--harness",
+                "claudecode",
+                "hello",
+                "--wait",
+            ],
+            vec![
+                "centaur",
+                "threads",
+                "new",
+                "--thread-key",
+                "cli:mine",
+                "hi",
+            ],
+            vec!["centaur", "threads", "send", "cli:abc", "hello", "--json"],
+            vec![
+                "centaur",
+                "threads",
+                "interrupt",
+                "cli:abc",
+                "--reason",
+                "stop",
+            ],
+            vec!["centaur", "threads", "pause", "cli:abc"],
+        ] {
+            Cli::try_parse_from(&args).unwrap_or_else(|error| panic!("{args:?}: {error}"));
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_harnesses_and_invalid_thread_keys() {
+        assert!(Cli::try_parse_from(["centaur", "threads", "new", "--harness", "gpt"]).is_err());
+        assert!(Cli::try_parse_from(["centaur", "threads", "show", ""]).is_err());
+        // One stdout format per run: a JSON document or the turn's NDJSON.
+        assert!(
+            Cli::try_parse_from([
+                "centaur", "threads", "send", "cli:a", "hi", "--json", "--wait"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
