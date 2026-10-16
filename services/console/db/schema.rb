@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_10_08_004411) do
+ActiveRecord::Schema[8.1].define(version: 2026_10_16_150807) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -193,6 +193,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_08_004411) do
 
   create_table "mcp_oauth_clients", force: :cascade do |t|
     t.datetime "created_at", null: false
+    t.string "first_party_key"
     t.jsonb "grant_types", default: [], null: false
     t.datetime "last_used_at"
     t.jsonb "metadata", default: {}, null: false
@@ -201,6 +202,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_08_004411) do
     t.jsonb "response_types", default: [], null: false
     t.jsonb "scopes", default: [], null: false
     t.datetime "updated_at", null: false
+    t.index ["first_party_key"], name: "index_mcp_oauth_clients_on_first_party_key", unique: true
   end
 
   create_table "mcp_oauth_refresh_tokens", force: :cascade do |t|

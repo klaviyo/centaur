@@ -28,14 +28,16 @@ Rails.application.routes.draw do
   get "auth/:provider/start", to: "session_oauth#start", as: :auth_start
   get "auth/:provider/callback", to: "session_oauth#callback", as: :auth_callback
 
-  # MCP OAuth authorization server. MCP clients discover this from api-rs'
-  # OAuth protected-resource metadata and register public PKCE clients here.
+  # OAuth authorization server for MCP clients and the `centaur` CLI. Clients
+  # discover it from api-rs' OAuth protected-resource metadata and register
+  # public PKCE clients here.
   get ".well-known/oauth-authorization-server", to: "mcp/oauth#metadata"
   get ".well-known/openid-configuration", to: "mcp/oauth#metadata"
   post "mcp/oauth/register", to: "mcp/oauth#register"
   get "mcp/oauth/authorize", to: "mcp/oauth#authorize"
   post "mcp/oauth/authorize", to: "mcp/oauth#approve"
   post "mcp/oauth/token", to: "mcp/oauth#token"
+  post "mcp/oauth/revoke", to: "mcp/oauth#revoke"
 
   # Operator console (server-rendered HTML UI).
   root "console#principals"
