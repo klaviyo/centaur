@@ -20,7 +20,6 @@ centaur-session-sqlx.workspace = true
 centaur-telemetry.workspace = true
 centaur-workflows.workspace = true
 clap.workspace = true
-eventsource-stream.workspace = true
 futures-util.workspace = true
 hmac.workspace = true
 hex.workspace = true

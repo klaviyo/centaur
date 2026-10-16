@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/centaur-api-client",
     "crates/centaur-api-server",
     "crates/centaur-api-types",
     "crates/centaur-cli",
@@ -37,6 +38,7 @@ async-trait = "0.1"
 absurd-sdk = { path = "../../crates/absurd-sdk" }
 axum = "0.8.9"
 bytes = { version = "1", features = ["serde"] }
+centaur-api-client = { path = "crates/centaur-api-client" }
 centaur-api-server = { path = "crates/centaur-api-server" }
 centaur-api-types = { path = "crates/centaur-api-types" }
 centaur-iron-control = { path = "crates/centaur-iron-control" }

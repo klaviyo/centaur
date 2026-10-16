@@ -6,7 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-centaur-api-server.workspace = true
+centaur-api-client.workspace = true
+centaur-api-types.workspace = true
 centaur-session-core.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 crossterm.workspace = true

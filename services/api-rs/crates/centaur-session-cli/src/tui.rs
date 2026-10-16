@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use centaur_api_server::client::{CentaurClient, SseEventStream};
+use centaur_api_client::{CentaurClient, SseEventStream};
 use centaur_session_core::ThreadKey;
 use crossterm::{
     cursor::{Hide, Show},

@@ -1,9 +1,7 @@
 use std::str::FromStr;
 
-use centaur_api_server::{
-    client::{CentaurClient, SseEvent as ApiSseEvent, SseEventStream},
-    types::{AppendMessagesRequest, CreateSessionRequest, ExecuteSessionRequest},
-};
+use centaur_api_client::{CentaurClient, SseEvent as ApiSseEvent, SseEventStream};
+use centaur_api_types::{AppendMessagesRequest, CreateSessionRequest, ExecuteSessionRequest};
 use centaur_session_core::{HarnessType, MessageRole, SessionMessageInput, ThreadKey};
 use clap::{Parser, ValueEnum};
 use eyre::{Result, WrapErr, bail, eyre};
@@ -90,7 +88,7 @@ async fn main() -> Result<()> {
 
     if attach_mode {
         let events = client
-            .stream_events(&thread_key, args.after_event_id)
+            .stream_events(&thread_key, args.after_event_id, None)
             .await
             .wrap_err("open event stream")?;
         if args.tui {
@@ -132,7 +130,7 @@ async fn main() -> Result<()> {
     };
 
     let events = client
-        .stream_events(&thread_key, args.after_event_id)
+        .stream_events(&thread_key, args.after_event_id, None)
         .await
         .wrap_err("open event stream")?;
 

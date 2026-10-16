@@ -1,6 +1,5 @@
 mod api_jwt;
 mod auth;
-pub mod client;
 mod error;
 mod mcp;
 mod routes;
