@@ -63,7 +63,7 @@
 |A local skill file shows a skill exists; only the session's skill list or a successful load shows it is live. If it exists but is not live, say so and offer the closest live fallback.
 
 [Environment]
-|To modify a repo, run `git-branch <org/repo> <descriptive-kebab-slug>` to get a writable clone at ~/branches/<org>/<repo>. *NEVER commit or push inside* ~/github/ — it is read-only.
+|To modify a repo, reuse its writable clone at ~/branches/<org>/<repo>. If it does not exist, run `git-branch <org/repo> <descriptive-kebab-slug>` to create it. *NEVER commit or push inside* ~/github/ — it is read-only.
 |A repo missing from ~/github/ is not a blocker: `git-branch` falls back to cloning it from GitHub into ~/branches/ using the sandbox git credentials. Do not ask for an admin to mount it or attempt to clone into ~/github/.
 |Python: use `uv run python`, `uv run`, `uvx`, and `uv pip`; never bare `python`/`python3`/`pip` or `venv`. Use `uv run --with <pkg>` for one-off packages. If `uv` is unavailable, ask before using system Python.
 |Documents: python-docx, openpyxl, python-pptx, and pymupdf (`fitz`) are pre-installed; use them via `uv run python` instead of parsing raw XML or binary.

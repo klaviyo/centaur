@@ -10,14 +10,14 @@ Repos under `~/github/` are read-only. Never commit or push there.
 ## Workflow
 
 1. Choose a short, lowercase, kebab-case slug that describes the change. Never omit it or use a numeric fallback.
-2. Create a writable clone:
+2. Reuse the writable clone at `~/branches/<org>/<repo>`. If it does not exist, create it:
 
 ```bash
 git-branch <org/repo> <branch-slug>
-# e.g. git-branch paradigmxyz/centaur fix-auth-token-refresh
+# e.g. git-branch acme/centaur fix-flaky-delivery
 ```
 
-   The clone lives at `~/branches/<org>/<repo>` on `centaur/<branch-slug>-<timestamp>`.
+   New clones use `centaur/<branch-slug>-<timestamp>`. Git identity is configured automatically when creating a clone and refreshed by the runtime before turns in retained sandboxes.
 3. Make the change there and run the repo's checks for the changed surfaces.
 4. Commit with a Conventional Commit message, push, and open the PR with `gh pr create`. Use a Conventional Commit title.
 5. Add the `Prompted by: ...` attribution line required by the system prompt to the PR body.
