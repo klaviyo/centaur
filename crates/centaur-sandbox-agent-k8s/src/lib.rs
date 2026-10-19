@@ -49,6 +49,9 @@ const ARTIFACT_ERROR_MAX_BYTES: usize = 64 * 1024;
 /// connection from one loop that blocks while a pipe is full, so its 1 KiB
 /// default lets a modest burst of output in one direction stall the other.
 const ATTACH_STREAM_BUF_SIZE: usize = 1024 * 1024;
+// Retained pods may still run an older image. Probe the helper's advertised
+// modes before invoking it; those pods gain refresh support when recreated.
+const REFRESH_GIT_IDENTITIES_COMMAND: &str = "if git-branch --help 2>&1 | grep -q -- --refresh-identities; then exec git-branch --refresh-identities; fi";
 // iron-control principal OID the sandbox's proxy binds to, stamped at create
 // so resume (which has only the sandbox id) can rebind without the spec or any
 // in-memory state. Survives pause and api-rs restarts.
@@ -773,7 +776,10 @@ impl SandboxBackend for AgentSandboxBackend {
         labels: &BTreeMap<String, String>,
     ) -> SandboxResult<()> {
         self.ensure_proxy_resources_for_principal(id, principal_id, requester_principal_id, labels)
-            .await
+            .await?;
+        // The proxy assignment and its sync barrier must finish before `gh`
+        // resolves the identity used for commits in a retained writable clone.
+        self.refresh_git_identities(id).await
     }
 
     async fn pause(&self, id: &SandboxId) -> SandboxResult<()> {
@@ -844,6 +850,55 @@ impl SandboxBackend for AgentSandboxBackend {
 }
 
 impl AgentSandboxBackend {
+    /// Refresh before handing the sandbox back to an execution, including when
+    /// the requester is unchanged (their selected GitHub credential can change).
+    async fn refresh_git_identities(&self, id: &SandboxId) -> SandboxResult<()> {
+        let refresh = async {
+            let params = AttachParams::default()
+                .container(self.config.container_name.clone())
+                .stdin(false)
+                .stdout(false)
+                .stderr(true)
+                .tty(false);
+            let mut process = self
+                .pods()
+                .exec(
+                    id.as_str(),
+                    [
+                        "timeout",
+                        "25s",
+                        "bash",
+                        "-c",
+                        REFRESH_GIT_IDENTITIES_COMMAND,
+                    ],
+                    &params,
+                )
+                .await
+                .map_err(|error| map_kube_error("exec Git identity refresh", error))?;
+            let mut stderr = process
+                .stderr()
+                .ok_or_else(|| SandboxError::io("Git identity refresh stderr was not attached"))?;
+            let status = process
+                .take_status()
+                .ok_or_else(|| SandboxError::io("Git identity refresh status was not attached"))?;
+            // Discard command diagnostics rather than log account information.
+            let mut sink = tokio::io::sink();
+            let (drained, status) = tokio::join!(tokio::io::copy(&mut stderr, &mut sink), status);
+            drained
+                .map_err(|error| SandboxError::io_source("drain Git identity refresh", error))?;
+            process.join().await.map_err(|error| {
+                SandboxError::backend_source("join Git identity refresh", error)
+            })?;
+            if status.as_ref().and_then(|status| status.status.as_deref()) != Some("Success") {
+                return Err(SandboxError::backend("sandbox Git identity refresh failed"));
+            }
+            Ok(())
+        };
+        tokio::time::timeout(Duration::from_secs(30), refresh)
+            .await
+            .map_err(|_| SandboxError::backend("sandbox Git identity refresh timed out"))?
+    }
+
     /// Read an artifact through a one-shot pod exec whose stdout is the file body.
     pub async fn read_artifact(
         &self,
@@ -1601,6 +1656,42 @@ mod tests {
         assert!(params.stdin && params.stdout && params.stderr && !params.tty);
         assert_eq!(params.max_stdin_buf_size, Some(ATTACH_STREAM_BUF_SIZE));
         assert_eq!(params.max_stdout_buf_size, Some(ATTACH_STREAM_BUF_SIZE));
+    }
+
+    #[test]
+    fn git_identity_refresh_supports_old_images_and_propagates_failures() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let directory = std::env::temp_dir().join(format!("git-refresh-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let helper = directory.join("git-branch");
+        let path = std::env::join_paths(
+            std::iter::once(directory.clone())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        for (help, refresh_exit, expected) in [
+            ("Usage: git-branch <repo> <slug>", 23, 0),
+            ("Usage: git-branch --refresh-identities", 0, 0),
+            ("Usage: git-branch --refresh-identities", 23, 23),
+        ] {
+            std::fs::write(
+                &helper,
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in\n--help) echo '{help}' >&2;;\n--refresh-identities) exit {refresh_exit};;\n*) exit 99;;\nesac\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let status = Command::new("bash")
+                .args(["-c", REFRESH_GIT_IDENTITIES_COMMAND])
+                .env("PATH", &path)
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(expected));
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
