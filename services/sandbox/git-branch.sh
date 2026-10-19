@@ -13,11 +13,85 @@ set -euo pipefail
 
 usage() {
     echo "Usage: git-branch <org/repo> <branch slug>" >&2
+    echo "       git-branch --refresh-identities" >&2
     echo "Example: git-branch owner/centaur fix-flaky-slack-delivery" >&2
 }
 
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     usage
+    exit 0
+fi
+
+# Match commit authorship to the account that will publish the PR so GitHub does
+# not preserve a separate sandbox identity as a squash-merge co-author.
+resolve_git_identity() {
+    name="${CENTAUR_GIT_USER_NAME:-}"
+    email="${CENTAUR_GIT_USER_EMAIL:-}"
+    local github_identity_query='[.name // .login,
+        .email // ((.id | tostring) + "+" + .login + "@users.noreply.github.com")
+    ] | @tsv'
+
+    if [ -n "$name" ] || [ -n "$email" ]; then
+        if [ -z "$name" ] || [ -z "$email" ]; then
+            echo "Error: CENTAUR_GIT_USER_NAME and CENTAUR_GIT_USER_EMAIL" \
+                "must be set together" >&2
+            return 1
+        fi
+    elif command -v gh >/dev/null 2>&1 && [ -n "${GITHUB_TOKEN:-}" ]; then
+        local identity
+        if ! identity="$({
+            GH_PROMPT_DISABLED=1 timeout 15s gh api user --jq "$github_identity_query"
+        } 2>/dev/null)"; then
+            identity=""
+        fi
+        IFS=$'\t' read -r name email <<< "$identity"
+    fi
+
+    if [ -z "$name" ] || [ -z "$email" ]; then
+        name=""
+        email=""
+        echo "Warning: no Git author identity is configured; set" \
+            "CENTAUR_GIT_USER_NAME and CENTAUR_GIT_USER_EMAIL before committing" >&2
+    fi
+}
+
+clear_git_identity() {
+    # Empty local values override inherited identities. Clear before the network
+    # call so lookup failure or cancellation cannot leave the previous author.
+    git -C "$1" config --local --replace-all user.name ""
+    git -C "$1" config --local --replace-all user.email ""
+    git -C "$1" config --local user.useConfigOnly true
+}
+
+apply_git_identity() {
+    git -C "$1" config --local --replace-all user.name "$name"
+    git -C "$1" config --local --replace-all user.email "$email"
+}
+
+configure_git_identity() {
+    clear_git_identity "$DEST"
+    resolve_git_identity
+    apply_git_identity "$DEST"
+}
+
+if [ "$#" -eq 1 ] && [ "$1" = "--refresh-identities" ]; then
+    # Only writable clones; never modify the read-only repository cache. This
+    # path must not fetch, switch branches, or change staged/working files.
+    shopt -s nullglob
+    repositories=()
+    for git_dir in "$HOME"/branches/*/*/.git; do
+        repositories+=("${git_dir%/.git}")
+    done
+    if [ "${#repositories[@]}" -eq 0 ]; then
+        exit 0
+    fi
+    for repository in "${repositories[@]}"; do
+        clear_git_identity "$repository"
+    done
+    resolve_git_identity
+    for repository in "${repositories[@]}"; do
+        apply_git_identity "$repository"
+    done
     exit 0
 fi
 
@@ -31,38 +105,6 @@ REPO="$1"
 SLUG="$2"
 SRC="$HOME/github/$REPO"
 DEST="$HOME/branches/$REPO"
-
-# Match commit authorship to the account that will publish the PR so GitHub does
-# not preserve a separate sandbox identity as a squash-merge co-author.
-configure_git_identity() {
-    local name="${CENTAUR_GIT_USER_NAME:-}"
-    local email="${CENTAUR_GIT_USER_EMAIL:-}"
-    local github_identity_query='[.name // .login,
-        .email // ((.id | tostring) + "+" + .login + "@users.noreply.github.com")
-    ] | @tsv'
-
-    if [ -n "$name" ] || [ -n "$email" ]; then
-        if [ -z "$name" ] || [ -z "$email" ]; then
-            echo "Error: CENTAUR_GIT_USER_NAME and CENTAUR_GIT_USER_EMAIL" \
-                "must be set together" >&2
-            return 1
-        fi
-    elif command -v gh >/dev/null 2>&1 && [ -n "${GITHUB_TOKEN:-}" ]; then
-        local identity
-        identity="$({
-            GH_PROMPT_DISABLED=1 gh api user --jq "$github_identity_query"
-        } 2>/dev/null || true)"
-        IFS=$'\t' read -r name email <<< "$identity"
-    fi
-
-    if [ -n "$name" ] && [ -n "$email" ]; then
-        git -C "$DEST" config user.name "$name"
-        git -C "$DEST" config user.email "$email"
-    elif ! git -C "$DEST" var GIT_AUTHOR_IDENT >/dev/null 2>&1; then
-        echo "Warning: no Git author identity is configured; set" \
-            "CENTAUR_GIT_USER_NAME and CENTAUR_GIT_USER_EMAIL before committing" >&2
-    fi
-}
 
 if [[ ! "$SLUG" =~ ^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$ ]]; then
     usage

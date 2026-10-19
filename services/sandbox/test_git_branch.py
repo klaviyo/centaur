@@ -7,7 +7,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 SANDBOX_DIR = Path(__file__).parent
 GIT_BRANCH = SANDBOX_DIR / "git-branch.sh"
 COMMIT_MSG_HOOK = SANDBOX_DIR / "git-hooks" / "commit-msg"
@@ -153,6 +152,184 @@ class GitBranchTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("must be set together", result.stderr)
 
+    def _refresh_identities(
+        self, extra_env: dict[str, str]
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(GIT_BRANCH), "--refresh-identities"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "HOME": str(self.home),
+                "GIT_CONFIG_GLOBAL": str(self.home / ".gitconfig"),
+                "CENTAUR_GIT_USER_NAME": "",
+                "CENTAUR_GIT_USER_EMAIL": "",
+                "GITHUB_TOKEN": "",
+                **extra_env,
+            },
+        )
+
+    def test_refresh_updates_all_clones_without_fetching_or_changing_work(self) -> None:
+        first = self._run_git_branch(
+            {
+                "CENTAUR_GIT_USER_NAME": "First User",
+                "CENTAUR_GIT_USER_EMAIL": "first@example.com",
+            }
+        )
+        second = self.home / "branches" / "other" / "repository"
+        self._git("init", str(second))
+        self._git("-C", str(second), "config", "user.name", "First User")
+        self._git("-C", str(second), "config", "user.email", "first@example.com")
+        # Any fetch would fail. Staged and unstaged content must survive refresh.
+        self._git(
+            "-C", str(first), "remote", "set-url", "origin", str(self.root / "missing")
+        )
+        (first / "README.md").write_text("staged\n")
+        self._git("-C", str(first), "add", "README.md")
+        (first / "README.md").write_text("unstaged\n")
+        branch_before = self._git("-C", str(first), "symbolic-ref", "HEAD").stdout
+        index_before = self._git("-C", str(first), "diff", "--cached").stdout
+
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        calls = self.root / "gh-calls"
+        gh = bin_dir / "gh"
+        gh.write_text(
+            "#!/bin/sh\n"
+            f"echo called >> '{calls}'\n"
+            "printf 'Second User\\tsecond@example.com\\n'\n"
+        )
+        gh.chmod(0o755)
+        self._refresh_identities(
+            {"PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_TOKEN": "placeholder"}
+        )
+
+        self.assertEqual(calls.read_text().splitlines(), ["called"])
+        self.assertEqual(
+            self._git("-C", str(first), "symbolic-ref", "HEAD").stdout, branch_before
+        )
+        self.assertEqual(
+            self._git("-C", str(first), "diff", "--cached").stdout, index_before
+        )
+        self.assertEqual((first / "README.md").read_text(), "unstaged\n")
+        self.assertEqual(
+            self._git("-C", str(self.source), "config", "user.name").stdout.strip(),
+            "Seed User",
+        )
+        for destination in (first, second):
+            self._git(
+                "-C",
+                str(destination),
+                "commit",
+                "--allow-empty",
+                "-m",
+                "fix: verify refreshed identity",
+            )
+            identity = self._git(
+                "-C",
+                str(destination),
+                "show",
+                "-s",
+                "--format=%an <%ae>%n%cn <%ce>",
+                "HEAD",
+            ).stdout
+            self.assertEqual(
+                identity.splitlines(), ["Second User <second@example.com>"] * 2
+            )
+
+    def test_failed_or_missing_github_lookup_blocks_stale_identity(self) -> None:
+        destination = self._run_git_branch(
+            {
+                "CENTAUR_GIT_USER_NAME": "Previous User",
+                "CENTAUR_GIT_USER_EMAIL": "previous@example.com",
+            }
+        )
+        # Empty local values must also mask an inherited global identity.
+        (self.home / ".gitconfig").write_text(
+            "[user]\nname = Global User\nemail = global@example.com\n"
+        )
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        gh = bin_dir / "gh"
+        gh.write_text(
+            "#!/bin/sh\nprintf 'Previous User\\tprevious@example.com\\n'\nexit 1\n"
+        )
+        gh.chmod(0o755)
+        for token in ("placeholder", ""):
+            with self.subTest(token_present=bool(token)):
+                self._git(
+                    "-C", str(destination), "config", "user.name", "Previous User"
+                )
+                self._git(
+                    "-C",
+                    str(destination),
+                    "config",
+                    "user.email",
+                    "previous@example.com",
+                )
+                self._refresh_identities(
+                    {"PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_TOKEN": token}
+                )
+                result = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(destination),
+                        "commit",
+                        "--allow-empty",
+                        "-m",
+                        "fix: must not commit",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env={
+                        **os.environ,
+                        "HOME": str(self.home),
+                        "GIT_CONFIG_NOSYSTEM": "1",
+                        "GIT_CONFIG_GLOBAL": str(self.home / ".gitconfig"),
+                    },
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(
+                    self._git(
+                        "-C", str(destination), "config", "--local", "user.name"
+                    ).stdout.strip(),
+                    "",
+                )
+
+    def test_refresh_with_no_clones_does_not_query_github(self) -> None:
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        gh = bin_dir / "gh"
+        gh.write_text('#!/bin/sh\ntouch "$HOME/gh-called"\nexit 1\n')
+        gh.chmod(0o755)
+        self._refresh_identities(
+            {"PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_TOKEN": "placeholder"}
+        )
+        self.assertFalse((self.home / "gh-called").exists())
+
+    def test_refresh_honors_explicit_identity(self) -> None:
+        destination = self._run_git_branch(
+            {
+                "CENTAUR_GIT_USER_NAME": "Previous User",
+                "CENTAUR_GIT_USER_EMAIL": "previous@example.com",
+            }
+        )
+        self._refresh_identities(
+            {
+                "CENTAUR_GIT_USER_NAME": "Service User",
+                "CENTAUR_GIT_USER_EMAIL": "service@example.com",
+            }
+        )
+        self.assertEqual(
+            self._git("-C", str(destination), "config", "user.name").stdout.strip(),
+            "Service User",
+        )
+
     def _advance_upstream(self, default_branch: str = "main") -> str:
         upstream = self.root / "upstream"
         self._git("clone", str(self.source), str(upstream))
@@ -202,13 +379,20 @@ class GitBranchTest(unittest.TestCase):
         (destination / "untracked.txt").write_text("keep me\n")
         upstream_head = self._advance_upstream()
         self._git(
-            "-C", str(destination), "remote", "set-url", "origin", str(self.root / "upstream")
+            "-C",
+            str(destination),
+            "remote",
+            "set-url",
+            "origin",
+            str(self.root / "upstream"),
         )
 
         self.assertEqual(self._run_git_branch({"GITHUB_TOKEN": ""}), destination)
 
         self.assertEqual(
-            self._git("-C", str(destination), "rev-parse", "origin/main").stdout.strip(),
+            self._git(
+                "-C", str(destination), "rev-parse", "origin/main"
+            ).stdout.strip(),
             upstream_head,
         )
         self.assertEqual(
@@ -223,7 +407,12 @@ class GitBranchTest(unittest.TestCase):
 
     def test_fetch_failure_does_not_report_a_stale_checkout_as_success(self) -> None:
         self._git(
-            "-C", str(self.source), "remote", "add", "origin", str(self.root / "missing")
+            "-C",
+            str(self.source),
+            "remote",
+            "add",
+            "origin",
+            str(self.root / "missing"),
         )
         for _ in range(2):
             result = subprocess.run(
@@ -248,7 +437,9 @@ class GitBranchTest(unittest.TestCase):
     def test_clones_uncached_repo_from_github(self) -> None:
         upstream = self.root / "uncached"
         self.source.rename(upstream)
-        upstream_head = self._git("-C", str(upstream), "rev-parse", "HEAD").stdout.strip()
+        upstream_head = self._git(
+            "-C", str(upstream), "rev-parse", "HEAD"
+        ).stdout.strip()
         destination = self._run_git_branch(
             {
                 "GITHUB_TOKEN": "",
@@ -263,7 +454,9 @@ class GitBranchTest(unittest.TestCase):
             upstream_head,
         )
         self.assertEqual(
-            self._git("-C", str(destination), "remote", "get-url", "origin").stdout.strip(),
+            self._git(
+                "-C", str(destination), "remote", "get-url", "origin"
+            ).stdout.strip(),
             "https://github.com/acme/centaur",
         )
         self.assertEqual(list(destination.parent.glob(".git-branch.*")), [])
