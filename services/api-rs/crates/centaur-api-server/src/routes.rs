@@ -50,6 +50,7 @@ use crate::{
     api_jwt::{bearer_jwt_from_headers, decode_jwt_payload, verify_console_jwt},
     auth::{ApiAuthConfig, AuthenticatedCaller, CallerClass, Capability},
     mcp::{mcp_get, mcp_post, mcp_protected_resource_metadata},
+    slack_external_teams::{get_slack_external_team_ids, replace_slack_external_team_ids},
     slack_proxy::slack_proxy_router,
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
@@ -155,7 +156,7 @@ impl AppState {
             .ok_or_else(|| ApiError::BadRequest("workflow runtime is not enabled".to_owned()))
     }
 
-    fn pool(&self) -> Result<PgPool, ApiError> {
+    pub(crate) fn pool(&self) -> Result<PgPool, ApiError> {
         let initialized = self
             .initialized()
             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))?;
@@ -236,6 +237,10 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         )
         .route("/api/sandboxes/drain", post(drain_sandboxes))
         .route("/api/auth/whoami", get(whoami))
+        .route(
+            "/api/slack/external-team-ids",
+            get(get_slack_external_team_ids).put(replace_slack_external_team_ids),
+        )
         .merge(slack_proxy_router())
         .route("/api/workflows/schedules", get(list_workflow_schedules))
         .route(
@@ -508,6 +513,14 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
         (&Method::POST, "/api/workflows/actions/invoke") => {
             capability(Capability::WorkflowsActions)
         }
+        (&Method::GET | &Method::HEAD, "/api/slack/external-team-ids") => {
+            capability(Capability::SlackExternalTeamsRead)
+        }
+        (&Method::PUT, "/api/slack/external-team-ids") => {
+            capability(Capability::SlackExternalTeamsWrite)
+        }
+        // Keep other methods out of the principal-only `/api/slack/` family.
+        (_, "/api/slack/external-team-ids") => None,
         (_, route) if route.starts_with("/api/slack/") => Some(RouteAccess::PrincipalOnly),
         (_, route) if route.starts_with("/api/admin/slack/dm-sync/") => {
             capability(Capability::AdminSync)
@@ -611,10 +624,12 @@ async fn create_or_get_session(
                 .await?
         }
     };
+    let persona_model = runtime.persona_model(&outcome.session).map(str::to_owned);
     Ok(Json(CreateSessionResponse {
         session: outcome.session,
         harness_switched: outcome.harness_switched,
         unavailable_requested_persona_id: outcome.unavailable_requested_persona_id,
+        persona_model,
     }))
 }
 
@@ -680,12 +695,14 @@ async fn create_session(
                 .await?
         }
     };
+    let persona_model = runtime.persona_model(&outcome.session).map(str::to_owned);
     Ok((
         StatusCode::CREATED,
         Json(CreateSessionResponse {
             session: outcome.session,
             harness_switched: outcome.harness_switched,
             unavailable_requested_persona_id: outcome.unavailable_requested_persona_id,
+            persona_model,
         }),
     ))
 }
@@ -1085,15 +1102,24 @@ fn principal_subject_owns_session(subject: Option<&str>, session_principal: Opti
     subject.is_none_or(|subject| session_principal == Some(subject))
 }
 
+/// A workflow that declares `WORKFLOW_STARTERS` may only be started through
+/// the API by those caller classes; undeclared workflows accept any caller
+/// with workflow write access.
+fn caller_may_start_workflow(starters: Option<&BTreeSet<String>>, caller: CallerClass) -> bool {
+    starters.is_none_or(|starters| starters.contains(caller.as_str()))
+}
+
 #[cfg(test)]
 mod session_authorization_tests {
+    use std::collections::BTreeSet;
+
     use axum::http::{HeaderMap, header};
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde_json::json;
 
     use super::{
-        ApiError, CallerClass, authorize_session_principal, principal_subject_owns_session,
-        sanitize_execute_metadata,
+        ApiError, CallerClass, authorize_session_principal, caller_may_start_workflow,
+        principal_subject_owns_session, sanitize_execute_metadata,
     };
     use crate::auth::{ApiAuthConfig, AuthenticatedCaller};
 
@@ -1153,6 +1179,30 @@ mod session_authorization_tests {
         // A sandbox principal never gains admin reach, whatever it claims.
         let sandbox = caller(json!({ "sub": "prn_sandbox", "console_admin": true }));
         assert!(!allowed(&sandbox, Some("prn_other")));
+    }
+
+    #[test]
+    fn declared_workflow_starters_limit_which_callers_may_start_a_run() {
+        let console_only = BTreeSet::from(["console".to_owned()]);
+        assert!(caller_may_start_workflow(
+            Some(&console_only),
+            CallerClass::Console
+        ));
+        for caller_class in [
+            CallerClass::Admin,
+            CallerClass::Ingress,
+            CallerClass::Principal,
+        ] {
+            assert!(!caller_may_start_workflow(
+                Some(&console_only),
+                caller_class
+            ));
+        }
+        assert!(!caller_may_start_workflow(
+            Some(&BTreeSet::new()),
+            CallerClass::Console
+        ));
+        assert!(caller_may_start_workflow(None, CallerClass::Principal));
     }
 
     #[test]
@@ -2666,9 +2716,17 @@ async fn invoke_workflow_button(
 
 async fn create_workflow_run(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
     Json(request): Json<CreateWorkflowRunRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let workflows = workflow_runtime(&state)?;
+    let starters = workflows.workflow_starters(&request.workflow_name);
+    if !caller_may_start_workflow(starters.as_ref(), caller.class()) {
+        return Err(ApiError::Forbidden(format!(
+            "caller is not allowed to start workflow {:?}",
+            request.workflow_name.trim()
+        )));
+    }
     let run = workflows.create_run(request).await?;
     Ok(Json(serde_json::to_value(run)?))
 }

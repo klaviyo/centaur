@@ -601,7 +601,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_16_150807) do
   add_foreign_key "pg_dsn_secrets", "users", column: "created_by_id"
   add_foreign_key "principal_roles", "principals"
   add_foreign_key "principal_roles", "roles"
-  add_foreign_key "principal_sync_config_snapshots", "principals"
+  add_foreign_key "principal_sync_config_snapshots", "principals", on_delete: :cascade
   add_foreign_key "principals", "users", column: "console_user_id"
   add_foreign_key "principals", "users", column: "created_by_id"
   add_foreign_key "proxies", "principals", column: "requester_principal_id", on_delete: :nullify

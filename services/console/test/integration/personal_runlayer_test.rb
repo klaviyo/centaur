@@ -28,7 +28,7 @@ class PersonalRunlayerTest < ActionDispatch::IntegrationTest
     Console::IntegrationsController.disconnect_service_factory = -> { Oauth::DisconnectRunlayer.new }
   end
 
-  test "OAuth connects two owners and A B A turns inject only the active person's token" do
+  test "OAuth connects two owners and each principal serves only its own token" do
     alice_credential = connect(@alice, "synthetic-alice")
     bob_credential = connect(@bob, "synthetic-bob")
     refute_equal alice_credential.id, bob_credential.id
@@ -36,9 +36,8 @@ class PersonalRunlayerTest < ActionDispatch::IntegrationTest
     assert_equal [ @bob_principal.id ], bob_credential.static_secret.grants.pluck(:principal_id)
     assert_equal({ "centaur-tool" => "runlayer" }, alice_credential.static_secret.labels)
     [ [ @alice_principal, "synthetic-alice" ], [ @bob_principal, "synthetic-bob" ],
-      [ @alice_principal, "synthetic-alice" ], [ nil, nil ] ].each do |actor, expected|
-      @proxy.update!(requester_principal: actor)
-      entries = runlayer_entries
+      [ principals(:acme_channel), nil ] ].each do |principal, expected|
+      entries = runlayer_entries(principal)
       assert_equal expected ? [ expected ] : [], entries.map { |entry| entry.dig("source", "value") }
       entries.each do |entry|
         assert_equal [ { "host" => "runlayer.example.test", "methods" => %w[GET POST DELETE], "paths" => [ "/mcp" ] } ], entry["rules"]
@@ -56,35 +55,10 @@ class PersonalRunlayerTest < ActionDispatch::IntegrationTest
     assert_response :bad_request
   end
 
-  test "live DM sync preserves proxy specific Postgres settings with a personal connection" do
-    credential = connect(@alice, "synthetic-alice")
-    pg = pg_dsn_secrets(:acme_analytics_pg)
-    pg.update!(settings: [
-      { "name" => "centaur.principal", "value_from" => { "principal_field" => "foreign_id" } },
-      { "name" => "centaur.requester", "value_from" => { "proxy_label" => "requester" } }
-    ])
-    @alice_principal.grants.create!(pg_dsn_secret: pg, created_by: @alice)
-    @proxy.update!(principal: @alice_principal, requester_principal: nil, labels: { "requester" => "alice-turn" })
-    [ false, true ].each do |revoked|
-      credential.update!(dead: revoked)
-      post api_v1_proxy_sync_url, params: {}.to_json,
-        headers: { "Authorization" => "Bearer iprx_#{'a' * 64}", "Content-Type" => "application/json" }
-      assert_response :ok
-      config = JSON.parse(response.body)
-      entry = config.fetch("postgres").find { |row| row["id"] == pg.oid }
-      assert_equal [
-        { "name" => "centaur.principal", "value" => @alice_principal.foreign_id },
-        { "name" => "centaur.requester", "value" => "alice-turn" }
-      ], entry.fetch("settings")
-      assert_equal revoked ? [] : [ "synthetic-alice" ], runlayer_entries.map { |row| row.dig("source", "value") }
-    end
-  end
-
   test "a mismatched wrapper source cannot substitute another owners token" do
     alice = connect(@alice, "synthetic-alice")
     bob = connect(@bob, "synthetic-bob")
     alice.static_secret.source.update!(config: { "credential_id" => bob.oid })
-    @proxy.update!(principal: @alice_principal, requester_principal: nil)
     assert_empty runlayer_entries
     connect(@alice, "synthetic-alice-reconnected")
     assert_equal [ "synthetic-alice-reconnected" ], runlayer_entries.map { |entry| entry.dig("source", "value") }
@@ -110,7 +84,6 @@ class PersonalRunlayerTest < ActionDispatch::IntegrationTest
     credential.update!(next_attempt_at: Time.current)
     credential.refresh_client = Broker::RefreshClient.new(http: transport)
     credential.refresh!
-    @proxy.update!(requester_principal: @alice_principal)
     assert_equal [ "synthetic-after" ], runlayer_entries.map { |entry| entry.dig("source", "value") }
     ENV["RUNLAYER_MCP_URL"] = "https://changed.example.test/mcp"
     credential.reload
@@ -133,7 +106,6 @@ class PersonalRunlayerTest < ActionDispatch::IntegrationTest
         assert_equal "synthetic-before", credential.access_token
         assert_equal "synthetic-refresh", credential.refresh_token
         assert_operator credential.next_attempt_at, :>, Time.current
-        @proxy.update!(requester_principal: @alice_principal)
         assert_empty runlayer_entries
       end
     end
@@ -155,7 +127,6 @@ class PersonalRunlayerTest < ActionDispatch::IntegrationTest
     assert_redirected_to console_integrations_path
     assert credential.reload.dead?
     assert_nil credential.refresh_token
-    @proxy.update!(requester_principal: @alice_principal)
     assert_empty runlayer_entries
     connect(@alice, "synthetic-reconnected")
     assert_equal [ "synthetic-reconnected" ], runlayer_entries.map { |entry| entry.dig("source", "value") }
@@ -183,7 +154,6 @@ class PersonalRunlayerTest < ActionDispatch::IntegrationTest
     refute credential.static_secret.grants.exists?(principal: @bob_principal)
     grant = Grant.new(role: roles(:acme_infra), static_secret: credential.static_secret, created_by: @alice)
     refute grant.valid?
-    @proxy.update!(requester_principal: @alice_principal)
     credential.update!(expires_at: 1.minute.ago)
     assert_empty runlayer_entries
     credential.update!(expires_at: 1.hour.from_now, dead: true)
@@ -322,8 +292,8 @@ class PersonalRunlayerTest < ActionDispatch::IntegrationTest
     BrokerCredential.find_by!(oauth_app: @app, created_by: user)
   end
 
-  def runlayer_entries
-    PrincipalSyncConfigSnapshot.config_for_proxy(@proxy.reload).fetch("secrets").select do |entry|
+  def runlayer_entries(principal = @alice_principal)
+    PrincipalSyncConfig.config_for(principal.reload).fetch("secrets").select do |entry|
       entry["rules"].any? { |rule| rule["host"] == "runlayer.example.test" }
     end
   end

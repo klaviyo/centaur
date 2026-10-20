@@ -78,12 +78,6 @@ module ApiServer
       CentaurJwt::Hs256.encode(payload, signing_secret: ENV["CENTAUR_JWT_SIGNING_SECRET"])
     end
 
-    # Kept for callers that reason about rotation boundaries directly
-    # (snapshot staleness checks, tests).
-    def window_start_for(principal, timestamp)
-      CentaurJwt::WindowedToken.window_start(principal.oid, timestamp, window_seconds: DEFAULT_WINDOW_SECONDS)
-    end
-
     def rotation_offset(principal)
       CentaurJwt::WindowedToken.rotation_offset(principal.oid, window_seconds: DEFAULT_WINDOW_SECONDS)
     end
