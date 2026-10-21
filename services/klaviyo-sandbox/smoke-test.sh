@@ -5,13 +5,14 @@ pants_version="${1:?Pass the image Pants version}"
 smoke_root="$(mktemp -d)"
 trap 'rm -rf "$smoke_root"' EXIT
 cd "$smoke_root"
+git init --quiet
 
 cat > pants.toml <<TOML
 [GLOBAL]
 pants_version = "$pants_version"
 backend_packages = ["pants.backend.python"]
 pantsd = false
-docker_execution = false
+docker_execution = true
 
 [anonymous-telemetry]
 enabled = false
@@ -23,10 +24,9 @@ enable_resolves = false
 indexes = ["https://pypi.org/simple/"]
 
 [environments-preview.names]
-native = "//:build_machine"
-default = "//:python_3_10"
-python_3_10 = "//:python_3_10"
-python_3_12 = "//:python_3_12"
+default = "//:python_3.10.18"
+python_3_10 = "//:python_3.10.18"
+python_3_12 = "//:python_3.12.9"
 
 [test]
 report = true
@@ -34,8 +34,8 @@ TOML
 
 cat > BUILD <<'BUILD'
 local_environment(name="build_machine", compatible_platforms=["linux_x86_64", "linux_arm64"])
-docker_environment(name="python_3_10", image="python:3.10", fallback_environment="native")
-docker_environment(name="python_3_12", image="python:3.12", fallback_environment="native")
+docker_environment(name="python_3.10.18", image="python:3.10.18")
+docker_environment(name="python_3.12.9", image="python:3.12.9")
 python_tests(name="default", sources=["test_default.py"], interpreter_constraints=["==3.10.*"])
 python_tests(name="py310", sources=["test_python310.py"], interpreter_constraints=["==3.10.*"], environment="python_3_10")
 python_tests(name="py312", sources=["test_python312.py"], interpreter_constraints=["==3.12.*"], environment="python_3_12")

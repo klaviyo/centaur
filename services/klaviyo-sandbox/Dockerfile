@@ -31,7 +31,6 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
 ENV LANG=en_US.UTF-8 \
     LC_ALL=en_US.UTF-8 \
     UV_PYTHON_INSTALL_DIR=/opt/krepo/python \
-    PANTS_CA_CERTS_PATH=/firewall-certs/ca-cert.pem \
     UV_NATIVE_TLS=true
 ENV PATH="/usr/local/go/bin:/home/agent/go/bin:${PATH}"
 
@@ -53,8 +52,6 @@ RUN uv python install "${PYTHON_310}" "${PYTHON_311}" "${PYTHON_312}" "${PYTHON_
 
 # Keep Centaur's system python3 and its installed tool libraries intact.
 ENV PANTS_PYTHON_BOOTSTRAP_SEARCH_PATH="['/opt/krepo/python/3.10/bin', '/opt/krepo/python/3.11/bin', '/opt/krepo/python/3.12/bin', '/opt/krepo/python/3.14/bin', '<PATH>']"
-
-ENV PANTS_DOCKER_EXECUTION=false
 
 ARG PROTOC_VERSION=33.1
 ARG BUF_VERSION=1.3.0
@@ -82,8 +79,13 @@ RUN architecture="$(uname -m)"; \
     curl -fsSL --retry 3 "${url}" -o "/tmp/${launcher}"; \
     curl -fsSL --retry 3 "${url}.sha256" -o "/tmp/${launcher}.sha256"; \
     (cd /tmp && sha256sum -c "${launcher}.sha256"); \
-    install -m 0755 "/tmp/${launcher}" /usr/local/bin/pants; \
+    install -D -m 0755 "/tmp/${launcher}" /usr/local/libexec/pants; \
     rm "/tmp/${launcher}" "/tmp/${launcher}.sha256"
+
+COPY services/klaviyo-sandbox/pants.sh /usr/local/bin/pants
+COPY services/klaviyo-sandbox/pants_native.py services/klaviyo-sandbox/pants.native.toml services/klaviyo-sandbox/native.BUILD /usr/local/share/klaviyo-sandbox/
+COPY services/klaviyo-sandbox/test_pants_native.py /usr/local/share/klaviyo-sandbox/
+RUN chmod 0755 /usr/local/bin/pants
 
 RUN --mount=type=cache,target=/root/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
@@ -102,7 +104,11 @@ ENV GOPATH=/home/agent/go \
     GOPRIVATE=github.com/klaviyo
 
 ARG PANTS_VERSION=2.33.0
-RUN mkdir -p /home/agent/go /home/agent/.cache/go-build \
+ARG GO_COMPAT_VERSION=1.25.0
+RUN uv run --no-project --no-python-downloads --python /opt/krepo/python/3.12/bin/python3.12 \
+         python -m unittest discover -s /usr/local/share/klaviyo-sandbox -p 'test_*.py' \
+    && mkdir -p /home/agent/go /home/agent/.cache/go-build \
+    && GOTOOLCHAIN="go${GO_COMPAT_VERSION}" go version \
     && bootstrap="$(mktemp -d)" \
     && printf '[GLOBAL]\npants_version = "%s"\n[anonymous-telemetry]\nenabled = false\n' \
          "${PANTS_VERSION}" > "${bootstrap}/pants.toml" \
@@ -115,6 +121,7 @@ for minor in 3.10 3.11 3.12 3.14; do
   "python${minor}" -c 'import bz2, ctypes, lzma, sqlite3, ssl, venv; print(ssl.OPENSSL_VERSION)'
 done
 go version
+GOPROXY=off GOTOOLCHAIN="go${GO_COMPAT_VERSION}" go version
 protoc --version
 protoc-gen-go --version
 protoc-gen-go-grpc --version
