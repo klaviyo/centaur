@@ -2,10 +2,35 @@
 set -euo pipefail
 
 pants_version="${1:?Pass the image Pants version}"
+for interpreter in \
+  "$MAINLINE_PYTHON" \
+  /opt/krepo/dev/.pyflink-venv/bin/python \
+  /opt/krepo/dev/.upgrade-venv/bin/python \
+  /opt/krepo/dev/.plugins-venv/bin/python; do
+  uv run --no-project --no-python-downloads --python "$interpreter" python \
+    -c 'import bz2, ctypes, lzma, sqlite3, ssl; print(ssl.OPENSSL_VERSION)'
+done
+go version
+node --version
+protoc --version
+protoc-gen-go --version
+protoc-gen-go-grpc --version
+buf --version
+staticcheck -version
+gotestsum --version
+pkg-config --exists libmemcached libxml-2.0 xmlsec1 openssl zlib
+
 smoke_root="$(mktemp -d)"
 trap 'rm -rf "$smoke_root"' EXIT
 cd "$smoke_root"
 git init --quiet
+
+printf 'int main(void) { return 0; }\n' > native.c
+cc native.c -o native
+./native
+printf 'package main\n/*\n#include <stdlib.h>\n*/\nimport "C"\nfunc main() { _ = C.abs(-1) }\n' > native.go
+CGO_ENABLED=1 go build -o native-go native.go
+./native-go
 
 cat > pants.toml <<TOML
 [GLOBAL]
@@ -37,8 +62,8 @@ local_environment(name="build_machine", compatible_platforms=["linux_x86_64", "l
 docker_environment(name="python_3.10.18", image="python:3.10.18")
 docker_environment(name="python_3.12.9", image="python:3.12.9")
 python_tests(name="default", sources=["test_default.py"], interpreter_constraints=["==3.10.*"])
-python_tests(name="py310", sources=["test_python310.py"], interpreter_constraints=["==3.10.*"], environment="python_3_10")
-python_tests(name="py312", sources=["test_python312.py"], interpreter_constraints=["==3.12.*"], environment="python_3_12")
+python_tests(name="py310", sources=["test_python310.py"], interpreter_constraints=["==3.10.*"])
+python_tests(name="py312", sources=["test_python312.py"], interpreter_constraints=["==3.12.*"])
 BUILD
 
 for target in default python310 python312; do
@@ -67,5 +92,5 @@ assert not any(
     for case in cases
     for result in ("failure", "error", "skipped")
 ), "A smoke test failed or was skipped"
-print("Pants native environments: three passing tests on Python 3.10 and 3.12")
+print("Pants native execution: three passing tests on Python 3.10 and 3.12")
 PY
