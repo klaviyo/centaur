@@ -54,9 +54,7 @@ RUN uv python install "${PYTHON_310}" "${PYTHON_311}" "${PYTHON_312}" "${PYTHON_
 # Keep Centaur's system python3 and its installed tool libraries intact.
 ENV PANTS_PYTHON_BOOTSTRAP_SEARCH_PATH="['/opt/krepo/python/3.10/bin', '/opt/krepo/python/3.11/bin', '/opt/krepo/python/3.12/bin', '/opt/krepo/python/3.14/bin', '<PATH>']"
 
-# k-repo defaults to Docker execution. Use its existing local environment
-# for language builds in sandboxes that have no Docker daemon.
-ENV PANTS_ENVIRONMENTS_PREVIEW_NAMES="{'default': '//:build_machine', 'python_3_10': '//:build_machine', 'python_3_12': '//:build_machine'}"
+ENV PANTS_DOCKER_EXECUTION=false
 
 ARG PROTOC_VERSION=33.1
 ARG BUF_VERSION=1.3.0
@@ -108,7 +106,7 @@ RUN mkdir -p /home/agent/go /home/agent/.cache/go-build \
     && bootstrap="$(mktemp -d)" \
     && printf '[GLOBAL]\npants_version = "%s"\n[anonymous-telemetry]\nenabled = false\n' \
          "${PANTS_VERSION}" > "${bootstrap}/pants.toml" \
-    && (cd "${bootstrap}" && env -u PANTS_ENVIRONMENTS_PREVIEW_NAMES \
+    && (cd "${bootstrap}" && \
          PANTS_CA_CERTS_PATH=/etc/ssl/certs/ca-certificates.crt pants --version) \
     && rm -rf "${bootstrap}"
 
@@ -133,6 +131,10 @@ CGO_ENABLED=1 go build -o "$smoke/cgo-smoke" "$smoke/main.go"
 python3.10 -m venv "$smoke/venv"
 "$smoke/venv/bin/python" -m pip --version
 SMOKE
+
+COPY --chown=1001:1001 services/klaviyo-sandbox/smoke-test.sh /usr/local/share/klaviyo-sandbox/smoke-test.sh
+RUN PANTS_CA_CERTS_PATH=/etc/ssl/certs/ca-certificates.crt \
+    timeout 600 bash /usr/local/share/klaviyo-sandbox/smoke-test.sh "${PANTS_VERSION}"
 
 COPY --chown=1001:1001 services/klaviyo-sandbox/pip.conf /home/agent/.pip/pip.conf
 
