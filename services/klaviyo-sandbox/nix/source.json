@@ -1,9 +1,0 @@
-{
-  "repository": "klaviyo/k-repo",
-  "revision": "e014b1b35dcc42d7c73dd3a2d698fa6f300c23fe",
-  "directory": "scripts/nix",
-  "sha256": {
-    "flake.nix": "b4cfc3546e3acd8add50372d28297d349ba371b806c4bf55169c02a3c691ecdd",
-    "flake.lock": "6a3120aedff2531f92e510dbc75554b74b0bc605782bb74d26f6d5047f7f9e5c"
-  }
-}
