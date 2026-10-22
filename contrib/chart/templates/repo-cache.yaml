@@ -110,6 +110,7 @@ spec:
           imagePullPolicy: {{ $repoCacheImagePullPolicy }}
           command:
             - /usr/local/bin/repo-cache-sync
+          workingDir: /cache
           env:
             - name: REPOSITORIES
               value: {{ join " " $repoCacheRepositories | quote }}
