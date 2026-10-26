@@ -251,7 +251,7 @@ Sandbox entrypoint and wrappers:
 | `CENTAUR_HARNESS_CONFIG_DIR`, `CENTAUR_HARNESS_ADAPTER` | Sandbox image or `sandbox.extraEnv`. | Harness config directory and optional adapter executable. |
 | `CENTAUR_SKILL_DIRS` | Chart-rendered from `overlays.sources[*].skillsSubdir` (default `.agents/skills`) through `SESSION_SANDBOX_EXTRA_ENV`. | Ordered skill directories copied into the agent workspace. |
 | `COMPANY_CONTEXT_API_URL` | Chart-rendered through `SESSION_SANDBOX_EXTRA_ENV` when `experimentalCompanyContext.enabled`, or `sandbox.extraEnv`. | Company-context query API the `company_context v2` commands call through the sandbox proxy, which injects the principal API JWT. Unset disables those commands. |
-| `AGENT_REPO`, `AGENT_PERSONA` | Runtime assignment metadata. | Workspace repo clone and persona prompt. |
+| `AGENT_REPO`, `AGENT_PERSONA` | Runtime assignment metadata. | Optional repo clone and persona prompt. For Codex, the clone is under `~/branches/<org>/<repo>`; other harnesses clone into their workspace. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Sandbox entrypoint or `sandbox.extraEnv`. | Google ADC path; entrypoint creates a local stub when unset. |
 | `CODEX_API_KEY`, `CODEX_HOME`, `CODEX_CONTINUE_THREAD_ID` | `sandbox.extraEnv` or runtime resume. | Codex auth/config/resume behavior. |
 | `CODEX_AUTH_MODE` | `sandbox.codexAuthMode`. | Codex auth flow: `api_key` (default, hits `api.openai.com`) or `access_token` (hits `chatgpt.com` via the brokered ChatGPT login). The chart sets this on api-rs, which propagates it into sandboxes. See [Codex Auth Modes](/deploying-in-production#codex-auth-modes). |
@@ -268,6 +268,33 @@ Sandbox entrypoint and wrappers:
 | `DEPLOY_ENV`, `ENVIRONMENT`, `TRACEPARENT` | Deployment env or wrapper-generated. | Runtime environment and trace context. |
 | `CALL_TIMEOUT_SECONDS` | Sandbox env before running `call`. | Curl watchdog for API tool calls. |
 | `SLACK_CHANNEL`, `SLACK_THREAD_TS` | Sandbox env. | File-upload helper target. |
+
+### Codex runtime instructions and skills
+
+Codex starts in `~/codex-workspace`, or `$CENTAUR_STATE_DIR/codex-workspace`
+when persistent state is enabled. This directory must be outside any Git
+checkout. An optional `AGENT_REPO` clone and checkouts created with `git-branch`
+live separately under `~/branches/<org>/<repo>`. Use an explicit tool working
+directory when running commands against those checkouts; native features that
+infer a Git repository from the session directory need an explicit target.
+
+Startup composes the base, deployment overlays, persona, and access restrictions
+in the usual order and writes the result to `$CODEX_HOME/AGENTS.md` (default
+`~/.codex/AGENTS.md`) as well as the runtime workspace. The default Codex config
+sets `project_doc_max_bytes = 0`, which preserves that global prompt while
+excluding checkout-local `AGENTS.md` and `AGENTS.override.md` from automatic
+instruction loading.
+
+Native skill instructions remain enabled. Only the configured Centaur skill
+sources are copied into the runtime's `.agents/skills`; refresh replaces that
+managed catalog so deleted skills and stale workspace additions do not remain.
+Sibling repository skill directories are outside Codex's discovery ancestry.
+The agent can still read repository files through its tools.
+
+Operator-supplied `CODEX_CONFIG_OVERLAY` settings still take precedence over the
+image defaults. Remove any `skills.include_instructions = false` override to
+enable the Centaur catalog. Roll this layout out to fresh threads: previously
+loaded instructions remain in existing conversation history.
 
 ## Workflows
 

@@ -8,6 +8,29 @@ import compose_system_prompt
 
 
 class ComposeSystemPromptTest(unittest.TestCase):
+    def test_refreshes_codex_global_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            target = home / "workspace" / "AGENTS.md"
+            target.parent.mkdir()
+            (home / "AGENTS.md").write_text("base\n")
+            (home / "AGENTS_OVERLAY.md").write_text("overlay\n")
+            codex_home = home / "codex-state"
+
+            for persona in ("first persona\n", "updated persona\n"):
+                (home / "AGENTS_PERSONA.md").write_text(persona)
+                compose_system_prompt.compose_system_prompt(
+                    home_dir=home,
+                    target_prompt=target,
+                    repo_mount=home / "github",
+                    codex_home=codex_home,
+                )
+                expected = compose_system_prompt.SEPARATOR.join(
+                    ["base\n", "overlay\n", persona]
+                )
+                self.assertEqual(target.read_text(), expected)
+                self.assertEqual((codex_home / "AGENTS.md").read_text(), expected)
+
     def test_appends_multiple_overlay_prompts_in_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -38,6 +38,7 @@ def compose_system_prompt(
     target_prompt: Path,
     repo_mount: Path,
     observability_enabled: bool = True,
+    codex_home: Path | None = None,
 ) -> None:
     base_prompt = home_dir / "AGENTS_BASE.md"
     baked_prompt = home_dir / "AGENTS.md"
@@ -70,6 +71,9 @@ def compose_system_prompt(
 
     effective_prompt = SEPARATOR.join(fragments)
     target_prompt.write_text(effective_prompt)
+    if codex_home is not None:
+        codex_home.mkdir(parents=True, exist_ok=True)
+        (codex_home / "AGENTS.md").write_text(effective_prompt)
 
 
 def main() -> int:
@@ -77,6 +81,7 @@ def main() -> int:
     parser.add_argument("--home-dir", default=os.path.expanduser("~"))
     parser.add_argument("--repo-mount")
     parser.add_argument("--target-prompt", required=True)
+    parser.add_argument("--codex-home")
     args = parser.parse_args()
 
     home_dir = Path(args.home_dir)
@@ -84,6 +89,7 @@ def main() -> int:
         home_dir=home_dir,
         target_prompt=Path(args.target_prompt),
         repo_mount=Path(args.repo_mount) if args.repo_mount else home_dir / "github",
+        codex_home=Path(args.codex_home) if args.codex_home else None,
         observability_enabled=os.environ.get(
             "CENTAUR_SANDBOX_OBSERVABILITY_ENABLED", "true"
         ).lower()

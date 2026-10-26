@@ -367,6 +367,14 @@ def _skill_sources() -> list[Path]:
 
 def _refresh_skill_dirs(workspace_dir: Path) -> int:
     workspace_skills = workspace_dir / ".agents" / "skills"
+    # Codex's neutral runtime is exclusively managed by Centaur. Rebuild its
+    # catalog on refresh so removed skills and stale local additions disappear.
+    # Other harnesses retain their existing workspace skill merge behavior.
+    if os.environ.get("CENTAUR_MANAGED_SKILLS_ONLY") == "1":
+        if workspace_skills.is_symlink():
+            workspace_skills.unlink()
+        elif workspace_skills.is_dir():
+            shutil.rmtree(workspace_skills)
     copied = 0
     for skills_src in _skill_sources():
         copied += _copy_skill_dir(skills_src, workspace_skills)

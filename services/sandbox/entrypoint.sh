@@ -380,6 +380,25 @@ if [ "${CENTAUR_PERSISTENT_STATE:-0}" = "1" ]; then
 else
     WORKSPACE_DIR="$HOME_DIR/workspace"
 fi
+CHECKOUT_DIR="$WORKSPACE_DIR"
+# Keep Codex's native instruction/config/skill discovery outside all checkouts,
+# including legacy persistent workspaces which may already contain a clone.
+if [ "${1:-}" = "harness-server" ] && [ "${2:-codex}" = "codex" ]; then
+    if [ "${CENTAUR_PERSISTENT_STATE:-0}" = "1" ]; then
+        WORKSPACE_DIR="$STATE_DIR/codex-workspace"
+    else
+        WORKSPACE_DIR="$HOME_DIR/codex-workspace"
+    fi
+    if git -C "$WORKSPACE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+        echo "Codex runtime directory must be outside a repository: $WORKSPACE_DIR" >&2
+        exit 1
+    fi
+    export CENTAUR_MANAGED_SKILLS_ONLY=1
+    if [ -n "${AGENT_REPO:-}" ]; then
+        CHECKOUT_DIR="$HOME_DIR/branches/$AGENT_REPO"
+        mkdir -p "$(dirname "$CHECKOUT_DIR")"
+    fi
+fi
 if [ -n "${AGENT_REPO:-}" ]; then
     REPO_PATH="$HOME_DIR/github/$AGENT_REPO"
     if ! git -C "$REPO_PATH" rev-parse --git-dir >/dev/null 2>&1; then
@@ -387,20 +406,20 @@ if [ -n "${AGENT_REPO:-}" ]; then
         exit 1
     fi
 
-    if ! git -C "$WORKSPACE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
-        rm -rf "$WORKSPACE_DIR"
-        if ! git clone --quiet --shared "$REPO_PATH" "$WORKSPACE_DIR"; then
+    if ! git -C "$CHECKOUT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+        rm -rf "$CHECKOUT_DIR"
+        if ! git clone --quiet --shared "$REPO_PATH" "$CHECKOUT_DIR"; then
             echo "shared clone failed for $REPO_PATH; retrying with regular clone" >&2
-            rm -rf "$WORKSPACE_DIR"
-            git clone --quiet "$REPO_PATH" "$WORKSPACE_DIR"
+            rm -rf "$CHECKOUT_DIR"
+            git clone --quiet "$REPO_PATH" "$CHECKOUT_DIR"
         fi
 
         BRANCH="agent-$(date +%s)-${RANDOM}-${RANDOM}"
-        git -C "$WORKSPACE_DIR" checkout -q -b "$BRANCH" || true
+        git -C "$CHECKOUT_DIR" checkout -q -b "$BRANCH" || true
     fi
-else
-    mkdir -p "$WORKSPACE_DIR"
 fi
+mkdir -p "$WORKSPACE_DIR"
+export WORKSPACE_DIR
 
 # ── Ensure uploads directory exists ──────────────────────────────────────────
 mkdir -p "$HOME_DIR/uploads"
@@ -431,7 +450,8 @@ unset _centaur_tools_auto_reload
 TARGET_PROMPT="$WORKSPACE_DIR/AGENTS.md"
 compose-system-prompt \
     --home-dir "$HOME_DIR" \
-    --target-prompt "$TARGET_PROMPT"
+    --target-prompt "$TARGET_PROMPT" \
+    --codex-home "${CODEX_HOME:-$HOME_DIR/.codex}"
 
 # Switch to workspace so the harness reads workspace/AGENTS.md (with persona overlay)
 cd "$WORKSPACE_DIR"
