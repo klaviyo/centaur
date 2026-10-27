@@ -16,15 +16,16 @@ class Console::SkillsController < ApplicationController
 
   def new
     @skill = current_user.skills.new(content: "# Instructions")
-    prepare_editor_picker
+    prepare_access_pickers
   end
 
   def create
     attributes = skill_params
     editor_oids = attributes.delete(:editor_oids)
+    reader_oids = attributes.delete(:reader_oids)
     @skill = current_user.skills.new(attributes)
-    prepare_editor_picker(editor_oids)
-    if save_with_editors
+    prepare_access_pickers(editor_oids, reader_oids)
+    if save_with_access
       redirect_to console_skill_path(@skill.oid), notice: "Skill created."
     else
       render :new, status: :unprocessable_entity
@@ -33,16 +34,18 @@ class Console::SkillsController < ApplicationController
 
   def edit
     @skill = editable_skill
-    prepare_editor_picker
+    prepare_access_pickers
   end
 
   def update
     @skill = editable_skill
     attributes = skill_params
     editor_oids = attributes.delete(:editor_oids)
+    reader_oids = attributes.delete(:reader_oids)
+    attributes.delete(:visibility) unless owner?
     @skill.assign_attributes(attributes)
-    prepare_editor_picker(owner? ? editor_oids : nil)
-    if save_with_editors(manage_editors: owner?)
+    prepare_access_pickers(owner? ? editor_oids : nil, owner? ? reader_oids : nil)
+    if save_with_access(manage_access: owner?)
       redirect_to console_skill_path(@skill.oid), notice: "Skill saved."
     else
       render :edit, status: :unprocessable_entity
@@ -75,7 +78,8 @@ class Console::SkillsController < ApplicationController
     @tab = tab
     @query = params[:q].to_s.strip
     @skills = if @tab == "mine"
-      Skill.editable_by(current_user).includes(:user)
+      Skill.catalog_visible_to(current_user).where(visibility: "private")
+        .or(Skill.editable_by(current_user)).includes(:user)
     else
       Skill.active.shared.includes(:user)
     end
@@ -102,50 +106,60 @@ class Console::SkillsController < ApplicationController
   end
 
   def skill_params
-    params.require(:skill).permit(:name, :description, :content, :lock_version, editor_oids: [])
+    params.require(:skill).permit(:name, :description, :content, :visibility, :lock_version, editor_oids: [], reader_oids: [])
   end
 
   def owner?
     @skill.user_id == current_user.id
   end
 
-  def prepare_editor_picker(submitted_oids = nil)
+  def prepare_access_pickers(submitted_oids = nil, submitted_reader_oids = nil)
     @editor_candidates = User.active.where.not(id: @skill.user_id || current_user.id).order(:email)
     @selected_editors = if submitted_oids.nil?
       @skill.persisted? ? @skill.editors.active.order(:email).to_a : []
     else
-      resolve_editor_users(submitted_oids)
+      resolve_access_users(submitted_oids, :editors)
+    end
+    @selected_readers = if submitted_reader_oids.nil?
+      @skill.persisted? ? @skill.readers.active.order(:email).to_a : []
+    else
+      resolve_access_users(submitted_reader_oids, :readers)
     end
   end
 
-  def resolve_editor_users(oids)
+  def resolve_access_users(oids, permission)
     submitted = Array(oids).compact_blank.uniq
     ids = submitted.filter_map { |oid| User.decode_oid(oid) }
     users_by_id = User.active.where(id: ids).index_by(&:id)
     users = ids.filter_map { |id| users_by_id[id] }.reject { |user| user.id == @skill.user_id }
 
     if ids.length != submitted.length || users.length != ids.length
-      @skill.errors.add(:editors, "include an unavailable user")
-      @editor_selection_invalid = true
+      @skill.errors.add(permission, "include an unavailable user")
+      @access_selection_invalid = permission
     end
     users
   end
 
-  def save_with_editors(manage_editors: true)
+  def save_with_access(manage_access: true)
     return false unless @skill.valid?
-    if @editor_selection_invalid
-      @skill.errors.add(:editors, "include an unavailable user")
+    if @access_selection_invalid
+      @skill.errors.add(@access_selection_invalid, "include an unavailable user")
       return false
     end
 
-    if manage_editors
+    if manage_access
       selected_ids = @selected_editors.map(&:id)
-      @skill.updated_at = Time.current if @skill.editor_ids.sort != selected_ids.sort
+      if @skill.editor_ids.sort != selected_ids.sort || @skill.reader_ids.sort != @selected_readers.map(&:id).sort
+        @skill.updated_at = Time.current
+      end
     end
 
     Skill.transaction do
       @skill.save!
-      @skill.editor_ids = @selected_editors.map(&:id) if manage_editors
+      if manage_access
+        @skill.editor_ids = @selected_editors.map(&:id)
+        @skill.reader_ids = @selected_readers.map(&:id)
+      end
     end
     true
   end

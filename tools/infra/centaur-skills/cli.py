@@ -192,6 +192,36 @@ def remove_editor(
     print(json.dumps({"data": result}, indent=2, default=str))
 
 
+@app.command("readers")
+def readers(identifier: str = typer.Argument(..., help="OID of an owned skill")) -> None:
+    """List explicit read ACL entries (owner only)."""
+    with get_client() as client:
+        result = client.list_readers(identifier)
+    print(json.dumps({"data": result}, indent=2, default=str))
+
+
+@app.command("add-reader")
+def add_reader(
+    identifier: str = typer.Argument(..., help="OID of an owned skill"),
+    target: str = typer.Argument(..., help="Console user email or usr_ OID"),
+) -> None:
+    """Grant read access to an owned skill."""
+    with get_client() as client:
+        result = client.add_reader(identifier, target)
+    print(json.dumps({"data": result}, indent=2, default=str))
+
+
+@app.command("remove-reader")
+def remove_reader(
+    identifier: str = typer.Argument(..., help="OID of an owned skill"),
+    target: str = typer.Argument(..., help="Console user email or usr_ OID"),
+) -> None:
+    """Revoke an explicit read ACL entry on an owned skill."""
+    with get_client() as client:
+        result = client.remove_reader(identifier, target)
+    print(json.dumps({"data": result}, indent=2, default=str))
+
+
 def _resolve_instructions(
     instructions: str | None,
     instructions_file: Path | None,

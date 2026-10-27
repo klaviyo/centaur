@@ -12,10 +12,14 @@ operating knowledge, QA playbooks, investigation steps, or formatting rules.
 
 Users can author a skill's name, description, and Markdown instructions from the
 Console Skills page. Console generates the complete `SKILL.md` when an agent
-reads it. Private skills are available only to that user's Console principal.
+reads it. Private skills are available to the owner and explicitly selected
+Console users. **Readers** can discover and read the skill; **Editors** can
+read and update it. Only the owner can manage access, sharing, or archiving.
+Choose Readers and Editors on the skill form. Private skills shared with you
+appear under My Skills as well as in your sandbox catalog.
 Shared skills are available to every principal and update immediately when
 their author saves them. New skills are public by default and can be made
-private from their detail page.
+private from their detail page or created privately from the skill form.
 
 Builtin organization skills live in an overlay repo under `.agents/skills/`. See
 [Using an overlay](/extend/overlay) for packaging, mount paths, and chart
@@ -117,6 +121,33 @@ changed the skill first. Edits to shared skills are visible to agents immediatel
 
 `delete` archives an owned skill by OID, removing it from the active catalog
 without deleting its stored record.
+
+## Control User Access
+
+Create a private skill before adding readers, so its instructions are never
+published to the public catalog:
+
+```bash
+centaur-skills create private-runbook --visibility private \
+  --description "Team runbook" --instructions-file instructions.md
+centaur-skills add-reader skl_example teammate@example.com
+centaur-skills add-editor skl_example editor@example.com
+centaur-skills readers skl_example
+centaur-skills remove-reader skl_example teammate@example.com
+centaur-skills remove-editor skl_example editor@example.com
+```
+
+Reader and editor commands accept an exact Console user email or `usr_` OID.
+Read ACLs apply to Console-authored skills and the user's linked personal
+sandbox principal. Shared channel principals do not inherit the requesting
+user's access. Builtin skills remain governed by overlay installation.
+
+Permissions are additive: public skills remain visible to everyone, and an
+editor can still read a skill after their separate reader grant is removed.
+To revoke all access to a private skill, remove both reader and editor grants.
+Disabling a user or archiving a skill prevents catalog access. Each catalog
+request rechecks access; instructions already loaded in a conversation cannot
+be recalled.
 
 ## Verify Builtin Skills
 

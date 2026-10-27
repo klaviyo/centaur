@@ -204,4 +204,58 @@ class Console::SkillsControllerTest < ActionDispatch::IntegrationTest
     assert_select "pre", count: 0
     assert_select "h2", text: "Preview", count: 0
   end
+  test "reader discovers and views a private skill without edit controls" do
+    skill = skills(:other_private)
+    skill.readers << @user
+    get mine_console_skills_url
+    assert_response :ok
+    assert_match skill.name, response.body
+    get console_skill_url(skill.oid)
+    assert_response :ok
+    assert_select "a[href='#{edit_console_skill_path(skill.oid)}']", count: 0
+    get edit_console_skill_url(skill.oid)
+    assert_response :not_found
+    patch console_skill_url(skill.oid), params: { skill: { content: "Changed" } }
+    assert_response :not_found
+    delete console_skill_url(skill.oid)
+    assert_response :not_found
+  end
+
+  test "owner creates private skill with readers and editors and revokes a reader" do
+    post console_skills_url, params: { skill: {
+      name: "selective-access", description: "Selective guidance", content: "Instructions",
+      visibility: "private", reader_oids: [ users(:globex_admin).oid ], editor_oids: [ users(:acme_admin).oid ]
+    } }
+    skill = @user.skills.find_by!(name: "selective-access")
+    assert_redirected_to console_skill_path(skill.oid)
+    assert_not skill.shared?
+    assert_equal [ users(:globex_admin) ], skill.readers.to_a
+    assert_equal [ users(:acme_admin) ], skill.editors.to_a
+    get edit_console_skill_url(skill.oid)
+    assert_select "input[name='skill[reader_oids][]'][value='#{users(:globex_admin).oid}']"
+    patch console_skill_url(skill.oid), params: { skill: { reader_oids: [ "" ], lock_version: skill.lock_version } }
+    assert_redirected_to console_skill_path(skill.oid)
+    assert_empty skill.reload.readers
+  end
+
+  test "editor cannot change read ACL or visibility through form attributes" do
+    skill = skills(:other_private)
+    skill.editors << @user
+    patch console_skill_url(skill.oid), params: { skill: {
+      content: "Updated by editor", visibility: "shared", reader_oids: [ users(:globex_admin).oid ]
+    } }
+    assert_redirected_to console_skill_path(skill.oid)
+    assert_not skill.reload.shared?
+    assert_empty skill.readers
+  end
+
+  test "invalid reader selections preserve content and access" do
+    skill = skills(:member_private)
+    patch console_skill_url(skill.oid), params: { skill: {
+      content: "Unsaved change", reader_oids: [ users(:disabled_user).oid ]
+    } }
+    assert_response :unprocessable_entity
+    assert_empty skill.reload.readers
+    assert_not_equal "Unsaved change", skill.content
+  end
 end

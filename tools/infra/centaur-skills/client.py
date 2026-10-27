@@ -182,6 +182,36 @@ class SkillsClient:
             raise RuntimeError("centaur-skills response did not include a data object")
         return result
 
+    def list_readers(self, identifier: str) -> dict[str, Any]:
+        """List read ACL entries for an owned Console skill."""
+        return self._manage_reader(identifier, method="GET")
+
+    def add_reader(self, identifier: str, target: str) -> dict[str, Any]:
+        """Grant read access to a Console user."""
+        return self._manage_reader(identifier, target, method="POST")
+
+    def remove_reader(self, identifier: str, target: str) -> dict[str, Any]:
+        """Revoke an explicit read grant on an owned skill."""
+        return self._manage_reader(identifier, target, method="DELETE")
+
+    def _manage_reader(
+        self, identifier: str, target: str | None = None, *, method: str
+    ) -> dict[str, Any]:
+        body = None
+        if target is not None:
+            target = target.strip()
+            if not target:
+                raise ValueError("reader email or OID must not be empty")
+            body = {"data": {"user": target}}
+        result = self._request(
+            f"{SANDBOX_SKILLS_PATH}/{quote(identifier, safe='')}/readers",
+            method=method,
+            json=body,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("centaur-skills response did not include a data object")
+        return result
+
     def _request(
         self,
         path: str,

@@ -628,3 +628,85 @@ def test_cli_lists_adds_and_removes_editors(monkeypatch, capsys):
 
     remove_editor("skl_123", "usr_456")
     assert json.loads(capsys.readouterr().out)["data"]["editors"] == []
+
+
+@pytest.mark.parametrize("target", ["reader@example.test", "usr_reader"])
+def test_read_acl_client_uses_user_membership_endpoints(target):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return json_response({"data": {"id": "skl_private", "readers": []}})
+
+    with make_client(handler) as client:
+        client.list_readers("skl_private")
+        client.add_reader("skl_private", target)
+        client.remove_reader("skl_private", target)
+
+    assert [request.method for request in requests] == ["GET", "POST", "DELETE"]
+    assert all(
+        request.url.path == f"{SANDBOX_SKILLS_PATH}/skl_private/readers" for request in requests
+    )
+    assert json.loads(requests[1].content) == {"data": {"user": target}}
+    assert json.loads(requests[2].content) == {"data": {"user": target}}
+
+
+def test_private_creation_sends_visibility_without_publishing_first():
+    def handler(request):
+        assert json.loads(request.content)["data"]["visibility"] == "private"
+        return json_response({"data": {"id": "skl_private", "visibility": "private"}}, 201)
+
+    with make_client(handler) as client:
+        assert (
+            client.create(
+                "private-runbook", "Private guidance", "Instructions", visibility="private"
+            )["visibility"]
+            == "private"
+        )
+
+
+def test_acl_cli_commands_and_private_creation(monkeypatch):
+    import cli
+    from typer.testing import CliRunner
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def create(self, name, description, instructions, *, visibility="shared"):
+            assert visibility == "private"
+            return {"id": "skl_private", "visibility": "private"}
+
+        def list_readers(self, identifier):
+            return {"readers": [{"id": "usr_reader"}]}
+
+        def add_reader(self, identifier, target):
+            assert (identifier, target) == ("skl_private", "reader@example.test")
+            return {"readers": [{"id": "usr_reader"}]}
+
+        def remove_reader(self, identifier, target):
+            assert (identifier, target) == ("skl_private", "reader@example.test")
+            return {"readers": []}
+
+    monkeypatch.setattr(cli, "get_client", FakeClient)
+    runner = CliRunner()
+    for args in [
+        [
+            "create",
+            "private-runbook",
+            "--description",
+            "Private guidance",
+            "--instructions",
+            "Instructions",
+            "--visibility",
+            "private",
+        ],
+        ["readers", "skl_private"],
+        ["add-reader", "skl_private", "reader@example.test"],
+        ["remove-reader", "skl_private", "reader@example.test"],
+    ]:
+        result = runner.invoke(cli.app, args)
+        assert result.exit_code == 0, result.output or str(result.exception)
