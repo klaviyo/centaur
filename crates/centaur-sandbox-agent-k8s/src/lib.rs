@@ -32,6 +32,7 @@ pub use iron_proxy::IronProxyConfig;
 pub use k8s_openapi::api::core::v1::Toleration;
 pub use tools::{GitHubTokenRef, ToolSource, ToolsConfig};
 
+mod ee_ssh;
 pub mod generated;
 mod iron_proxy;
 mod tools;

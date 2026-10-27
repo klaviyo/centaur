@@ -70,6 +70,7 @@ impl Fixture {
         let pool = database().await?;
         let unique = format!("{:032x}", rand_suffix());
         let state = AppState {
+            ssh_grants_path: None,
             pool: pool.clone(),
             encryption: Arc::new(ActiveRecordEncryption::new(PRIMARY_KEY, SALT)),
             jwt_secret: enabled.then(|| JWT_SECRET.to_owned()),
@@ -1225,4 +1226,76 @@ async fn personal_runlayer_requires_the_owners_verified_slack_team_and_active_ac
     sqlx::query("INSERT INTO user_identities (user_id, provider, subject, team_id, created_at, updated_at) VALUES ($1, 'slack', $2, 'T000000002', now(), now())")
         .bind(f.admin).bind(format!("W{}", f.unique.to_uppercase())).execute(&f.pool).await.unwrap();
     assert!(secret_hosts(&f.sync(&token).await).is_empty());
+}
+
+#[tokio::test]
+async fn ssh_authorization_is_personal_and_revocable() {
+    let Some(mut f) = Fixture::new().await else {
+        return;
+    };
+    let alice = f.principal("ssh-alice").await;
+    let bob = f.principal("ssh-bob").await;
+    let alice_token = f.proxy(Some(alice), None, json!({})).await;
+    let bob_token = f.proxy(Some(bob), Some(alice), json!({})).await;
+    let unassigned = f.proxy(None, Some(alice), json!({})).await;
+    let root = std::env::temp_dir().join(f.name("ssh-grants"));
+    std::fs::create_dir(&root).unwrap();
+    let key = root.join("key");
+    std::fs::write(&key, "test-only-upstream-value").unwrap();
+    let path = root.join("grants.json");
+    std::fs::write(&path, serde_json::to_vec(&json!([{
+        "principal": centaur_console_db::oid("prn", alice), "route":"ee", "generation":"one",
+        "destination":"wss://ee.example.com/events/events", "username":"dev", "host_key":"ssh-ed25519 fixture",
+        "private_key_file":key,"expires_at":"2099-01-01T00:00:00Z"
+    }])).unwrap()).unwrap();
+    f.state.ssh_grants_path = Some(path.clone());
+    let body = json!({"route":"ee","public_key":"ssh-ed25519 sandbox-key"});
+    let endpoint = "/api/v1/proxy/ssh/authorize";
+    let (status, grant) = f.post(endpoint, Some(&alice_token), body.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(grant["principal"], centaur_console_db::oid("prn", alice));
+    assert_eq!(grant["private_key"]["type"], "control_plane");
+    let expiry =
+        chrono::DateTime::parse_from_rfc3339(grant["expires_at"].as_str().unwrap()).unwrap();
+    assert!((expiry.timestamp() - chrono::Utc::now().timestamp()) <= 30);
+    for token in [&bob_token, &unassigned, "invalid-token"] {
+        assert_eq!(
+            f.post(endpoint, Some(token), body.clone()).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let bob_key = root.join("bob-key");
+    std::fs::write(&bob_key, "test-only-bob-value").unwrap();
+    let mut records: Vec<Value> = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut bob_record = records[0].clone();
+    bob_record["principal"] = json!(centaur_console_db::oid("prn", bob));
+    bob_record["private_key_file"] = json!(bob_key);
+    records.push(bob_record);
+    std::fs::write(&path, serde_json::to_vec(&records).unwrap()).unwrap();
+    let (status, bob_grant) = f.post(endpoint, Some(&bob_token), body.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bob_grant["principal"], centaur_console_db::oid("prn", bob));
+    assert_eq!(bob_grant["private_key"]["value"], "test-only-bob-value");
+    // A channel principal cannot acquire Alice's SSH grant via requester attribution.
+    sqlx::query("UPDATE principals SET kind = 'channel' WHERE id = $1")
+        .bind(alice)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.post(endpoint, Some(&alice_token), body.clone()).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    sqlx::query("UPDATE principals SET kind = 'user' WHERE id = $1")
+        .bind(alice)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    std::fs::write(path, "[]").unwrap();
+    assert_eq!(
+        f.post(endpoint, Some(&alice_token), body).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    std::fs::remove_dir_all(root).unwrap();
+
 }
