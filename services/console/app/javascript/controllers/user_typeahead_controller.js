@@ -3,6 +3,7 @@ import { Controller } from "@hotwired/stimulus"
 // Multi-user picker with a filterable listbox. Selected users are submitted as
 // opaque IDs, while all filtering and chip management stays client-side.
 export default class extends Controller {
+  static values = { fieldName: { type: String, default: "skill[editor_oids][]" } }
   static targets = ["input", "listbox", "option", "selections", "empty"]
 
   connect() {
@@ -85,7 +86,7 @@ export default class extends Controller {
 
     const hidden = document.createElement("input")
     hidden.type = "hidden"
-    hidden.name = "skill[editor_oids][]"
+    hidden.name = this.fieldNameValue
     hidden.value = option.dataset.userOid
 
     const remove = document.createElement("button")
@@ -109,7 +110,7 @@ export default class extends Controller {
   selectedOids() {
     return new Set(
       Array.from(
-        this.selectionsTarget.querySelectorAll("input[name='skill[editor_oids][]']"),
+        this.selectionsTarget.querySelectorAll("input[type='hidden']"),
         (input) => input.value
       )
     )
