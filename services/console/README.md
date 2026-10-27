@@ -150,18 +150,7 @@ See [docs/API.md](docs/API.md) for the full reference: authentication, request/r
 
 ## Personal Runlayer connections
 
-Set `RUNLAYER_MCP_URL` in the Console web and worker environments to the exact
-HTTPS unified Plugin MCP URL. Use the same value for api-rs, proxy-sync and sandboxes.
-The Integrations preset registers the OAuth client using this deployment
-configuration; there is no URL-entry field. Each user authorizes their own
-account, and Console stores and refreshes its tokens in the encrypted broker.
-Verified Slack SSO identities link those connections to Slack requester principals.
-Runlayer always uses the requester's own connection in DMs and channels. Shared
-accounts, email fallback and shared-role grants are rejected; personal
-availability is fixed rather than selectable.
-
-See [the Runlayer tool guide](../../tools/infra/runlayer/README.md) for client
-registration, callback URLs, endpoint configuration, token lifecycle and rollout
-checks. The shared Rust credential reader used by api-rs and proxy-sync, and the
-Console permissions views, enforce ownership and current credential eligibility.
-Keep `tokenBroker.enabled: false` for Runlayer; refresh runs in Console.
+Set the same `RUNLAYER_MCP_URL` in Console web/workers, api-rs, proxy-sync and
+sandboxes. Each user connects through Integrations; verified Slack SSO links
+personal access in DMs and channels. Keep `tokenBroker.enabled: false` so Console
+refreshes tokens. See [setup and limits](../../tools/infra/runlayer/README.md).
