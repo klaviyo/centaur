@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_10_10_025431) do
+ActiveRecord::Schema[8.1].define(version: 2026_10_27_183903) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -441,6 +441,16 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_10_025431) do
     t.index ["user_id"], name: "index_skill_editors_on_user_id"
   end
 
+  create_table "skill_readers", force: :cascade do |t|
+    t.datetime "created_at", null: false
+    t.bigint "skill_id", null: false
+    t.datetime "updated_at", null: false
+    t.bigint "user_id", null: false
+    t.index ["skill_id", "user_id"], name: "index_skill_readers_on_skill_id_and_user_id", unique: true
+    t.index ["skill_id"], name: "index_skill_readers_on_skill_id"
+    t.index ["user_id"], name: "index_skill_readers_on_user_id"
+  end
+
   create_table "skills", force: :cascade do |t|
     t.datetime "archived_at"
     t.text "content", null: false
@@ -622,6 +632,8 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_10_025431) do
   add_foreign_key "secret_sources", "static_secrets"
   add_foreign_key "skill_editors", "skills", on_delete: :cascade
   add_foreign_key "skill_editors", "users", on_delete: :cascade
+  add_foreign_key "skill_readers", "skills", on_delete: :cascade
+  add_foreign_key "skill_readers", "users", on_delete: :cascade
   add_foreign_key "skills", "users", on_delete: :cascade
   add_foreign_key "slack_channel_permissions", "principals"
   add_foreign_key "slack_channel_permissions", "roles"

@@ -33,6 +33,13 @@
     </div>
   </div>
 
+  <% if skill.user_id == current_user.id %>
+    <div>
+      <%= form.label :visibility, class: "mb-2 block text-sm font-medium text-zinc-200" %>
+      <%= form.select :visibility, [["Private: owner, readers, and editors", "private"], ["Public: everyone", "shared"]], {}, class: "form-input" %>
+    </div>
+    <%= render "editor_picker", skill: skill, access: "reader" %>
+  <% end %>
   <%= render "editor_picker", skill: skill %>
 
   <div>

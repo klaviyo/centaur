@@ -92,13 +92,19 @@ def create(
     visibility: Annotated[
         SkillVisibility, typer.Option("--visibility", help="Who can discover and read the skill")
     ] = SkillVisibility.shared,
+    private: Annotated[
+        bool, typer.Option("--private", help="Alias for --visibility private")
+    ] = False,
 ) -> None:
     """Create a private or shared Console-authored skill."""
     resolved_instructions = _resolve_instructions(instructions, instructions_file, required=True)
     assert resolved_instructions is not None
     with get_client() as client:
         result = client.create(
-            name, description, resolved_instructions, visibility=visibility.value
+            name,
+            description,
+            resolved_instructions,
+            visibility=SkillVisibility.private.value if private else visibility.value,
         )
     print(json.dumps({"data": result}, indent=2, default=str))
 
@@ -189,6 +195,36 @@ def remove_editor(
     """Remove an editor from an owned Console-authored skill."""
     with get_client() as client:
         result = client.remove_editor(identifier, user)
+    print(json.dumps({"data": result}, indent=2, default=str))
+
+
+@app.command("readers")
+def readers(identifier: str = typer.Argument(..., help="OID of an owned skill")) -> None:
+    """List explicit read ACL entries (owner only)."""
+    with get_client() as client:
+        result = client.list_readers(identifier)
+    print(json.dumps({"data": result}, indent=2, default=str))
+
+
+@app.command("add-reader")
+def add_reader(
+    identifier: str = typer.Argument(..., help="OID of an owned skill"),
+    target: str = typer.Argument(..., help="Console user email or usr_ OID"),
+) -> None:
+    """Grant read access to an owned skill."""
+    with get_client() as client:
+        result = client.add_reader(identifier, target)
+    print(json.dumps({"data": result}, indent=2, default=str))
+
+
+@app.command("remove-reader")
+def remove_reader(
+    identifier: str = typer.Argument(..., help="OID of an owned skill"),
+    target: str = typer.Argument(..., help="Console user email or usr_ OID"),
+) -> None:
+    """Revoke an explicit read ACL entry on an owned skill."""
+    with get_client() as client:
+        result = client.remove_reader(identifier, target)
     print(json.dumps({"data": result}, indent=2, default=str))
 
 
