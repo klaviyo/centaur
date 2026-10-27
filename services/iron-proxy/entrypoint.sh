@@ -14,6 +14,30 @@ log_json() {
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$3"
 }
 
+run_proxy() {
+    if [ -z "${IRON_SSH_CONFIG_JSON:-}" ]; then
+        exec iron-proxy "$@"
+    fi
+    command -v iron-ssh >/dev/null 2>&1 || {
+        log_json "error" "ssh_unavailable" "SSH enabled but companion binary is missing"
+        exit 1
+    }
+    umask 077
+    printf '%s' "$IRON_SSH_CONFIG_JSON" > "$CONFIG_DIR/ssh.json"
+    unset IRON_SSH_CONFIG_JSON
+    iron-ssh -config "$CONFIG_DIR/ssh.json" &
+    ssh_pid=$!
+    iron-proxy "$@" &
+    proxy_pid=$!
+    trap 'kill "$ssh_pid" "$proxy_pid" 2>/dev/null || true' EXIT
+    trap 'exit 143' TERM
+    trap 'exit 130' INT
+    while kill -0 "$ssh_pid" 2>/dev/null && kill -0 "$proxy_pid" 2>/dev/null; do
+        sleep 1
+    done
+    exit 1
+}
+
 mkdir -p "$CONFIG_DIR" "$CERT_SHARE"
 
 # ── Load required CA from the pre-created Kubernetes Secret volume ─────────
@@ -36,7 +60,7 @@ log_json "info" "ca_shared" "CA cert shared at /certs/ca-cert.pem"
 # -config. A local config file would conflict (e.g. management.listen). ────
 if [ -n "${IRON_CONTROL_PLANE_URL:-}" ]; then
     log_json "info" "managed_mode" "IRON_CONTROL_PLANE_URL set; running without a local config"
-    exec iron-proxy
+    run_proxy
 fi
 
 # ── Unmanaged mode: seed the local config from the baked default and pass it
@@ -46,4 +70,4 @@ if (set -C; cat "$DEFAULT_CONFIG" > "$CONFIG_FILE") 2>/dev/null; then
     log_json "info" "config_seeded" "seeded $CONFIG_FILE from default"
 fi
 
-exec iron-proxy -config "$CONFIG_FILE"
+run_proxy -config "$CONFIG_FILE"

@@ -1,0 +1,71 @@
+---
+title: SSH access to ephemeral environments
+description: Headless remote development through the paired Iron SSH companion.
+---
+
+# SSH access to ephemeral environments
+
+This opt-in pilot requires an Iron image containing `iron-ssh`. The companion
+uses sshpiper's transport library in a separate Go module; ordinary HTTP
+proxying keeps its existing crypto dependencies. Build that image locally from
+the companion's Dockerfile, then build the Centaur proxy wrapper with
+`--build-arg IRON_PROXY_IMAGE=<local-image>`. Do not enable this on the default
+published image until the companion is released and pinned by digest.
+
+On api-rs, set a persistent, random `CENTAUR_EE_SSH_SEED` of at least 32 bytes
+through the deployment's secret mechanism. Set `KUBERNETES_IRON_PROXY_SSH_ENABLED=true`,
+`KUBERNETES_IRON_PROXY_SSH_ROUTE=ee`, and
+`KUBERNETES_IRON_PROXY_SSH_WORKSPACE=/workspace` through `apiRs.extraEnv`. api-rs derives different disposable client and
+proxy-host keys for each sandbox. Keep the seed stable across api-rs restarts;
+changing it requires replacing retained sandboxes and their proxies. The seed
+is never sent to sandbox or proxy pods. Proxy repair preserves identities via
+the same seed and sandbox ID.
+
+Mount an operator-controlled JSON grants file and private-key files in
+proxy-sync only using `proxySync.extraVolumes` and `extraVolumeMounts`. Set `CENTAUR_EE_SSH_GRANTS_FILE` to that JSON file through `proxySync.extraEnv`. Example:
+
+```json
+[{
+  "principal": "prn_example",
+  "route": "ee",
+  "generation": "environment-generation-1",
+  "destination": "wss://ee-ssh.dev.example.com/events/events",
+  "username": "dev",
+  "host_key": "ssh-ed25519 <verified-upstream-public-host-key>",
+  "private_key_file": "/run/ee-keys/user-example",
+  "expires_at": "2026-12-01T00:00:00Z"
+}]
+```
+
+Register the matching dedicated public key in the EE application. Confirm the
+upstream SSH host key through a trusted channel; there is no trust-on-first-use
+or disabled TLS validation. The destination path is the full wstunnel v11
+upgrade path: `/<configured-prefix>/events`, commonly `/events/events`.
+Only WSS on port 443 is allowed by this pilot's authorization endpoint. The
+Iron companion also supports explicitly configured direct TCP SSH in standalone
+mode. Neither path needs Kubernetes exec or a Kubernetes service-account token.
+
+The authorizer authenticates the proxy's existing private bearer token and
+uses its assigned principal. Only `kind=user` principals are accepted. Requester
+attribution does not select another user's key; shared-channel and workflow
+principals are refused. Downstream key verification happens in the paired proxy
+against the key api-rs supplied. A sandbox supplies only a route alias, never an
+upstream host or a credential reference.
+
+Grants are reread on every authorization and renewed at five-second intervals
+with a maximum 30-second lease. Removing a grant, changing its key/destination,
+unassigning its proxy, or losing the authorizer closes the connection on the
+next check or lease expiry. Update files atomically. Rotation requires updating
+the matching public key in the EE as well as the private-key file. Removing a
+local grant does not remove an EE public key.
+
+Supported operations are non-PTY exec and SFTP. Forwarding, agent forwarding,
+PTY, shell, environment injection, X11, and other subsystems are rejected.
+Connection audit metadata excludes credentials and command output. SSH access
+permits agent code to use the EE's own credentials and network permissions;
+review that boundary before granting access. Iron's local HTTP egress policy
+does not extend to programs running in the EE.
+
+To disable, remove the grants, allow active connections to close, then disable
+the SSH feature and replace affected sandbox/proxy pods. Workspace changes in
+the EE remain intact.

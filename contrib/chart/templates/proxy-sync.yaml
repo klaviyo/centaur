@@ -53,6 +53,10 @@ spec:
 {{ toYaml . | nindent 8 }}
       {{- end }}
 {{- include "centaur.podScheduling" (dict "values" .Values.proxySync "indent" 6) }}
+{{- with .Values.proxySync.extraVolumes }}
+      volumes:
+{{ toYaml . | nindent 8 }}
+{{- end }}
       containers:
         - name: proxy-sync
           image: {{ printf "%s:%s" .Values.proxySync.image.repository .Values.proxySync.image.tag | quote }}
@@ -101,6 +105,10 @@ spec:
 {{- range $name, $value := .Values.proxySync.extraEnv }}
             - name: {{ $name }}
               value: {{ $value | toString | quote }}
+{{- end }}
+{{- with .Values.proxySync.extraVolumeMounts }}
+          volumeMounts:
+{{ toYaml . | nindent 12 }}
 {{- end }}
           ports:
             - name: http

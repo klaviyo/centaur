@@ -1,0 +1,36 @@
+"""Remote argument quoting and disposable-identity handling."""
+import importlib.util
+import json
+import os
+from pathlib import Path
+import unittest
+from unittest.mock import patch
+
+spec = importlib.util.spec_from_file_location("ee_cli", Path(__file__).with_name("cli.py"))
+cli = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cli)
+
+
+class ClientTests(unittest.TestCase):
+    def test_disposable_key_is_private_and_removed(self):
+        config = {"host": "proxy", "port": 2222, "route": "ee", "workspace": "/workspace", "private_key": "disposable", "host_key": "ssh-ed25519 fixture"}
+        with patch.dict(os.environ, {"CENTAUR_EE_SSH": json.dumps(config)}):
+            with cli.connection() as (_, command):
+                key = Path(command[command.index("-i") + 1])
+                self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+                self.assertIn("StrictHostKeyChecking=yes", command)
+                self.assertNotIn("disposable", command)
+            self.assertFalse(key.exists())
+
+    def test_command_arguments_remain_literal(self):
+        config = {"workspace": "/path with spaces"}
+        with patch.object(cli, "connection") as connection, patch.object(cli.subprocess, "run") as run:
+            connection.return_value.__enter__.return_value = (config, ["ssh", "proxy"])
+            run.return_value.returncode = 7
+            with patch("sys.argv", ["ee", "exec", "--", "printf", "%s", "$(touch bad)"]):
+                self.assertEqual(cli.main(), 7)
+            self.assertEqual(run.call_args.args[0][-1], "cd -- '/path with spaces' && printf %s '$(touch bad)'")
+
+
+if __name__ == "__main__":
+    unittest.main()
