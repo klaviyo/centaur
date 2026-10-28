@@ -8,7 +8,7 @@ agents:
 
 steps:
   - group: "Build images"
-    if: build.branch != "klaviyo-main-2" || build.pull_request.id != null
+    if: build.branch != "klaviyo-main" || build.pull_request.id != null
     steps:
       - label: "Build api-rs (AMD64)"
         timeout_in_minutes: 120
@@ -53,7 +53,7 @@ steps:
           docker build --platform linux/amd64 --build-arg RUST_BUILD_PROFILE=release -f Dockerfile -t 340433579684.dkr.ecr.us-east-1.amazonaws.com/klaviyo-centaur-console:${BUILDKITE_COMMIT} .
 
   - group: "Publish images to eng and dev ECR"
-    if: build.branch == "klaviyo-main-2" && build.pull_request.id == null
+    if: build.branch == "klaviyo-main" && build.pull_request.id == null
     steps:
       - label: "Publish api-rs (AMD64)"
         timeout_in_minutes: 120
