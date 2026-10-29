@@ -32,9 +32,7 @@
       <section class="form-section">
         <h2 class="form-section-heading">Access</h2>
         <p class="form-hint mb-4">Your administrator controls which SSH destinations are allowed. Give Centaur the environment URL in your request; this key can be reused across allowed destinations.</p>
-        <%= form.label :duration_hours, "Allow access for", class: "form-label" %>
-        <%= form.select :duration_hours, [["24 hours", 24], ["7 days", 168], ["30 days", 720]], { selected: @connection.duration_hours || 24 }, class: "form-input" %>
-        <p class="form-hint">Saving starts a new access period. Only your Console sessions, DMs, and channel turns can use this connection. Disconnect at any time.</p>
+        <p class="form-hint">Connected until you disconnect. Only your Console sessions, DMs, and channel turns can use this key. Disconnect at any time.</p>
         <p class="form-hint">Slack access requires a verified Slack identity linked to your Console account.</p>
       </section>
       <div class="flex flex-wrap gap-3">

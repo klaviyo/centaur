@@ -15,7 +15,7 @@ class SshConnectionTest < ActiveSupport::TestCase
 
   def connection
     private_key, = self.class.synthetic_key
-    users(:member_user).build_ssh_connection(name: "My SSH key", private_key: private_key, duration_hours: 24)
+    users(:member_user).build_ssh_connection(name: "My SSH key", private_key: private_key)
   end
 
   test "validates and encrypts a personal key and derives its public key" do
@@ -27,7 +27,7 @@ class SshConnectionTest < ActiveSupport::TestCase
     stored = record.attributes_before_type_cast["private_key"]
     assert_match(/\A\{/, stored)
     assert_no_match(/BEGIN OPENSSH/, stored)
-    assert_in_delta 24.hours.from_now.to_i, record.expires_at.to_i, 5
+    assert_nil record.expires_at
   end
 
   test "rejects unsafe destinations, invalid server keys and private keys" do
@@ -62,14 +62,14 @@ class SshConnectionTest < ActiveSupport::TestCase
     assert_not_equal generation, record.generation
   end
 
-  test "expiry is bounded and a second connection for a user is refused" do
+  test "keys stay connected without expiry and a second connection for a user is refused" do
     record = connection
-    record.duration_hours = "9999"
-    assert_not record.valid?
-    record.duration_hours = 24
     record.save!
     duplicate = record.dup
     assert_not duplicate.valid?
+    travel 1.year do
+      assert record.reload.configured?
+    end
     record.update_columns(expires_at: 1.minute.ago)
     assert_not record.configured?
   end

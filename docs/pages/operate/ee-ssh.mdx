@@ -8,16 +8,14 @@ description: Headless remote development through the paired Iron SSH companion.
 ## Personal setup in Console
 
 Open **Integrations → SSH key → Connect**. Enter a name and a dedicated private
-key without a passphrase. Choose an access period (24 hours, 7 days, or 30 days),
-then save. The next screen shows the public key to register with each environment.
+key without a passphrase, then save. The key stays connected until you disconnect it. The next screen shows the public key to register with each environment.
 Supply the full WSS SSH tunnel URL on each `ee` command; the same key works with
 all destinations allowed by the deployment. Saving does not perform registration or claim a successful
 connection test.
 
 Private keys are write-only and encrypted with Console's existing Active Record
 encryption settings. Proxy-sync decrypts them only for the paired Iron SSH
-companion. The sandbox never receives the upstream private key. **Edit or
-renew** changes the key or starts a new access period; leaving the key
+companion. The sandbox never receives the upstream private key. **Edit** changes the key; leaving the key
 blank preserves it. **Disconnect** removes the stored private key and revokes
 new connections and active leases on their next authorization check.
 
@@ -83,8 +81,9 @@ ee write --url wss://other.dev.example.com/events/events path/to/file < local-fi
 
 ### Legacy fixed-target provisioning
 
-Existing fixed-target UI records remain usable by older clients until their
-owner saves the key-only form. New saved keys require a target on each call.
+Existing fixed-target UI records retain their original expiry and remain usable
+by older clients until their owner saves the key-only form. Saving removes the
+expiry; disconnected keys must be explicitly reconnected by their owner. New saved keys require a target on each call.
 An optional operator grants file retains per-target SSH host-key pinning.
 Mount an operator-controlled JSON grants file and private-key files in
 proxy-sync only using `proxySync.extraVolumes` and `extraVolumeMounts`. Set `CENTAUR_EE_SSH_GRANTS_FILE` to that JSON file through `proxySync.extraEnv`. Example:

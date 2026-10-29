@@ -10,10 +10,10 @@ class Console::SshConnectionsController < ApplicationController
   end
 
   def update
-    attributes = params.require(:ssh_connection).permit(:name, :private_key, :duration_hours).to_h
+    attributes = params.require(:ssh_connection).permit(:name, :private_key).to_h
     attributes.delete("private_key") if attributes["private_key"].blank?
     @connection.assign_attributes(attributes)
-    @connection.assign_attributes(destination: nil, username: nil, host_key: nil)
+    @connection.assign_attributes(destination: nil, username: nil, host_key: nil, expires_at: nil)
     @connection.revoked_at = nil
     if @connection.save
       redirect_to console_ssh_connection_path, notice: "SSH key saved. Register the public key in your environments."
@@ -30,6 +30,6 @@ class Console::SshConnectionsController < ApplicationController
   private
 
   def load_connection
-    @connection = current_user.ssh_connection || current_user.build_ssh_connection(name: "My SSH key", duration_hours: 24)
+    @connection = current_user.ssh_connection || current_user.build_ssh_connection(name: "My SSH key")
   end
 end

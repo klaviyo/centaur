@@ -6,7 +6,7 @@
     <p class="form-hint mb-4">Provide the destination URL when asking Centaur to connect. Available to your Console sessions. Slack DMs and channel turns use your verified linked Slack identity.</p>
     <dl class="space-y-4 text-sm">
       <div><dt class="form-label">Status</dt><dd><%= @connection.configured? ? "Configured" : @connection.revoked? ? "Disconnected" : "Expired" %></dd></div>
-      <div><dt class="form-label">Expires</dt><dd><%= @connection.expires_at.utc.strftime("%Y-%m-%d %H:%M UTC") %></dd></div>
+      <div><dt class="form-label">Access</dt><dd><%= @connection.expires_at ? @connection.expires_at.utc.strftime("%Y-%m-%d %H:%M UTC") : "Until you disconnect" %></dd></div>
       <div><dt class="form-label">Your key fingerprint</dt><dd class="break-all font-mono text-zinc-300"><%= @connection.key_fingerprint %></dd></div>
     </dl>
   </section>
@@ -18,7 +18,7 @@
     <p class="form-hint">Your private key is stored encrypted and cannot be viewed or downloaded.</p>
   </section>
   <div class="flex flex-wrap gap-3">
-    <%= link_to "Edit or renew", edit_console_ssh_connection_path, class: "btn-primary" %>
+    <%= link_to "Edit", edit_console_ssh_connection_path, class: "btn-primary" %>
     <% unless @connection.revoked? %>
       <%= button_to "Disconnect", console_ssh_connection_path, method: :delete, class: "btn-secondary" %>
     <% end %>
