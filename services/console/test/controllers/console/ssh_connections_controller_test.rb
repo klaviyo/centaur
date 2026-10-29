@@ -25,10 +25,12 @@ class Console::SshConnectionsControllerTest < ActionDispatch::IntegrationTest
     assert_nil record.destination
     assert_nil record.username
     assert_nil record.host_key
+    assert_equal SshKey.normalize(@private_key), record.private_key
     assert_nil users(:acme_admin).ssh_connection
     get console_ssh_connection_url
     assert_response :ok
     assert_select "textarea#ssh-public-key", text: @public_key
+    assert_select "[role=status]", text: /SSH key saved/
     assert_no_match(/BEGIN OPENSSH PRIVATE KEY/, response.body)
     get edit_console_ssh_connection_url
     assert_response :ok
@@ -45,6 +47,25 @@ class Console::SshConnectionsControllerTest < ActionDispatch::IntegrationTest
     assert_redirected_to console_integrations_path
     assert record.reload.revoked?
     assert_nil record.private_key
+  end
+
+  test "live validation handles browser line endings without saving or echoing keys" do
+    assert_no_difference "SshConnection.count" do
+      post validate_key_console_ssh_connection_url, params: { private_key: @private_key.gsub("\n", "\r\n") }, as: :json
+    end
+    assert_response :ok
+    assert response.parsed_body["valid"]
+    assert_equal SshKey.fingerprint(@public_key), response.parsed_body["fingerprint"]
+    assert_includes response.headers["Cache-Control"], "no-store"
+    assert_no_match(/BEGIN OPENSSH PRIVATE KEY/, response.body)
+    post validate_key_console_ssh_connection_url, params: { private_key: @public_key }, as: :json
+    assert_response :unprocessable_entity
+    assert_includes response.parsed_body["message"], "public key"
+    assert_not response.parsed_body["valid"]
+    assert_not_includes response.body, @public_key
+    delete logout_url
+    post validate_key_console_ssh_connection_url, params: { private_key: @private_key }, as: :json
+    assert_response :redirect
   end
 
   test "validation never echoes a submitted private key" do
