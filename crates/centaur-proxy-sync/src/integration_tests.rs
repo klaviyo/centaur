@@ -1315,3 +1315,149 @@ async fn ssh_authorization_is_personal_and_revocable() {
     );
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn ssh_channel_turn_uses_only_the_bound_slack_requester() {
+    let Some(mut f) = Fixture::new().await else {
+        return;
+    };
+    let channel = f.principal("ssh-channel").await;
+    let alice = f.principal("ssh-requester-alice").await;
+    let bob = f.principal("ssh-requester-bob").await;
+    sqlx::query("UPDATE principals SET kind = 'slack_channel' WHERE id = $1")
+        .bind(channel)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    for (id, user) in [(alice, "UALICE"), (bob, "UBOB")] {
+        sqlx::query("UPDATE principals SET kind = 'slack_dm', slack_user_id = $1, slack_team_id = 'TTEST' WHERE id = $2")
+            .bind(user).bind(id).execute(&f.pool).await.unwrap();
+    }
+    let token = f.proxy(Some(channel), Some(alice), json!({})).await;
+    let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
+    let root = std::env::temp_dir().join(f.name("ssh-channel-grants"));
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("grants.json");
+    let key = root.join("key");
+    std::fs::write(&key, "test-only-alice-value").unwrap();
+    let record = json!({
+        "principal":centaur_console_db::oid("prn",alice),"route":"ee","generation":"one",
+        "destination":"wss://ee.example.com/events/events","username":"dev","host_key":"ssh-ed25519 fixture",
+        "private_key_file":key,"expires_at":"2099-01-01T00:00:00Z"
+    });
+    // A grant on the channel must never be considered, even with higher authority.
+    let mut channel_record = record.clone();
+    channel_record["principal"] = json!(centaur_console_db::oid("prn", channel));
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&json!([record, channel_record])).unwrap(),
+    )
+    .unwrap();
+    f.state.ssh_grants_path = Some(path.clone());
+    let endpoint = "/api/v1/proxy/ssh/authorize";
+    let body = json!({"route":"ee","public_key":"ssh-ed25519 sandbox-key"});
+    let (status, lease) = f.post(endpoint, Some(&token), body.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(lease["principal"], centaur_console_db::oid("prn", alice));
+    assert_eq!(lease["private_key"]["value"], "test-only-alice-value");
+    assert_eq!(
+        f.post(endpoint, Some(&token), body.clone()).await.1["generation"],
+        lease["generation"]
+    );
+
+    // Same shared sandbox: another user's turn cannot inherit Alice's grant.
+    // Missing attribution also clears access instead of falling back to the channel.
+    for requester in [Some(bob), None] {
+        sqlx::query("UPDATE proxies SET requester_principal_id = $1, requester_principal_assigned_at = now() WHERE bearer_token_hash = $2")
+            .bind(requester).bind(&token_hash).execute(&f.pool).await.unwrap();
+        assert_eq!(
+            f.post(endpoint, Some(&token), body.clone()).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    sqlx::query("UPDATE proxies SET requester_principal_id = $1, requester_principal_assigned_at = now() WHERE bearer_token_hash = $2")
+        .bind(alice).bind(&token_hash).execute(&f.pool).await.unwrap();
+    let (status, next_lease) = f.post(endpoint, Some(&token), body.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(
+        next_lease["generation"], lease["generation"],
+        "an old lease must not survive rebinding to Alice"
+    );
+
+    // The tool cannot nominate a user; only the authenticated control-plane binding can.
+    let mut forged = body.clone();
+    forged["requester_principal_id"] = json!(centaur_console_db::oid("prn", alice));
+    let response = router(f.state.clone())
+        .oneshot(
+            Request::post(endpoint)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(forged.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    for kind in ["workflow", "unknown"] {
+        sqlx::query("UPDATE principals SET kind = $1 WHERE id = $2")
+            .bind(kind)
+            .bind(channel)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            f.post(endpoint, Some(&token), body.clone()).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    sqlx::query("UPDATE principals SET kind = 'slack_channel' WHERE id = $1")
+        .bind(channel)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    // A non-Slack requester or incomplete binding must not unlock a personal key.
+    for kind in [
+        "user",
+        "console_user",
+        "slack_channel",
+        "workflow",
+        "unknown",
+    ] {
+        sqlx::query("UPDATE principals SET kind = $1 WHERE id = $2")
+            .bind(kind)
+            .bind(alice)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            f.post(endpoint, Some(&token), body.clone()).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    sqlx::query("UPDATE principals SET kind = 'slack_dm', slack_team_id = NULL WHERE id = $1")
+        .bind(alice)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.post(endpoint, Some(&token), body.clone()).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    sqlx::query("UPDATE principals SET slack_team_id = 'TTEST' WHERE id = $1")
+        .bind(alice)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE proxies SET requester_principal_assigned_at = NULL WHERE bearer_token_hash = $1",
+    )
+    .bind(&token_hash)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        f.post(endpoint, Some(&token), body.clone()).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}

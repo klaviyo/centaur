@@ -35,14 +35,36 @@ pub(crate) async fn authorize(
     let proxy = load_proxy(&state.pool, token)
         .await?
         .ok_or_else(ApiError::unauthorized)?;
-    let principal_id = proxy.principal_id.ok_or_else(ApiError::unauthorized)?;
-    // Channel/workflow requester attribution cannot select a personal SSH key.
-    if !matches!(
-        proxy.principal_field("kind").as_str(),
-        Some("user" | "console_user" | "slack_dm")
-    ) {
-        return Err(ApiError::unauthorized());
-    }
+    let assigned_principal = proxy.principal_id.ok_or_else(ApiError::unauthorized)?;
+    // The ingress derives this binding from the verified actor on each execute,
+    // before the sandbox receives input. Never take a requester from the tool.
+    let (principal_id, binding) = match proxy.principal_field("kind").as_str() {
+        Some("user" | "console_user" | "slack_dm") => (assigned_principal, None),
+        Some("slack_channel") => {
+            let requester = proxy
+                .requester_principal_id
+                .ok_or_else(ApiError::unauthorized)?;
+            let assigned_at = proxy
+                .requester_principal_assigned_at
+                .ok_or_else(ApiError::unauthorized)?;
+            let personal: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM principals WHERE id = $1 AND kind = 'slack_dm' \
+                 AND NULLIF(slack_user_id, '') IS NOT NULL AND NULLIF(slack_team_id, '') IS NOT NULL)",
+            )
+            .bind(requester)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(centaur_console_db::Error::Database)?;
+            if !personal {
+                return Err(ApiError::unauthorized());
+            }
+            (
+                requester,
+                Some(format!("{}:{}", proxy.id, assigned_at.to_rfc3339())),
+            )
+        }
+        _ => return Err(ApiError::unauthorized()),
+    };
     let path = state
         .ssh_grants_path
         .as_ref()
@@ -60,10 +82,16 @@ pub(crate) async fn authorize(
         .await
         .map_err(|_| ApiError::unauthorized())?;
     let expires_at = std::cmp::min(grant.expires_at, Utc::now() + chrono::Duration::seconds(30));
+    // A lease from an earlier requester binding must not survive reassignment,
+    // including switching away and back to the same user between renewals.
+    let generation = match binding {
+        Some(binding) => format!("{}:{binding}", grant.generation),
+        None => grant.generation.clone(),
+    };
     Ok(Json(json!({
         "id": format!("{}:{}", grant.route, grant.generation),
         "principal": grant.principal,
-        "generation": grant.generation,
+        "generation": generation,
         "destination": grant.destination,
         "username": grant.username,
         "host_key": grant.host_key,
