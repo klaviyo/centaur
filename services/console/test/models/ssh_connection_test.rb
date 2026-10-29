@@ -1,0 +1,77 @@
+require "test_helper"
+require "tmpdir"
+require "open3"
+
+
+class SshConnectionTest < ActiveSupport::TestCase
+  def self.synthetic_key
+    @synthetic_key ||= Dir.mktmpdir do |dir|
+      path = File.join(dir, "synthetic")
+      _out, _err, status = Open3.capture3("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", path)
+      raise "synthetic key generation failed" unless status.success?
+      [ File.read(path), File.read("#{path}.pub").split.first(2).join(" ") ]
+    end
+  end
+
+  def connection
+    private_key, public_key = self.class.synthetic_key
+    users(:member_user).build_ssh_connection(name: "My EE", destination: "wss://ee.example.com/events/events", username: "dev",
+      host_key: public_key, private_key: private_key, duration_hours: 24)
+  end
+
+  test "validates and encrypts a personal key and derives its public key" do
+    record = connection
+    assert record.save, record.errors.full_messages.join(", ")
+    assert_equal self.class.synthetic_key.last, record.public_key
+    assert record.configured?
+    assert_match(/\ASHA256:/, record.key_fingerprint)
+    stored = record.attributes_before_type_cast["private_key"]
+    assert_match(/\A\{/, stored)
+    assert_no_match(/BEGIN OPENSSH/, stored)
+    assert_in_delta 24.hours.from_now.to_i, record.expires_at.to_i, 5
+  end
+
+  test "rejects unsafe destinations, invalid server keys and private keys" do
+    %w[http://ee.example.com https://ee.example.com wss://user:pass@ee.example.com/events wss://ee.example.com:22/events wss://ee.example.com/events?token=abc wss://ee.example.com/events#fragment].each do |destination|
+      record = connection
+      record.destination = destination
+      assert_not record.valid?, destination
+      assert record.errors[:destination].any?
+    end
+    record = connection
+    record.host_key = "SHA256:fingerprint-is-not-a-public-key"
+    assert_not record.valid?
+    assert record.errors[:host_key].any?
+    record = connection
+    record.private_key = "invalid synthetic key"
+    assert_not record.valid?
+    assert record.errors[:private_key].any?
+    assert_not_includes record.errors.full_messages.join, "invalid synthetic key"
+  end
+
+  test "key rotation and revocation change the lease generation and remove the key" do
+    record = connection
+    record.save!
+    generation = record.generation
+    record.update!(name: "Other EE")
+    assert_not_equal generation, record.generation
+    generation = record.generation
+    record.revoke!
+    assert record.revoked?
+    assert_not record.configured?
+    assert_nil record.reload.private_key
+    assert_not_equal generation, record.generation
+  end
+
+  test "expiry is bounded and a second connection for a user is refused" do
+    record = connection
+    record.duration_hours = "9999"
+    assert_not record.valid?
+    record.duration_hours = 24
+    record.save!
+    duplicate = record.dup
+    assert_not duplicate.valid?
+    record.update_columns(expires_at: 1.minute.ago)
+    assert_not record.configured?
+  end
+end
