@@ -5,6 +5,36 @@ description: Headless remote development through the paired Iron SSH companion.
 
 # SSH access to ephemeral environments
 
+## Personal setup in Console
+
+Open **Integrations → SSH environment → Connect**. Enter the full WSS SSH
+tunnel URL, SSH username, a dedicated private key without a passphrase, and the
+server's verified public host key. Choose an access period (24 hours, 7 days,
+or 30 days), then save. The next screen shows the public key to register with
+your environment. Saving does not perform registration or claim a successful
+connection test.
+
+Private keys are write-only and encrypted with Console's existing Active Record
+encryption settings. Proxy-sync decrypts them only for the paired Iron SSH
+companion. The sandbox never receives the upstream private key. **Edit or
+renew** changes the target/key or starts a new access period; leaving the key
+blank preserves it. **Disconnect** removes the stored private key and revokes
+new connections and active leases on their next authorization check.
+
+Each user has one active SSH environment, available through the `ee` tool.
+Console sessions match the authenticated Console account. Slack DMs and channel
+turns match the owner's verified Slack SSO subject and workspace, never email
+or editable principal labels. Link that Slack identity to the Console account
+before using the connection from Slack.
+
+Deploy Console's database migration before relying on the new proxy-sync
+authorizer. UI-managed connections take precedence over the operator file
+below, including when expired or disconnected, so an old file entry does not
+silently reactivate access. Operators must still enable the SSH companion and
+allow the destination through the deployment's network policy.
+
+## Operator configuration
+
 This opt-in pilot requires an Iron image containing `iron-ssh`. The companion
 uses sshpiper's transport library in a separate Go module; ordinary HTTP
 proxying keeps its existing crypto dependencies. Build that image locally from

@@ -1,0 +1,59 @@
+<% content_for :title, "Configure SSH · Centaur Console" %>
+<% saved_key = @connection.persisted? && @connection.private_key_in_database.present? %>
+<%= render "console/page_header", title: "Connect an SSH environment", subtitle: "Your personal key lets Centaur work in your development environment." %>
+
+<div class="max-w-3xl">
+  <% if @connection.errors.any? %>
+    <div class="mb-6 rounded-lg border border-red-900 bg-red-950/30 p-4 text-sm text-red-200" role="alert">
+      <ul class="list-disc pl-5"><% @connection.errors.full_messages.each do |message| %><li><%= message %></li><% end %></ul>
+    </div>
+  <% end %>
+  <%= form_with scope: :ssh_connection, url: console_ssh_connection_path, method: :patch, data: { turbo: false } do |form| %>
+    <div class="space-y-6">
+      <section class="form-section">
+        <h2 class="form-section-heading">Environment</h2>
+        <div class="space-y-5">
+          <div>
+            <%= form.label :name, "Name", class: "form-label" %>
+            <%= form.text_field :name, value: @connection.name, required: true, maxlength: 100, class: "form-input", placeholder: "My development environment" %>
+          </div>
+          <div>
+            <%= form.label :destination, "SSH tunnel URL", class: "form-label" %>
+            <%= form.text_field :destination, value: @connection.destination, required: true, class: "form-input font-mono", placeholder: "wss://my-environment.example.com/events/events", spellcheck: false %>
+            <p class="form-hint">Use the full WebSocket SSH URL provided by your environment, including its path.</p>
+          </div>
+          <div>
+            <%= form.label :username, "SSH username", class: "form-label" %>
+            <%= form.text_field :username, value: @connection.username, required: true, class: "form-input", autocomplete: "off" %>
+          </div>
+        </div>
+      </section>
+      <section class="form-section">
+        <h2 class="form-section-heading">Keys</h2>
+        <div class="space-y-5">
+          <div>
+            <%= form.label :private_key, "Your private SSH key", class: "form-label" %>
+            <%= form.text_area :private_key, value: nil, rows: 6, required: !saved_key, class: "form-input font-mono", autocomplete: "off", spellcheck: false, placeholder: saved_key ? "Leave blank to keep your saved key" : "Paste your dedicated private SSH key" %>
+            <p class="form-hint">Use a dedicated key without a passphrase. Stored encrypted and never shown again. Centaur's sandbox receives a disposable key; the proxy holds your real key.</p>
+          </div>
+          <div>
+            <%= form.label :host_key, "Verified server public key", class: "form-label" %>
+            <%= form.text_area :host_key, value: @connection.host_key, rows: 3, required: true, class: "form-input font-mono", spellcheck: false, placeholder: "ssh-ed25519 AAAA…" %>
+            <p class="form-hint">Copy the SSH host public key from your environment's trusted setup information. This identifies the server, and is different from your own public key. A fingerprint alone is not enough.</p>
+          </div>
+        </div>
+      </section>
+      <section class="form-section">
+        <h2 class="form-section-heading">Access</h2>
+        <%= form.label :duration_hours, "Allow access for", class: "form-label" %>
+        <%= form.select :duration_hours, [["24 hours", 24], ["7 days", 168], ["30 days", 720]], { selected: @connection.duration_hours || 24 }, class: "form-input" %>
+        <p class="form-hint">Saving starts a new access period. Only your Console sessions, DMs, and channel turns can use this connection. Disconnect at any time.</p>
+        <p class="form-hint">Slack access requires a verified Slack identity linked to your Console account.</p>
+      </section>
+      <div class="flex flex-wrap gap-3">
+        <%= form.submit "Save SSH connection", class: "btn-primary" %>
+        <%= link_to "Cancel", console_integrations_path, class: "btn-secondary" %>
+      </div>
+    </div>
+  <% end %>
+</div>
