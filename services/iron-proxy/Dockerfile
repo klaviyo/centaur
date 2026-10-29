@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG IRON_PROXY_IMAGE=340433579684.dkr.ecr.us-east-1.amazonaws.com/klaviyo-iron-proxy:0f49682c4a0301088418f2a7c2c273d86f04a909@sha256:ea2f5750c69caed9cc0c77a8aa1252db6d0307eaf8eeddcd02823dbc524742c5
+ARG IRON_PROXY_IMAGE=340433579684.dkr.ecr.us-east-1.amazonaws.com/klaviyo-iron-proxy:4a139e098a200922f5ea1488e51099bf41c01e76@sha256:1a9c458127043a2c5b57a795241c193da07d7485984915c0ddaa0f8415b55656
 FROM ${IRON_PROXY_IMAGE}
 
 USER root

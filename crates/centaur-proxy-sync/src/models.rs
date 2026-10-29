@@ -11,6 +11,7 @@ use crate::cache::SyncCache;
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) ssh_grants_path: Option<std::path::PathBuf>,
+    pub(crate) ssh_targets: Vec<crate::ssh::TargetPolicy>,
     pub(crate) pool: PgPool,
     pub(crate) encryption: Arc<ActiveRecordEncryption>,
     pub(crate) jwt_secret: Option<String>,

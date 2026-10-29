@@ -12,7 +12,7 @@ class Console::SshConnectionsControllerTest < ActionDispatch::IntegrationTest
       raise "synthetic key generation failed" unless status.success?
       [ File.read(path), File.read("#{path}.pub").split.first(2).join(" ") ]
     end
-    @attributes = { name: "My EE", destination: "wss://ee.example.com/events/events", username: "dev", host_key: @public_key, private_key: @private_key, duration_hours: 24 }
+    @attributes = { name: "My SSH key", private_key: @private_key, duration_hours: 24 }
   end
 
   test "non-admin can enroll manage renew and disconnect only their own connection" do
@@ -22,6 +22,9 @@ class Console::SshConnectionsControllerTest < ActionDispatch::IntegrationTest
     assert_redirected_to console_ssh_connection_path
     record = users(:member_user).reload.ssh_connection
     assert record
+    assert_nil record.destination
+    assert_nil record.username
+    assert_nil record.host_key
     assert_nil users(:acme_admin).ssh_connection
     get console_ssh_connection_url
     assert_response :ok
@@ -29,6 +32,8 @@ class Console::SshConnectionsControllerTest < ActionDispatch::IntegrationTest
     assert_no_match(/BEGIN OPENSSH PRIVATE KEY/, response.body)
     get edit_console_ssh_connection_url
     assert_response :ok
+    assert_select "input[name='ssh_connection[destination]']", count: 0
+    assert_select "textarea[name='ssh_connection[host_key]']", count: 0
     assert_select "textarea[name='ssh_connection[private_key]']", text: ""
     patch console_ssh_connection_url, params: { ssh_connection: { name: "Renewed", private_key: "", duration_hours: 168 } }
     assert_redirected_to console_ssh_connection_path
@@ -40,7 +45,7 @@ class Console::SshConnectionsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "validation never echoes a submitted private key" do
-    patch console_ssh_connection_url, params: { ssh_connection: @attributes.merge(destination: "https://invalid.example.com") }
+    patch console_ssh_connection_url, params: { ssh_connection: @attributes.merge(name: "") }
     assert_response :unprocessable_entity
     assert_select "textarea[name='ssh_connection[private_key]']", text: ""
     assert_select "textarea[name='ssh_connection[private_key]'][required]"

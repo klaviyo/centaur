@@ -12,6 +12,8 @@ use crate::{ApiError, bearer_token, database::load_proxy, models::AppState};
 pub(crate) struct Request {
     route: String,
     public_key: String,
+    #[serde(default)]
+    destination: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -23,6 +25,8 @@ struct Grant {
     destination: String,
     username: String,
     host_key: String,
+    #[serde(default)]
+    tls_identity: bool,
     private_key_file: String,
     expires_at: DateTime<Utc>,
 }
@@ -103,6 +107,7 @@ pub(crate) async fn authorize(
         "destination": grant.destination,
         "username": grant.username,
         "host_key": grant.host_key,
+        "tls_identity": grant.tls_identity,
         "private_key": {"type": "control_plane", "value": private_key},
         "expires_at": expires_at.to_rfc3339(),
     })))
@@ -156,13 +161,31 @@ async fn managed_grant(
     if private_key.is_empty() {
         return Err(ApiError::unauthorized());
     }
+    let (destination, username, host_key, tls_identity) =
+        if let Some(target) = request.destination.as_deref() {
+            let (destination, policy) = target_policy(&state.ssh_targets, target)?;
+            (destination, policy.username.clone(), String::new(), true)
+        } else {
+            // Retain existing fixed-target records until the owner converts to a
+            // reusable key. New key-only records require a URL on each call.
+            (
+                row.get::<Option<String>, _>("destination")
+                    .ok_or_else(ApiError::unauthorized)?,
+                row.get::<Option<String>, _>("username")
+                    .ok_or_else(ApiError::unauthorized)?,
+                row.get::<Option<String>, _>("host_key")
+                    .ok_or_else(ApiError::unauthorized)?,
+                false,
+            )
+        };
     let grant = Grant {
         principal: centaur_console_db::oid("prn", principal_id),
         route: "ee".to_owned(),
         generation: row.get("generation"),
-        destination: row.get("destination"),
-        username: row.get("username"),
-        host_key: row.get("host_key"),
+        destination,
+        username,
+        host_key,
+        tls_identity,
         private_key_file: String::new(),
         expires_at,
     };
@@ -202,7 +225,74 @@ fn select(
         return Err(ApiError::unauthorized());
     }
     validate_destination(&grant.destination)?;
+    if request
+        .destination
+        .as_deref()
+        .is_some_and(|target| target != grant.destination)
+    {
+        return Err(ApiError::unauthorized());
+    }
     Ok(grant)
+}
+
+#[derive(Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TargetPolicy {
+    host: String,
+    path: String,
+    username: String,
+}
+
+pub(crate) fn target_policies(raw: Option<&str>) -> Result<Vec<TargetPolicy>, String> {
+    let policies: Vec<TargetPolicy> = serde_json::from_str(raw.unwrap_or("[]"))
+        .map_err(|_| "CENTAUR_EE_SSH_TARGETS must be a JSON array".to_owned())?;
+    for p in &policies {
+        let host = p.host.strip_prefix("*.").unwrap_or(&p.host);
+        if host.is_empty()
+            || host.starts_with('.')
+            || host.ends_with('.')
+            || !host
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-'))
+            || !p.path.starts_with('/')
+            || p.path.contains(['?', '#', '*'])
+            || p.username.is_empty()
+            || p.username.len() > 64
+            || !p
+                .username
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        {
+            return Err("invalid SSH target policy: use an exact/lowercase wildcard host, exact path, and SSH username".to_owned());
+        }
+    }
+    Ok(policies)
+}
+
+fn target_policy<'a>(
+    policies: &'a [TargetPolicy],
+    destination: &str,
+) -> Result<(String, &'a TargetPolicy), ApiError> {
+    if destination.len() > 2048 {
+        return Err(ApiError::unauthorized());
+    }
+    validate_destination(destination)?;
+    let url = url::Url::parse(destination).map_err(|_| ApiError::unauthorized())?;
+    let host = url.host_str().ok_or_else(ApiError::unauthorized)?;
+    let mut matches = policies.iter().filter(|p| {
+        let allowed = match p.host.strip_prefix("*.") {
+            Some(suffix) => host
+                .strip_suffix(suffix)
+                .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1),
+            None => host == p.host,
+        };
+        allowed && url.path() == p.path
+    });
+    let policy = matches.next().ok_or_else(ApiError::unauthorized)?;
+    if matches.next().is_some() {
+        return Err(ApiError::unauthorized());
+    }
+    Ok((url.to_string(), policy))
 }
 
 fn validate_destination(destination: &str) -> Result<(), ApiError> {
@@ -223,6 +313,42 @@ fn validate_destination(destination: &str) -> Result<(), ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dynamic_targets_are_restricted_by_deployment_policy() {
+        let policies = target_policies(Some(
+            r#"[{"host":"*.dev.example.com","path":"/events/events","username":"dev"}]"#,
+        ))
+        .unwrap();
+        for target in [
+            "wss://one.dev.example.com/events/events",
+            "wss://two.dev.example.com/events/events",
+        ] {
+            assert!(target_policy(&policies, target).is_ok());
+        }
+        for target in [
+            "wss://dev.example.com/events/events",
+            "wss://one.dev.example.com.evil.test/events/events",
+            "wss://evildev.example.com/events/events",
+            "wss://one.dev.example.com/other",
+            "wss://one.dev.example.com:8443/events/events",
+            "wss://user:secret@one.dev.example.com/events/events",
+            "wss://one.dev.example.com/events/events?token=secret",
+            "tcp://one.dev.example.com:22",
+            "wss://169.254.169.254/events/events",
+        ] {
+            assert!(target_policy(&policies, target).is_err(), "{target}");
+        }
+        assert!(target_policy(&[], "wss://one.dev.example.com/events/events").is_err());
+        let ambiguous = vec![policies[0].clone(), policies[0].clone()];
+        assert!(target_policy(&ambiguous, "wss://one.dev.example.com/events/events").is_err());
+        assert!(
+            target_policies(Some(
+                r#"[{"host":"*","path":"/events/events","username":"dev"}]"#
+            ))
+            .is_err()
+        );
+        assert!(target_policies(Some("not-json")).is_err());
+    }
     fn record() -> Value {
         json!({"principal":"prn_alice","route":"ee","generation":"one", "destination":"wss://ee.example.com/events/events", "username":"dev","host_key":"ssh-ed25519 fixture","private_key_file":"/run/keys/alice","expires_at":"2099-01-01T00:00:00Z"})
     }
@@ -231,6 +357,7 @@ mod tests {
         let request = Request {
             route: "ee".into(),
             public_key: "ssh-ed25519 sandbox-key".into(),
+            destination: None,
         };
         let bytes = serde_json::to_vec(&vec![record()]).unwrap();
         assert!(select(&bytes, "prn_alice", &request, Utc::now()).is_ok());
@@ -246,6 +373,7 @@ mod tests {
         let request = Request {
             route: "ee".into(),
             public_key: "ssh-ed25519 sandbox-key".into(),
+            destination: None,
         };
         for (field, value) in [
             ("expires_at", "2000-01-01T00:00:00Z"),
