@@ -8,16 +8,13 @@ place for the user to talk, review progress, and resume deferred work.
 
 The first version implements conversation continuity. It routes selected
 Slack DM users to the existing conversation-wide session and posts replies at
-the top level. The local playground also enables existing owner-scoped Console
-tasks for temporary parallel sandbox jobs, with results delivered to the same
-DM. It adds no database migration, memory extraction, persistent project-session
-mapping, or automatic import of historical threads.
+the top level. It adds no database migration, memory extraction, persistent
+project-session mapping, or automatic import of historical threads.
 
 | Capability | First version | Follow-on work |
 | --- | --- | --- |
 | One continuing private DM | Opt-in canonical DM session | Product controls and recovery UX |
 | Existing conversation context | Existing session/harness history | Bounded memory injection |
-| Temporary parallel sandbox jobs | Existing Console manual tasks, enabled locally | Integrated progress and cancellation |
 | Multiple project sandboxes | Existing single session assignment | Owner-bound child sessions |
 | Current work, preferences, deferred actions, decisions | No automatic extraction | Versioned memory objects |
 | Revert experiment | Disable ingress configuration | Independently disable extraction/dispatch |
@@ -87,14 +84,14 @@ that turn; the old durable session records are not merged.
 
 ## Target coordinator and project sessions
 
-The local playground can already create and run manual tasks through
+Console already supports owner-scoped manual tasks through
 `centaur-console create-task` and `run-task`. Console verifies the linked active
 user and task ownership, then starts its registered `console_workflow` as that
 owner. This does not require generic workflow API permissions. Each run owns a
 temporary sandbox and posts its result to the DM before cleanup. Child task
 agents are instructed to execute directly, without recursively creating or
-rerunning Console tasks. This provides a testable first delegation path; it
-does not provide persistent project sessions or aggregate cancellation.
+rerunning Console tasks. This existing delegation mechanism does not provide
+persistent project sessions or aggregate cancellation.
 
 Keep one persistent coordinator session per verified private DM owner. It owns
 conversation state and a bounded mapping of project IDs to owner-bound child
