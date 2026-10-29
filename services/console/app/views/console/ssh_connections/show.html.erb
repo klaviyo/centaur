@@ -1,6 +1,13 @@
 <% content_for :title, "SSH key · Centaur Console" %>
 <%= render "console/page_header", title: @connection.name, subtitle: "Your personal SSH key" %>
 <div class="max-w-3xl space-y-6">
+  <% if @connection.configured? %>
+    <div class="rounded border border-green-700 bg-green-950/20 p-4" role="status">
+      <p class="font-semibold">SSH key saved</p>
+      <p class="text-sm">Saved <%= @connection.updated_at.utc.strftime("%Y-%m-%d %H:%M UTC") %>. Your private key is stored encrypted. You can leave this page.</p>
+      <p class="form-hint">This confirms the key was saved; it does not test access to an environment. Register the public key below in your environments.</p>
+    </div>
+  <% end %>
   <section class="form-section">
     <h2 class="form-section-heading">Key details</h2>
     <p class="form-hint mb-4">Provide the destination URL when asking Centaur to connect. Available to your Console sessions. Slack DMs and channel turns use your verified linked Slack identity.</p>

@@ -30,6 +30,14 @@ class SshConnectionTest < ActiveSupport::TestCase
     assert_nil record.expires_at
   end
 
+  test "normalizes browser CRLF and a missing final newline before encryption" do
+    record = connection
+    record.private_key = record.private_key.strip.gsub("\n", "\r\n")
+    record.save!
+    assert_equal self.class.synthetic_key.last, record.public_key
+    assert_equal self.class.synthetic_key.first, record.reload.private_key
+  end
+
   test "rejects unsafe destinations, invalid server keys and private keys" do
     %w[http://ee.example.com https://ee.example.com wss://user:pass@ee.example.com/events wss://ee.example.com:22/events wss://ee.example.com/events?token=abc wss://ee.example.com/events#fragment].each do |destination|
       record = connection

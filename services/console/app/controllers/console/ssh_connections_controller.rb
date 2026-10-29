@@ -9,6 +9,14 @@ class Console::SshConnectionsController < ApplicationController
   def edit
   end
 
+  def validate_key
+    response.headers["Cache-Control"] = "no-store"
+    public_key = SshKey.public_key(params[:private_key].to_s)
+    render json: { valid: true, message: "Valid private key. Ready to save.", fingerprint: SshKey.fingerprint(public_key) }
+  rescue SshKey::Invalid => error
+    render json: { valid: false, message: error.message }, status: :unprocessable_entity
+  end
+
   def update
     attributes = params.require(:ssh_connection).permit(:name, :private_key).to_h
     attributes.delete("private_key") if attributes["private_key"].blank?

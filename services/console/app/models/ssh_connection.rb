@@ -55,7 +55,8 @@ class SshConnection < ApplicationRecord
     return if persisted? && !will_save_change_to_private_key? && private_key.present?
 
     self.public_key = SshKey.public_key(private_key)
-  rescue SshKey::Invalid
-    errors.add(:private_key, "must be a valid private key without a passphrase")
+    self.private_key = SshKey.normalize(private_key)
+  rescue SshKey::Invalid => error
+    errors.add(:private_key, error.message)
   end
 end
