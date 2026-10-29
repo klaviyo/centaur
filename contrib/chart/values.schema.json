@@ -519,6 +519,12 @@
       "type": "object",
       "properties": {
         "agentViewEnabled": { "type": "boolean" },
+        "unifiedDmEnabled": { "type": "boolean" },
+        "unifiedDmUsers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^T[A-Z0-9]+:[UW][A-Z0-9]+$" }
+        },
         "mcpPublicUrl": { "type": "string" },
         "responseMetadataMode": {
           "type": "string",

@@ -126,16 +126,23 @@ function handle(method: string, actor: Actor, body: Record<string, unknown>) {
     }
     case 'chat.postMessage':
     case 'chat.startStream': {
-      if (!conversation(channel)) return { ok: false, error: 'channel_not_found' }
+      // Slack lets a bot address a user ID to post into its DM with that user.
+      // Resolve only fixture identities here; user IDs are not channel aliases
+      // for history, discovery, streaming, or messages sent by user tokens.
+      const recipient = method === 'chat.postMessage' && actor === 'bot'
+        ? USERS.find(user => user.id === channel)
+        : undefined
+      const targetChannel = recipient ? dmChannel(recipient).id : channel
+      if (!conversation(targetChannel)) return { ok: false, error: 'channel_not_found' }
       const text = str(body.markdown_text) || str(body.text) || chunksText(body.chunks)
-      const message = post(actor, channel, {
+      const message = post(actor, targetChannel, {
         text,
         thread_ts: str(body.thread_ts) || undefined,
         blocks: Array.isArray(body.blocks) ? body.blocks : undefined,
         streaming: method === 'chat.startStream' || (actor === 'bot' && text === CHAT_SDK_STREAM_PLACEHOLDER)
       })
       if (actor !== 'bot') void deliverMessage(message, actor)
-      return { ok: true, channel, ts: message.ts, message }
+      return { ok: true, channel: targetChannel, ts: message.ts, message }
     }
     case 'chat.postEphemeral': {
       if (!conversation(channel)) return { ok: false, error: 'channel_not_found' }

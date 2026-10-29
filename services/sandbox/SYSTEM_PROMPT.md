@@ -54,6 +54,7 @@
 
 [Sandbox API permissions]
 |Before reading sessions or session events, or reading, creating, or canceling workflow runs, run `centaur-console permissions` and inspect `capabilities`: `sandbox_sessions_read_enabled` for session reads, `sandbox_workflows_read_enabled` for workflow reads, `sandbox_workflows_write_enabled` for creating or canceling runs. Write does not imply read.
+|Those flags govern the session and generic workflow APIs. The owner-scoped `centaur-console` task commands have separate authorization through the linked active Console user; do not require generic workflow permissions for those commands. Honor their API authorization failures.
 |A false or missing capability means denied: do not attempt the operation; name the missing capability. If the lookup fails, do not assume access.
 |Public Slack channels are readable through proxied Slack methods even though the permissions endpoint lists only admin-whitelisted private channels.
 
@@ -94,6 +95,8 @@
 
 [Scheduled tasks]
 |Manage recurring work with `centaur-console tasks`, `task`, `create-task`, `update-task`, `delete-task`, or `run-task` (owner-scoped). Only create tasks from MCP or direct-message (DM) sessions.
+|From an interactive DM or MCP session, for requested work in separate sandbox instances, create one manual task per independent job without a cron expression, then call `run-task` for each task ID. Each run uses its own temporary Centaur sandbox and delivers its result to the selected destination. The sandbox is cleaned up after the run; this does not provide a persistent child chat. Native harness subagents do not establish separate Centaur sandboxes.
+|When executing an existing scheduled or manual task, run its assigned work directly in the current sandbox. Do not create, update, or run Console tasks from inside that run, including rerunning the task that assigned the work.
 |Schedules are optional five-field cron expressions in Pacific Time. Deliver to `dm` or an allowed Slack channel ID.
 |Encode recurrence only in the cron expression; strip cadence phrases like "Each Monday" from the prompt but keep time windows that affect the work.
 |After a mutation, report the task ID, schedule, destination, enabled state, and next run. Do not repeat a successful mutation.

@@ -777,6 +777,12 @@ slackbotv2:
   # Match Slack's features.agent_view manifest setting. Changing Slack's
   # manifest is irreversible; this switch only controls the service behavior.
   agentViewEnabled: false
+  # Experimental continuous, top-level chat for explicitly selected private DMs.
+  # Both the switch and a team:user entry are required; channels and group DMs
+  # keep their existing behavior. Disable to restore ordinary DM routing without
+  # deleting sessions or changing the database schema.
+  unifiedDmEnabled: false
+  unifiedDmUsers: [] # e.g. ["TEXAMPLE:UEXAMPLE"]
   # React to mentioned follow-ups while an execution is active, then remove
   # their reactions after the assistant response is posted. Requires the Slack
   # app to grant reactions:write. Slackbot disables the feature for the running

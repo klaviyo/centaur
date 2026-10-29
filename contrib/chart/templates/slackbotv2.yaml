@@ -80,6 +80,10 @@ spec:
               value: {{ .Values.slackbotv2.autoJoinCreatedChannels | quote }}
             - name: SLACKBOTV2_AGENT_VIEW_ENABLED
               value: {{ .Values.slackbotv2.agentViewEnabled | quote }}
+            - name: SLACKBOTV2_UNIFIED_DM_ENABLED
+              value: {{ .Values.slackbotv2.unifiedDmEnabled | quote }}
+            - name: SLACKBOTV2_UNIFIED_DM_USERS
+              value: {{ .Values.slackbotv2.unifiedDmUsers | join "," | quote }}
             - name: SLACKBOTV2_STEERING_REACTION_ENABLED
               value: {{ .Values.slackbotv2.steeringReactionEnabled | quote }}
             - name: SLACKBOTV2_STEERING_REACTION

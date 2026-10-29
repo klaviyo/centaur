@@ -130,6 +130,493 @@ afterAll(async () => {
 })
 
 describe('slackbotv2', () => {
+  describe('unified private DMs', () => {
+    const enabledOptions = {
+      agentViewEnabled: true,
+      slackHomeTeamId: TEAM_ID,
+      unifiedDmEnabled: true,
+      unifiedDmUsers: [`${TEAM_ID}:${USER_ID}`]
+    }
+
+    it.each([false, true])('continues distinct roots and old replies with top-level answers (agent view: %s)', async agentViewEnabled => {
+      const sharedState = createMemoryState()
+      await sharedState.connect()
+      bot = createTestBot({ ...enabledOptions, agentViewEnabled, state: sharedState })
+      const channel = await openTestDm()
+      const key = `slack:${channel}:`
+      const first = await sendDirectMessage(channel, 'Project constraint: keep the existing database schema.')
+      expect(first.response.status).toBe(200)
+      await first.finished()
+      const firstState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+      expect(Number(firstState?.lastEventId)).toBeGreaterThan(0)
+
+      const second = await sendDirectMessage(channel, 'Continue the same project using that constraint.')
+      await second.finished()
+      const reply = await sendDirectMessage(channel, 'Also retain the rollback option.', { threadTs: first.ts })
+      await reply.finished()
+
+      expect(codexApi.executes.map(request => request.threadKey)).toEqual([key, key, key])
+      expect(codexApi.executes.map(request => request.body.idempotency_key)).toEqual([
+        first.ts, second.ts, reply.ts
+      ])
+      expect(codexApi.appends.map(request => request.threadKey)).toEqual([key, key, key])
+      expect(codexApi.eventRequests[1]?.afterEventId).toBe(Number(firstState?.lastEventId))
+      const history = await slackBot.conversations.history({ channel })
+      const answers = (history.messages ?? []).filter(message => message.user === BOT_USER_ID
+        && /Executed request \d\./.test(message.text ?? ''))
+      expect(answers).toHaveLength(3)
+      expect(answers.every(message => !message.thread_ts || message.thread_ts === message.ts)).toBe(true)
+      expect(slackApi.calls.some(call => call.method === 'agents.sessions.rename')).toBe(false)
+    })
+
+    it.each([
+      { name: 'disabled', unifiedDmEnabled: false, unifiedDmUsers: [`${TEAM_ID}:${USER_ID}`] },
+      { name: 'an empty allowlist', unifiedDmEnabled: true, unifiedDmUsers: [] },
+      { name: 'another user', unifiedDmEnabled: true, unifiedDmUsers: [`${TEAM_ID}:${USER_B_ID}`] },
+      { name: 'another workspace', unifiedDmEnabled: true, unifiedDmUsers: [`TOTHERTEAM:${USER_ID}`] }
+    ])('keeps agent-view root sessions for $name', async options => {
+      bot = createTestBot({ agentViewEnabled: true, slackHomeTeamId: TEAM_ID, ...options })
+      const channel = await openTestDm()
+      const first = await sendDirectMessage(channel, 'First separate request.')
+      await first.finished()
+      const second = await sendDirectMessage(channel, 'Second separate request.')
+      await second.finished()
+      expect(codexApi.executes.map(request => request.threadKey)).toEqual([
+        `slack:${channel}:${first.ts}`, `slack:${channel}:${second.ts}`
+      ])
+    })
+
+    it('isolates opted-in users by their private DM channel', async () => {
+      bot = createTestBot({
+        ...enabledOptions,
+        unifiedDmUsers: [`${TEAM_ID}:${USER_ID}`, `${TEAM_ID}:${USER_B_ID}`]
+      })
+      const channel = await openTestDm()
+      const otherChannel = await openTestDm('builder')
+      expect(otherChannel).not.toBe(channel)
+      const first = await sendDirectMessage(channel, 'My private project constraint.')
+      await first.finished()
+      const other = await sendDirectMessage(otherChannel, 'My unrelated private project.', { userId: USER_B_ID })
+      await other.finished()
+      expect(codexApi.executes.map(request => request.threadKey)).toEqual([
+        `slack:${channel}:`, `slack:${otherChannel}:`
+      ])
+      expect(sessionMessageTexts(codexApi.appends[1]!.body.messages).join('\n'))
+        .not.toContain('My private project constraint.')
+    })
+
+    it.each(['channel', 'mpim'])('preserves thread routing for %s messages', async channelType => {
+      bot = createTestBot(enabledOptions)
+      const first = await sendMessage(`<@${BOT_USER_ID}> first channel request`, {
+        event: { channel_type: channelType }
+      })
+      await first.finished()
+      const second = await sendMessage(`<@${BOT_USER_ID}> second channel request`, {
+        event: { channel_type: channelType }
+      })
+      await second.finished()
+      expect(codexApi.executes.map(request => request.threadKey)).toEqual([
+        threadKey(first.ts), threadKey(second.ts)
+      ])
+    })
+
+    it('retains the continuous session when disabled and resumes it after re-enabling', async () => {
+      const sharedState = createMemoryState()
+      await sharedState.connect()
+      bot = createTestBot({ ...enabledOptions, state: sharedState })
+      const channel = await openTestDm()
+      const key = `slack:${channel}:`
+      const first = await sendDirectMessage(channel, 'Keep this project decision.')
+      await first.finished()
+      const savedState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+
+      bot = createTestBot({ ...enabledOptions, unifiedDmEnabled: false, state: sharedState })
+      const separate = await sendDirectMessage(channel, 'A temporary separate request.')
+      await separate.finished()
+      expect(await sharedState.get(`thread-state:${key}`)).toEqual(savedState)
+
+      bot = createTestBot({ ...enabledOptions, state: sharedState })
+      const resumed = await sendDirectMessage(channel, 'Resume my original project.')
+      await resumed.finished()
+      expect(codexApi.executes.map(request => request.threadKey)).toEqual([
+        key, `slack:${channel}:${separate.ts}`, key
+      ])
+      expect(codexApi.eventRequests.at(-1)?.afterEventId).toBe(Number(savedState?.lastEventId))
+    })
+
+    it('reuses the accepted turn after a lost response and deduplicates Slack redelivery', async () => {
+      bot = createTestBot({ ...enabledOptions, handoffRetryDelaysMs: [20] })
+      codexApi.failNextExecuteAfterAccept = true
+      const channel = await openTestDm()
+      const request = await sendDirectMessage(channel, 'Execute this exactly once.', { eventId: 'Ev-unified-retry' })
+      expect(request.response.status).toBe(200)
+      await waitFor(() => codexApi.executes.length === 2, 3000)
+      await request.finished()
+      const retry = await deliverEvent({
+        type: 'message', channel_type: 'im', channel, user: USER_ID,
+        ts: request.ts, text: 'Execute this exactly once.'
+      }, { eventId: 'Ev-unified-retry', retryNum: '1', retryReason: 'http_timeout' })
+      expect(retry.response.status).toBe(200)
+      await retry.finished()
+      expect(codexApi.appends).toHaveLength(1)
+      expect(codexApi.executes).toHaveLength(2)
+      expect(codexApi.executes.map(execution => execution.body.idempotency_key)).toEqual([
+        request.ts, request.ts
+      ])
+      expect(codexApi.executes.every(execution => execution.threadKey === `slack:${channel}:`)).toBe(true)
+      const history = await slackBot.conversations.history({ channel })
+      expect((history.messages ?? []).filter(message =>
+        (message.text ?? '').includes('Executed request 1.')
+      )).toHaveLength(1)
+    })
+
+    it('steers an active execution when another unmentioned root arrives', async () => {
+      bot = createTestBot(enabledOptions)
+      codexApi.autoRespond = false
+      const channel = await openTestDm()
+      const key = `slack:${channel}:`
+      const running = await sendDirectMessage(channel, 'Start working on my project.')
+      await waitFor(() => codexApi.streamCount === 1)
+      const steering = await sendDirectMessage(channel, 'Preserve the existing public API too.')
+      expect(steering.response.status).toBe(200)
+      await steering.finished()
+      expect(codexApi.executes).toHaveLength(1)
+      expect(codexApi.appends.map(request => request.threadKey)).toEqual([key, key])
+      expect(sessionMessageTexts(codexApi.appends[1]!.body.messages).join('\n'))
+        .toContain('Preserve the existing public API too.')
+      codexApi.emitOutputLines(key, sampleCodexOutputLines('Completed with the additional constraint.'))
+      await running.finished()
+    })
+
+    it('serializes distinct roots that overlap before the first message is durably appended', async () => {
+      const sharedState = createMemoryState()
+      await sharedState.connect()
+      const acquireLock = sharedState.acquireLock.bind(sharedState)
+      let contentionCount = 0
+      const lockSpy = spyOn(sharedState, 'acquireLock').mockImplementation(async (key, ttlMs) => {
+        const lock = await acquireLock(key, ttlMs)
+        if (key.startsWith('slackbotv2:unified-dm:handoff:') && !lock) contentionCount += 1
+        return lock
+      })
+      let releaseAppend!: () => void
+      const appendGate = new Promise<void>(resolve => { releaseAppend = resolve })
+      let appendCalls = 0
+      bot = createTestBot({
+        ...enabledOptions,
+        state: sharedState,
+        fetch: async (input, init) => {
+          if (String(input).endsWith('/messages') && ++appendCalls === 1) await appendGate
+          return globalThis.fetch(input, init)
+        }
+      })
+      codexApi.autoRespond = false
+      const channel = await openTestDm()
+      const key = `slack:${channel}:`
+      try {
+        const firstPending = sendDirectMessage(channel, 'First request with a slow durable append.')
+        await waitFor(() => appendCalls === 1)
+        const secondPending = sendDirectMessage(channel, 'Second root arriving during that append.')
+        await waitFor(() => contentionCount > 0)
+        expect(codexApi.appends).toHaveLength(0)
+        expect(codexApi.executes).toHaveLength(0)
+        releaseAppend()
+
+        const [first, second] = await Promise.all([firstPending, secondPending])
+        expect(first.response.status).toBe(200)
+        expect(second.response.status).toBe(200)
+        await second.finished()
+        expect(codexApi.appends.map(request => request.threadKey)).toEqual([key, key])
+        expect(codexApi.appends.flatMap(request => request.body.messages)
+          .map(message => message.client_message_id)).toEqual([first.ts, second.ts])
+        expect(codexApi.executes).toHaveLength(1)
+        expect(await sharedState.get(`thread-state:${key}`)).toMatchObject({
+          activeExecution: true,
+          forwardedMessageIds: [first.ts, second.ts]
+        })
+        codexApi.emitOutputLines(key, sampleCodexOutputLines('Both requests were retained.'))
+        await first.finished()
+      } finally {
+        releaseAppend()
+        lockSpy.mockRestore()
+      }
+    })
+
+    it('returns retryable failure before SDK deduplication when the canonical handoff remains busy', async () => {
+      const sharedState = createMemoryState()
+      await sharedState.connect()
+      bot = createTestBot({ ...enabledOptions, state: sharedState })
+      const channel = await openTestDm()
+      const key = `slack:${channel}:`
+      const lock = await sharedState.acquireLock(`slackbotv2:unified-dm:handoff:${key}`, 10_000)
+      expect(lock).not.toBeNull()
+      let request: Awaited<ReturnType<typeof sendDirectMessage>>
+      try {
+        request = await sendDirectMessage(channel, 'Retain this message after contention.', {
+          eventId: 'Ev-unified-busy-handoff'
+        })
+        expect(request.response.status).toBe(503)
+        await request.finished()
+        expect(codexApi.creates).toHaveLength(0)
+        expect(codexApi.appends).toHaveLength(0)
+        expect(codexApi.executes).toHaveLength(0)
+      } finally {
+        await sharedState.releaseLock(lock!)
+      }
+
+      const retry = await deliverEvent({
+        type: 'message', channel_type: 'im', channel, user: USER_ID,
+        ts: request.ts, text: 'Retain this message after contention.'
+      }, { eventId: 'Ev-unified-busy-handoff', retryNum: '1', retryReason: 'http_error' })
+      expect(retry.response.status).toBe(200)
+      await retry.finished()
+      expect(codexApi.appends).toHaveLength(1)
+      expect(codexApi.executes).toHaveLength(1)
+      expect(codexApi.executes[0]).toMatchObject({ threadKey: key, body: { idempotency_key: request.ts } })
+    })
+
+    it('rejects a handoff that loses its lease during create and accepts the same Slack retry', async () => {
+      const sharedState = createMemoryState()
+      await sharedState.connect()
+      let releaseCreate!: () => void
+      const createGate = new Promise<void>(resolve => { releaseCreate = resolve })
+      let createCalls = 0
+      bot = createTestBot({
+        ...enabledOptions,
+        state: sharedState,
+        fetch: async (input, init) => {
+          if (/\/api\/session\/[^/]+$/.test(new URL(String(input)).pathname) && ++createCalls === 1) {
+            await createGate
+          }
+          return globalThis.fetch(input, init)
+        }
+      })
+      const channel = await openTestDm()
+      const key = `slack:${channel}:`
+      const leaseKey = `slackbotv2:unified-dm:handoff:${key}`
+      let successor: Awaited<ReturnType<typeof sharedState.acquireLock>> = null
+      let first!: Awaited<ReturnType<typeof sendDirectMessage>>
+      try {
+        const pending = sendDirectMessage(channel, 'Retry me if this worker loses ownership.', {
+          eventId: 'Ev-unified-lease-lost'
+        })
+        await waitFor(() => createCalls === 1)
+        await sharedState.forceReleaseLock(leaseKey)
+        successor = await sharedState.acquireLock(leaseKey, 10_000)
+        expect(successor).not.toBeNull()
+        releaseCreate()
+        first = await pending
+        expect(first.response.status).toBe(503)
+        await first.finished()
+        expect(codexApi.appends).toHaveLength(0)
+        expect(codexApi.executes).toHaveLength(0)
+        const abandonedState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+        expect(abandonedState?.activeExecution).not.toBe(true)
+        // Releasing the stale holder must not release the new owner's lease.
+        expect(await sharedState.extendLock(successor!, 10_000)).toBe(true)
+      } finally {
+        releaseCreate()
+        if (successor) await sharedState.releaseLock(successor)
+      }
+
+      const retry = await deliverEvent({
+        type: 'message', channel_type: 'im', channel, user: USER_ID,
+        ts: first.ts, text: 'Retry me if this worker loses ownership.'
+      }, { eventId: 'Ev-unified-lease-lost', retryNum: '1', retryReason: 'http_error' })
+      expect(retry.response.status).toBe(200)
+      await retry.finished()
+      expect(codexApi.appends).toHaveLength(1)
+      expect(codexApi.executes).toHaveLength(1)
+      expect(codexApi.executes[0]).toMatchObject({ threadKey: key, body: { idempotency_key: first.ts } })
+    })
+
+    it('interrupts the shared active execution from an unmentioned new root stop command', async () => {
+      const sharedState = createMemoryState()
+      await sharedState.connect()
+      const interrupts: string[] = []
+      bot = createTestBot({
+        ...enabledOptions,
+        state: sharedState,
+        fetch: async (input, init) => {
+          if (String(input).endsWith('/interrupt')) {
+            interrupts.push(String(input))
+            return Response.json({ ok: true, interrupted: true, execution_id: 'exe-1' })
+          }
+          return globalThis.fetch(input, init)
+        }
+      })
+      codexApi.autoRespond = false
+      const channel = await openTestDm()
+      const key = `slack:${channel}:`
+      const running = await sendDirectMessage(channel, 'Work until I stop you.')
+      await waitFor(() => codexApi.eventRequests.length === 1)
+      const stop = await sendDirectMessage(channel, 'stop')
+      expect(stop.response.status).toBe(200)
+      await stop.finished()
+      expect(interrupts).toEqual([`${codexApi.url}/api/session/${encodeURIComponent(key)}/interrupt`])
+      expect(codexApi.executes).toHaveLength(1)
+      expect(codexApi.appends).toHaveLength(1)
+      expect(await sharedState.get(`thread-state:${key}`)).toMatchObject({ activeExecution: false })
+      // The real Codex harness emits this before the durable cancellation event.
+      // The session stream closes on this raw terminal line, so it must render
+      // interruption correctly without waiting for session.execution_cancelled.
+      codexApi.emitOutputLine(key, JSON.stringify({
+        method: 'turn/completed',
+        params: {
+          threadId: 'thread-interrupted',
+          turn: { id: 'turn-interrupted', items: [], status: 'interrupted', error: null }
+        }
+      }))
+      codexApi.emitSessionEvent(key, 'session.execution_cancelled', {
+        execution_id: 'exe-1', status: 'cancelled', reason: 'turn_interrupted'
+      })
+      await running.finished()
+      const history = await slackBot.conversations.history({ channel })
+      const replies = (history.messages ?? []).filter(message => message.user === BOT_USER_ID)
+      expect(replies.filter(message => message.text?.includes('Execution interrupted'))).toHaveLength(1)
+      expect(replies.map(message => message.text).join('\n')).not.toContain(
+        'Execution completed, but no final text was captured.'
+      )
+    })
+
+    it('keeps delayed file-only messages in the continuous session', async () => {
+      bot = createTestBot(enabledOptions)
+      const channel = await openTestDm()
+      const first = await sendDirectMessage(channel, 'Inspect the screenshot I am uploading.')
+      await first.finished()
+      const fileTs = incrementSlackTs(first.ts, 2)
+      const delivery = await deliverEvent({
+        type: 'message', channel_type: 'im', channel, user: USER_ID,
+        ts: fileTs, text: '',
+        files: [{
+          id: 'F-unified-late', mimetype: 'image/png', name: 'captured.png',
+          size: 16, url_private: 'https://files.slack.com/files/captured.png'
+        }]
+      })
+      expect(delivery.response.status).toBe(200)
+      await delivery.finished()
+      expect(codexApi.executes.map(request => request.threadKey)).toEqual([
+        `slack:${channel}:`, `slack:${channel}:`
+      ])
+      expect(codexApi.appends[1]!.body.messages.flatMap(message => message.parts))
+        .toContainEqual(expect.objectContaining({
+          type: 'attachment', dataBase64: Buffer.from('captured-image').toString('base64')
+        }))
+    })
+
+    it('recovers an unfinished top-level answer after restart with the opt-in disabled', async () => {
+      const sharedState = createMemoryState()
+      await sharedState.connect()
+      const channel = await openTestDm()
+      const key = `slack:${channel}:`
+      const posted = await slackBot.chat.postMessage({ channel, text: 'Finish my original request.' })
+      const message = apiMessageFromSlackEvent({
+        isMention: true, text: 'Finish my original request.', threadId: key, ts: posted.ts!
+      })
+      message.raw = {
+        type: 'message', channel_type: 'im', channel, user: USER_ID,
+        ts: posted.ts, team: TEAM_ID, text: message.text
+      }
+      await sharedState.set(`thread-state:${key}`, {
+        activeExecution: true,
+        executedMessageIds: [message.id],
+        forwardedMessageIds: [message.id],
+        historyForwarded: true,
+        lastEventId: 999999,
+        renderObligation: { afterEventId: 0, executionId: 'exe-unified-recovery', message }
+      })
+      await sharedState.appendToList('slackbotv2:render:index', key)
+      codexApi.emitOutputLines(key, sampleCodexOutputLines('Recovered continuous answer.'))
+
+      bot = createTestBot({ ...enabledOptions, unifiedDmEnabled: false, state: sharedState })
+      await waitFor(async () => {
+        const recovered = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+        return recovered?.renderObligation === null
+      }, 3000)
+      expect(codexApi.executes).toHaveLength(0)
+      expect(codexApi.eventRequests).toEqual([
+        { afterEventId: 0, executionId: 'exe-unified-recovery', threadKey: key }
+      ])
+      const history = await slackBot.conversations.history({ channel })
+      const answers = (history.messages ?? []).filter(message =>
+        (message.text ?? '').includes('Recovered continuous answer.')
+      )
+      expect(answers).toHaveLength(1)
+      expect(answers[0]?.thread_ts).toBeUndefined()
+    })
+
+    it('preserves a newer execution when an older recovery finishes after stop and restart', async () => {
+      const sharedState = createMemoryState()
+      await sharedState.connect()
+      const channel = await openTestDm()
+      const key = `slack:${channel}:`
+      const posted = await slackBot.chat.postMessage({ channel, text: 'An older request awaiting recovery.' })
+      const message = apiMessageFromSlackEvent({
+        isMention: true, text: 'An older request awaiting recovery.', threadId: key, ts: posted.ts!
+      })
+      message.raw = {
+        type: 'message', channel_type: 'im', channel, user: USER_ID,
+        ts: posted.ts, team: TEAM_ID, text: message.text
+      }
+      await sharedState.set(`thread-state:${key}`, {
+        activeExecution: true,
+        executedMessageIds: [message.id],
+        forwardedMessageIds: [message.id],
+        historyForwarded: true,
+        lastEventId: 0,
+        renderObligation: { afterEventId: 0, executionId: 'exe-old-recovery', message }
+      })
+      await sharedState.appendToList('slackbotv2:render:index', key)
+      const logs: CapturedLog[] = []
+      let oldEvents!: ReadableStreamDefaultController<Uint8Array>
+      bot = createTestBot({
+        ...enabledOptions,
+        logger: captureLogger(logs),
+        state: sharedState,
+        fetch: async (input, init) => {
+          const url = new URL(String(input))
+          if (url.pathname.endsWith('/events') && url.searchParams.get('execution_id') === 'exe-old-recovery') {
+            return new Response(new ReadableStream<Uint8Array>({
+              start(controller) { oldEvents = controller }
+            }), { headers: { 'content-type': 'text/event-stream' } })
+          }
+          if (url.pathname.endsWith('/interrupt')) {
+            return Response.json({ ok: true, interrupted: true, execution_id: 'exe-old-recovery', thread_key: key })
+          }
+          return globalThis.fetch(input, init)
+        }
+      })
+      await waitFor(() => hasLog(logs, 'slackbotv2_render_slack_metadata_set'))
+      const stop = await sendDirectMessage(channel, 'stop')
+      await stop.finished()
+      codexApi.autoRespond = false
+      // The emulator uses a per-second sequence for ts fractions. Make the
+      // new event unambiguously newer than the stop's wall-clock marker.
+      const next = await deliverEvent({
+        type: 'message', channel_type: 'im', channel, user: USER_ID,
+        ts: incrementSlackTs(stop.ts, 2), text: 'Start the newer request.'
+      })
+      await waitFor(() => codexApi.eventRequests.length === 1)
+      const nextState = await sharedState.get<Record<string, unknown>>(`thread-state:${key}`)
+      expect(nextState).toMatchObject({
+        activeExecution: true,
+        renderObligation: { executionId: 'exe-1' }
+      })
+
+      for (const [index, line] of sampleCodexOutputLines('The older recovered answer.').entries()) {
+        oldEvents.enqueue(new TextEncoder().encode(`id: ${index + 100}\nevent: session.output.line\ndata: ${line}\n\n`))
+      }
+      oldEvents.close()
+      await waitFor(() => hasLog(logs, 'slackbotv2_render_recovery_finalized'))
+      expect(await sharedState.get(`thread-state:${key}`)).toMatchObject({
+        activeExecution: true,
+        renderObligation: nextState?.renderObligation,
+        lastEventId: nextState?.lastEventId
+      })
+      codexApi.emitOutputLines(key, sampleCodexOutputLines('The newer request completed.'))
+      await next.finished()
+    })
+  })
+
   // Legacy (non-agent-view) DMs run end to end in e2e/tests/context.test.ts.
   it('routes agent-view DM roots and replies to their own sessions', async () => {
     bot = createTestBot({ agentViewEnabled: true })
@@ -4956,6 +5443,29 @@ function signedSlackInteraction(payload: Record<string, unknown>): RequestInit {
  * settles once the work the webhook scheduled has finished.
  */
 type Delivery = { response: Response; finished: () => Promise<unknown> }
+
+async function openTestDm(name = 'tester'): Promise<string> {
+  const members = await slackBot.users.list({})
+  const userId = members.members?.find(member => member.name === name)?.id
+  expect(userId).toBeDefined()
+  const dm = await slackBot.conversations.open({ users: userId! })
+  expect(dm.channel?.id).toBeDefined()
+  return dm.channel!.id!
+}
+
+async function sendDirectMessage(
+  channel: string,
+  text: string,
+  options: { eventId?: string; threadTs?: string; userId?: string } = {}
+): Promise<{ ts: string } & Delivery> {
+  const posted = await slackBot.chat.postMessage({ channel, text, thread_ts: options.threadTs })
+  expect(posted.ts).toBeDefined()
+  const delivery = await deliverEvent({
+    type: 'message', channel_type: 'im', channel, user: options.userId ?? USER_ID,
+    ts: posted.ts, text, ...(options.threadTs ? { thread_ts: options.threadTs } : {})
+  }, { eventId: options.eventId })
+  return { ts: posted.ts!, ...delivery }
+}
 
 let eventCount = 0
 

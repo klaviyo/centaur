@@ -127,6 +127,10 @@ export type SlackbotV2Options = {
   apiUrl: string
   /** Enable Slack's Agent messaging experience. Must match the app manifest. */
   agentViewEnabled?: boolean
+  /** Default-off continuous conversation for explicitly opted-in private DM users. */
+  unifiedDmEnabled?: boolean
+  /** Exact home-workspace team:user pairs eligible for continuous private DMs. */
+  unifiedDmUsers?: readonly string[]
   assistantStatus?: string
   /**
    * When enabled, session.activity_summary events update Slack's assistant

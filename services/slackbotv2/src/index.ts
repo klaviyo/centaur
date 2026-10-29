@@ -86,6 +86,14 @@ import {
 } from './slack-events'
 import { isSlackStopCommand } from './stop-command'
 import {
+  assertUnifiedDmLockOwned,
+  isConversationDmThread,
+  unifiedDmThreadId,
+  unifiedDmThreadIdForEvent,
+  UnifiedDmLockError,
+  withUnifiedDmLock
+} from './unified-dm'
+import {
   createSteeringReactionController,
   type SteeringReactionAck,
   type SteeringReactionController
@@ -153,6 +161,7 @@ const MAX_SLACK_MESSAGE_ATTACHMENTS = 20
 type SlackbotV2RequestContext = {
   waitUntil(promise: Promise<unknown>): void
   actionError?: unknown
+  unifiedDmLock?: { active: boolean; threadId: string }
 }
 
 type StateConnectionStatus = {
@@ -438,23 +447,12 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
       const channel = stringValue(raw.channel)
       const threadTs = stringValue(raw.thread_ts) ?? stringValue(raw.ts)
       if (!channel || !threadTs) return
-      // Legacy DMs leave a conversation-wide subscription behind. The SDK
-      // preserves that routing for proactive bots; our agent sessions always
-      // follow Slack's thread roots, including after toggling modes.
-      const threadId = slack.encodeThreadId({ channel, threadTs })
+      // Legacy DMs leave a conversation-wide subscription behind. Agent mode
+      // follows Slack's roots unless this user explicitly opts into one chat.
+      const threadId = unifiedDmThreadId(message, options) ??
+        slack.encodeThreadId({ channel, threadTs })
       const thread = chat.thread(threadId)
-      const directMessage = new ChatSdkMessage({
-        attachments: message.attachments,
-        author: message.author,
-        formatted: message.formatted,
-        id: message.id,
-        isMention: true,
-        links: message.links,
-        metadata: message.metadata,
-        raw: message.raw,
-        text: message.text,
-        threadId
-      })
+      const directMessage = retargetDirectMessage(message, threadId)
       lateSlackFiles.rememberFilelessMention(thread, directMessage)
       await handleSlackMessageHandoff(thread, directMessage, {
         assistantStatusRequested: true,
@@ -470,6 +468,11 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
 
   chat.onNewMention(async (thread, message) => {
     if (!(await isAllowedSlackMessage(message, options, logger))) return
+    const canonicalId = unifiedDmThreadId(message, options)
+    if (canonicalId) {
+      thread = chat.thread(canonicalId)
+      message = retargetDirectMessage(message, canonicalId)
+    }
     lateSlackFiles.rememberFilelessMention(thread, message)
     await handleSlackMessageHandoff(thread, message, {
       assistantStatusRequested: true,
@@ -488,6 +491,11 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   chat.onNewMessage(/^.*$/s, async (thread, message) => {
     if (!slackRichTextMentionsUser(message.raw, options.botUserId)) return
     if (!(await isAllowedSlackMessage(message, options, logger))) return
+    const canonicalId = unifiedDmThreadId(message, options)
+    if (canonicalId) {
+      thread = chat.thread(canonicalId)
+      message = retargetDirectMessage(message, canonicalId)
+    }
     message.isMention = true
     await handleSlackMessageHandoff(thread, message, {
       assistantStatusRequested: true,
@@ -502,6 +510,11 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
 
   chat.onSubscribedMessage(async (thread, message) => {
     if (!(await isAllowedSlackMessage(message, options, logger))) return
+    const canonicalId = unifiedDmThreadId(message, options)
+    if (canonicalId) {
+      thread = chat.thread(canonicalId)
+      message = retargetDirectMessage(message, canonicalId)
+    }
     if (slackRichTextMentionsUser(message.raw, options.botUserId)) message.isMention = true
     if (message.isMention !== true) {
       traceLog(
@@ -602,74 +615,108 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
         return new globalThis.Response('ok', { status: 200 })
       }
       const interaction = parseSlackWebhookPayload(rawBody)
-      const workflowAction = interaction?.type === 'block_actions'
-        && Array.isArray(interaction.actions)
-        && interaction.actions.some(action => isJsonObject(action)
-          && typeof action.action_id === 'string'
-          && action.action_id.startsWith(WORKFLOW_ACTION_PREFIX))
-      const awaitHandoff = workflowAction || shouldAwaitSlackHandoff(rawBody)
-      const handoffTasks: Promise<unknown>[] = []
-      const keepAlive = (promise: Promise<unknown>) => {
-        background.track(promise)
-        waitUntil(c, promise)
-      }
-      const context: SlackbotV2RequestContext = { waitUntil: keepAlive }
-      const response = await requestContext.run(context, () => {
-        return chat.webhooks.slack(c.req.raw, {
-          waitUntil: promise => {
-            if (awaitHandoff) {
-              background.track(promise)
-              handoffTasks.push(promise)
-            } else {
-              keepAlive(promise)
+      const canonicalId = unifiedDmThreadIdForEvent(
+        interaction?.event, options, interaction?.team_id
+      )
+      const canonicalLock = canonicalId ? { active: true, threadId: canonicalId } : undefined
+      const dispatchWebhook = async (): Promise<Response> => {
+        const workflowAction = interaction?.type === 'block_actions'
+          && Array.isArray(interaction.actions)
+          && interaction.actions.some(action => isJsonObject(action)
+            && typeof action.action_id === 'string'
+            && action.action_id.startsWith(WORKFLOW_ACTION_PREFIX))
+        const awaitHandoff = workflowAction || shouldAwaitSlackHandoff(rawBody)
+        const handoffTasks: Promise<unknown>[] = []
+        const keepAlive = (promise: Promise<unknown>) => {
+          background.track(promise)
+          waitUntil(c, promise)
+        }
+        const context: SlackbotV2RequestContext = {
+          waitUntil: keepAlive, unifiedDmLock: canonicalLock
+        }
+        const response = await requestContext.run(context, () => {
+          return chat.webhooks.slack(c.req.raw, {
+            waitUntil: promise => {
+              if (awaitHandoff) {
+                background.track(promise)
+                handoffTasks.push(promise)
+              } else {
+                keepAlive(promise)
+              }
             }
-          }
-        })
-      })
-      const channelCreatedJoinTask = response.ok && options.autoJoinCreatedChannels === true
-        ? joinSlackChannelCreatedEvent(rawBody, options)
-        : null
-      if (channelCreatedJoinTask) keepAlive(channelCreatedJoinTask)
-      if (awaitHandoff && response.ok) {
-        const waitStartedAtMs = nowMs()
-        const waitFields = {
-          ...webhookFields,
-          response_status: response.status,
-          task_count: handoffTasks.length
-        }
-        traceLog(options, 'slackbotv2_webhook_handoff_wait_started', undefined, waitFields)
-        const stopPendingLog = startPendingOperationLog(
-          options,
-          'slackbotv2_webhook_handoff_wait_pending',
-          undefined,
-          waitFields,
-          waitStartedAtMs
-        )
-        let waitError: unknown
-        try {
-          await Promise.all(handoffTasks)
-        } catch (error) {
-          waitError = error
-        } finally {
-          stopPendingLog()
-          traceLog(options, 'slackbotv2_webhook_handoff_wait_complete', undefined, {
-            ...waitFields,
-            error: waitError ? errorMessage(waitError) : undefined,
-            phase_ms: elapsedMs(waitStartedAtMs)
           })
+        })
+        const channelCreatedJoinTask = response.ok && options.autoJoinCreatedChannels === true
+          ? joinSlackChannelCreatedEvent(rawBody, options)
+          : null
+        if (channelCreatedJoinTask) keepAlive(channelCreatedJoinTask)
+        if (awaitHandoff && response.ok) {
+          const waitStartedAtMs = nowMs()
+          const waitFields = {
+            ...webhookFields,
+            response_status: response.status,
+            task_count: handoffTasks.length
+          }
+          traceLog(options, 'slackbotv2_webhook_handoff_wait_started', undefined, waitFields)
+          const stopPendingLog = startPendingOperationLog(
+            options,
+            'slackbotv2_webhook_handoff_wait_pending',
+            undefined,
+            waitFields,
+            waitStartedAtMs
+          )
+          let waitError: unknown
+          try {
+            await Promise.all(handoffTasks)
+          } catch (error) {
+            waitError = error
+          } finally {
+            stopPendingLog()
+            traceLog(options, 'slackbotv2_webhook_handoff_wait_complete', undefined, {
+              ...waitFields,
+              error: waitError ? errorMessage(waitError) : undefined,
+              phase_ms: elapsedMs(waitStartedAtMs)
+            })
+          }
+          if (workflowAction && (waitError || context.actionError)) {
+            outcome = 'error'
+            return new globalThis.Response('Workflow action could not be recorded. Please retry.', { status: 503 })
+          }
         }
-        if (workflowAction && (waitError || context.actionError)) {
-          outcome = 'error'
-          return new globalThis.Response('Workflow action could not be recorded. Please retry.', { status: 503 })
-        }
+        const lateFileTask = response.ok ? lateSlackFiles.repairFromWebhook(rawBody) : null
+        if (lateFileTask) keepAlive(lateFileTask)
+        outcome = response.ok ? 'success' : 'error'
+        return new globalThis.Response(await response.text(), {
+          headers: response.headers,
+          status: response.status
+        })
       }
-      const lateFileTask = response.ok ? lateSlackFiles.repairFromWebhook(rawBody) : null
-      if (lateFileTask) keepAlive(lateFileTask)
-      outcome = response.ok ? 'success' : 'error'
-      return new globalThis.Response(await response.text(), {
-        headers: response.headers,
-        status: response.status
-      })
+      try {
+        // Acquire before the SDK marks the Slack message as deduplicated. A
+        // busy canonical handoff can then ask Slack to retry without losing
+        // the message or relying on an in-process retry surviving a rollout.
+        return canonicalId
+          ? await withUnifiedDmLock(state, canonicalId, dispatchWebhook, { waitMs: 750 })
+          : await dispatchWebhook()
+      } catch (error) {
+        if (!(error instanceof UnifiedDmLockError)) throw error
+        outcome = 'error'
+        const event = isJsonObject(interaction?.event) ? interaction.event : undefined
+        const messageId = stringValue(event?.ts)
+        if (error.ownershipLost && canonicalId && interaction?.type === 'event_callback' &&
+            messageId && /^\d+\.\d+$/.test(messageId)) {
+          // Chat SDK and Slack adapter 4.40.0 retain these exact message/event
+          // dedupe keys on callback failure. The callback has now exited;
+          // permit redelivery of only this verified message after lease loss.
+          // Session append/execute still use their stable idempotency keys.
+          await state.delete(`dedupe:slack:${messageId}`)
+          const eventId = stringValue(interaction.event_id)
+          if (eventId) await state.delete(`slack:event-delivered:${eventId}`)
+        }
+        return new globalThis.Response('The DM is busy. Please retry.', { status: 503 })
+      } finally {
+        if (canonicalLock) canonicalLock.active = false
+      }
     } catch (error) {
       outcome = 'error'
       throw error
@@ -694,18 +741,68 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   return { app, chat, drain: background.drain }
 }
 
+function retargetDirectMessage(message: ChatMessage, threadId: string): ChatMessage {
+  return new ChatSdkMessage({
+    attachments: message.attachments,
+    author: message.author,
+    formatted: message.formatted,
+    id: message.id,
+    isMention: true,
+    links: message.links,
+    metadata: message.metadata,
+    raw: message.raw,
+    text: message.text,
+    threadId
+  })
+}
+
+type SlackMessageHandoffInput = {
+  assistantStatusRequested: boolean
+  mode: SlackbotV2MessageMode
+  options: SlackbotV2Options
+  state: StateAdapter
+  steeringReactions: SteeringReactionController
+  subscribe?: boolean
+  trigger: string
+  retryAttempt?: number
+}
+
 async function handleSlackMessageHandoff(
   thread: Thread<SlackbotV2ThreadState>,
   message: ChatMessage,
-  input: {
-    assistantStatusRequested: boolean
-    mode: SlackbotV2MessageMode
-    options: SlackbotV2Options
-    state: StateAdapter
-    steeringReactions: SteeringReactionController
-    subscribe?: boolean
-    trigger: string
+  input: SlackMessageHandoffInput
+): Promise<void> {
+  const initialLock = requestContext.getStore()?.unifiedDmLock
+  if (initialLock?.active && initialLock.threadId === thread.id) {
+    return performSlackMessageHandoff(thread, message, input)
   }
+  try {
+    await withUnifiedDmLock(input.state, thread.id, () =>
+      performSlackMessageHandoff(thread, message, input)
+    )
+  } catch (error) {
+    if (!(error instanceof UnifiedDmLockError)) throw error
+    const attempt = input.retryAttempt ?? 0
+    const delays = input.options.handoffRetryDelaysMs ?? HANDOFF_RETRY_DELAYS_MS
+    if (attempt >= delays.length) {
+      await withSlackApiTimeout(input.options, 'post continuous DM busy notice', () =>
+        thread.post('I could not hand off this message. Please send it again.')
+      )
+      throw error
+    }
+    traceWarn(input.options, 'slackbotv2_unified_dm_handoff_retry',
+      createHandoffTrace(thread, message, input.mode), { attempt: attempt + 1 })
+    backgroundWaitUntil((async () => {
+      await sleep(delays[attempt] ?? 0)
+      await handleSlackMessageHandoff(thread, message, { ...input, retryAttempt: attempt + 1 })
+    })())
+  }
+}
+
+async function performSlackMessageHandoff(
+  thread: Thread<SlackbotV2ThreadState>,
+  message: ChatMessage,
+  input: SlackMessageHandoffInput
 ): Promise<void> {
   const trace = createHandoffTrace(thread, message, input.mode)
   traceLog(input.options, 'slackbotv2_handoff_started', trace, {
@@ -746,6 +843,7 @@ async function handleSlackMessageHandoff(
       initialAssistantStatusRequested: assistantStatusRequested,
       initialAssistantStatusVisible,
       mode: input.mode,
+      handoffLockHeld: true,
       options: input.options,
       state: input.state,
       steeringReactions: input.steeringReactions
@@ -795,10 +893,13 @@ async function interruptThreadExecution(
     // Record the stop before interrupting: an execution api-rs has not
     // started yet sees it in its handoff (see stopRequestedFor), and one it
     // has started is visible to the interrupt below.
+    await assertUnifiedDmLockOwned(thread.id)
     await thread.setState({ stopRequestedAt: Date.now() })
+    await assertUnifiedDmLockOwned(thread.id)
     const response = await interruptSessionExecution(options, thread.id, reason)
     // With nothing interrupted, a handoff may still own this state.
     if (response.interrupted) {
+      await assertUnifiedDmLockOwned(thread.id)
       await thread.setState({
         activeExecution: false,
         lastEventId: latest.lastEventId ?? latest.renderObligation?.afterEventId ?? 0,
@@ -1169,6 +1270,8 @@ async function ensureStateConnected(
 }
 
 type SyncThreadMessageInput = {
+  /** Set only for the currently held canonical handoff; retries reacquire. */
+  handoffLockHeld?: boolean
   initialAssistantStatus?: Promise<boolean>
   initialAssistantStatusRequested?: boolean
   initialAssistantStatusVisible?: boolean
@@ -1215,7 +1318,9 @@ function scheduleHandoffRetry(
   backgroundWaitUntil(
     (async () => {
       await sleep(delayMs)
-      await syncThreadMessageToSession(thread, message, { ...input, retryAttempt: attempt + 1 })
+      await syncThreadMessageToSession(thread, message, {
+        ...input, handoffLockHeld: false, retryAttempt: attempt + 1
+      })
     })().catch(async retryError => {
       traceWarn(input.options, 'slackbotv2_handoff_retry_failed', trace, {
         attempt: attempt + 1,
@@ -1255,6 +1360,18 @@ async function syncThreadMessageToSession(
   message: ChatMessage,
   input: SyncThreadMessageInput
 ): Promise<void> {
+  if (!input.handoffLockHeld && isConversationDmThread(thread.id)) {
+    try {
+      await withUnifiedDmLock(input.state, thread.id, () =>
+        syncThreadMessageToSession(thread, message, { ...input, handoffLockHeld: true })
+      )
+    } catch (error) {
+      if (!(error instanceof UnifiedDmLockError) ||
+          !scheduleHandoffRetry(thread, message, input, error,
+            createHandoffTrace(thread, message, input.mode))) throw error
+    }
+    return
+  }
   const traceStartedAtMs = nowMs()
   const state = (await thread.state) ?? {}
   const messageIds = new Set(state.forwardedMessageIds ?? [])
@@ -1552,6 +1669,7 @@ async function syncThreadMessageToSession(
         })
       }
     }
+    await assertUnifiedDmLockOwned(thread.id)
     forwardInput.contextPreamble = harnessRestartPreamble(history, serializedMessage.id)
     traceLog(input.options, 'slackbotv2_forward_restart_context_built', trace, {
       degraded: restartContextDegraded,
@@ -1567,6 +1685,7 @@ async function syncThreadMessageToSession(
     const steeringReactionAck = input.steeringReactionAck
     const holdSteeringReaction =
       steeringReactionAck !== undefined && latest.activeExecution === true
+    await assertUnifiedDmLockOwned(thread.id)
     await thread.setState({
       ...(stickyOverridesUpdate ?? {}),
       forwardedMessageIds: Array.from(latestMessageIds).slice(-1000),
@@ -1586,6 +1705,7 @@ async function syncThreadMessageToSession(
   const commitExecutionStarted = async (
     execution: SlackbotV2ExecuteSessionResponse
   ): Promise<void> => {
+    await assertUnifiedDmLockOwned(thread.id)
     const latest = (await thread.state) ?? {}
     const latestExecutedMessageIds = new Set(latest.executedMessageIds ?? [])
     latestExecutedMessageIds.add(serializedMessage.id)
@@ -1616,6 +1736,7 @@ async function syncThreadMessageToSession(
         error: errorMessage(error)
       })
     }
+    await assertUnifiedDmLockOwned(thread.id)
     await thread.setState({
       ...(stickyOverridesUpdate ?? {}),
       activeExecution: true,
@@ -1645,7 +1766,9 @@ async function syncThreadMessageToSession(
   if (!shouldStartExecution) {
     try {
       if (messagesToAppend.length > 0) {
+        await assertUnifiedDmLockOwned(thread.id)
         await forwardToSessionApi(input.options, forwardInput, {
+          onSessionCreated: () => assertUnifiedDmLockOwned(thread.id),
           onMessagesAppended: commitMessagesAppended
         })
       }
@@ -1680,16 +1803,24 @@ async function syncThreadMessageToSession(
   let responseContextBlock: SlackContextBlock | undefined
   let stoppedBeforeExecute = false
   try {
-    await thread.setState({ activeExecution: true })
-    traceLog(input.options, 'slackbotv2_forward_active_execution_marked', trace)
+    // Canonical handoffs already hold an exclusive lease. Mark them active
+    // only after execute returns, so losing a lease during create/append
+    // cannot strand an unstarted execution in active state on redelivery.
+    if (!isConversationDmThread(thread.id)) {
+      await thread.setState({ activeExecution: true })
+      traceLog(input.options, 'slackbotv2_forward_active_execution_marked', trace)
+    }
+    await assertUnifiedDmLockOwned(thread.id)
     await forwardToSessionApi(input.options, forwardInput, {
       shouldExecute: async () => {
+        await assertUnifiedDmLockOwned(thread.id)
         stoppedBeforeExecute = stopRequestedFor((await thread.state) ?? {}, message)
         return !stoppedBeforeExecute
       },
       onExecutionStarted: commitExecutionStarted,
       onMessagesAppended: commitMessagesAppended,
       onSessionCreated: async outcome => {
+        await assertUnifiedDmLockOwned(thread.id)
         const fallbackNotice = personaFallbackNotice(
           outcome.unavailableRequestedPersonaId,
           outcome.personaId
@@ -1762,6 +1893,7 @@ async function syncThreadMessageToSession(
       const latest = (await thread.state) ?? {}
       const latestExecutedMessageIds = new Set(latest.executedMessageIds ?? [])
       latestExecutedMessageIds.add(serializedMessage.id)
+      await assertUnifiedDmLockOwned(thread.id)
       await thread.setState({
         activeExecution: false,
         executedMessageIds: Array.from(latestExecutedMessageIds).slice(-1000)
@@ -1775,6 +1907,7 @@ async function syncThreadMessageToSession(
       thread,
       serializedMessage,
       input.options,
+      input.state,
       forwardInput,
       () => lastEventId,
       renderLease,
@@ -1792,7 +1925,9 @@ async function syncThreadMessageToSession(
     // The live render is not happening; let the recovery sweep claim the
     // obligation (if one was committed) as soon as it scans.
     await renderLease.release?.()
+    if (error instanceof UnifiedDmLockError && error.ownershipLost) throw error
     const latest = (await thread.state) ?? {}
+    await assertUnifiedDmLockOwned(thread.id)
     await thread.setState({
       activeExecution: false,
       lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId)
@@ -1862,6 +1997,7 @@ function scheduleExecutionRender(
   thread: Thread<SlackbotV2ThreadState>,
   message: SlackbotV2ApiMessage,
   options: SlackbotV2Options,
+  state: StateAdapter,
   input: ForwardSessionInput,
   getLastEventId: () => number,
   renderLease: { release: (() => Promise<void>) | null },
@@ -1879,6 +2015,7 @@ function scheduleExecutionRender(
           thread,
           message,
           options,
+          state,
           input,
           getLastEventId,
           assistantStatusVisible,
@@ -1924,6 +2061,7 @@ async function renderExecutionAttempt(
   thread: Thread<SlackbotV2ThreadState>,
   message: SlackbotV2ApiMessage,
   options: SlackbotV2Options,
+  state: StateAdapter,
   input: ForwardSessionInput,
   getLastEventId: () => number,
   assistantStatusVisible: boolean,
@@ -1939,7 +2077,7 @@ async function renderExecutionAttempt(
   try {
     const streamResult = await renderExecutionStream(
       thread,
-      clearRejectedStickyModel(thread, input, streamSessionAfterHandoff(options, input), options),
+      clearRejectedStickyModel(thread, input, streamSessionAfterHandoff(options, input), options, state),
       message,
       options,
       trace,
@@ -2065,13 +2203,12 @@ async function renderExecutionAttempt(
     }
     throw error
   } finally {
-    const latest = (await thread.state) ?? {}
-    await thread.setState({
+    const updated = await updateRenderState(thread, state, input.executionId, latest => ({
       activeExecution: retry,
       lastEventId: Math.max(latest.lastEventId ?? 0, getLastEventId(), fallbackLastEventId),
       ...(rendered ? { renderObligation: null } : {})
-    })
-    if (rendered) await steeringReactions.completeThread(thread.id, trace)
+    }))
+    if (rendered && updated) await steeringReactions.completeThread(thread.id, trace)
     traceLog(options, 'slackbotv2_render_finalized', trace, {
       obligation_cleared: rendered,
       render_duration_ms: elapsedMs(renderStartedAtMs),
@@ -2082,23 +2219,48 @@ async function renderExecutionAttempt(
   }
 }
 
+/** A stopped render may finish after a newer handoff has already started. */
+async function updateRenderState(
+  thread: Thread<SlackbotV2ThreadState>,
+  state: StateAdapter,
+  executionId: string | undefined,
+  update: (latest: SlackbotV2ThreadState) => Partial<SlackbotV2ThreadState>
+): Promise<boolean> {
+  // Finalization runs in the background while its render lease is renewed.
+  // A slow handoff must not strand activeExecution after the answer is shown.
+  // Recheck the execution owner once the handoff eventually releases its lock.
+  return withUnifiedDmLock(state, thread.id, async () => {
+    const latest = (await thread.state) ?? {}
+    if (isConversationDmThread(thread.id) &&
+        latest.renderObligation?.executionId !== executionId) return false
+    await assertUnifiedDmLockOwned(thread.id)
+    await thread.setState(update(latest))
+    return true
+  }, { waitMs: Infinity, pollMs: 100 })
+}
+
 async function* clearRejectedStickyModel(
   thread: Thread<SlackbotV2ThreadState>,
   input: ForwardSessionInput,
   stream: AsyncIterable<SlackbotV2RendererSource>,
-  options: SlackbotV2Options
+  options: SlackbotV2Options,
+  state: StateAdapter
 ): AsyncIterable<SlackbotV2RendererSource> {
   for await (const event of stream) {
     if (input.model && isRejectedModelEvent(event)) {
-      const latest = (await thread.state) ?? {}
-      // A newer turn may already have replaced the sticky model while this
-      // stream was finishing. Clear only the value rejected by this execution.
-      if (latest.model === input.model) {
-        await thread.setState({ model: null })
-        traceLog(options, 'slackbotv2_rejected_sticky_model_cleared', input.trace, {
-          model: input.model
-        })
-      }
+      await withUnifiedDmLock(state, thread.id, async () => {
+        const latest = (await thread.state) ?? {}
+        // A newer turn may already have replaced the sticky model while this
+        // stream was finishing. Clear only the value rejected by this execution.
+        if (latest.model === input.model && (!isConversationDmThread(thread.id) ||
+            latest.renderObligation?.executionId === input.executionId)) {
+          await assertUnifiedDmLockOwned(thread.id)
+          await thread.setState({ model: null })
+          traceLog(options, 'slackbotv2_rejected_sticky_model_cleared', input.trace, {
+            model: input.model
+          })
+        }
+      }, { waitMs: Infinity, pollMs: 100 })
     }
     yield event
   }
@@ -2356,11 +2518,11 @@ async function recoverRenderObligations(
           max_obligation_age_ms: maxObligationAgeMs,
           thread_id: threadId
         })
-        await thread.setState({
+        await updateRenderState(thread, state, obligation.executionId, latest => ({
           activeExecution: false,
-          lastEventId: threadState?.lastEventId ?? 0,
+          lastEventId: latest.lastEventId ?? 0,
           renderObligation: null
-        })
+        }))
         continue
       }
 
@@ -2381,11 +2543,11 @@ async function recoverRenderObligations(
           },
           'error'
         )
-        await thread.setState({
+        await updateRenderState(thread, state, obligation.executionId, latest => ({
           activeExecution: false,
-          lastEventId: threadState?.lastEventId ?? 0,
+          lastEventId: latest.lastEventId ?? 0,
           renderObligation: null
-        })
+        }))
         continue
       }
 
@@ -2553,11 +2715,11 @@ async function recoverRenderObligation(
       return true
     }
     await renderRecoveredExecutionStream(thread, streamError(error), obligation.message, options, trace)
-    await thread.setState({
+    await updateRenderState(thread, state, obligation.executionId, latest => ({
       activeExecution: false,
-      lastEventId,
+      lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId),
       renderObligation: null
-    })
+    }))
     renderOutcome = 'stream_error_rendered'
     recordRenderAttempt('recovery', renderOutcome, renderStartedAtMs)
     return false
@@ -2565,10 +2727,11 @@ async function recoverRenderObligation(
 
   let rendered = false
   try {
-    await thread.setState({
+    const current = await updateRenderState(thread, state, obligation.executionId, latest => ({
       activeExecution: true,
-      lastEventId
-    })
+      lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId)
+    }))
+    if (!current) return false
     const streamResult = await renderRecoveredExecutionStream(
       thread,
       streamOpenedSession(input, openedStream),
@@ -2662,12 +2825,11 @@ async function recoverRenderObligation(
       lastEventId = Math.max(lastEventId, fallback.lastEventId)
     }
   } finally {
-    const latest = (await thread.state) ?? {}
-    await thread.setState({
+    await updateRenderState(thread, state, obligation.executionId, latest => ({
       activeExecution: false,
       lastEventId: Math.max(latest.lastEventId ?? 0, lastEventId),
       ...(rendered ? { renderObligation: null } : {})
-    })
+    }))
     traceLog(options, 'slackbotv2_render_recovery_finalized', trace, {
       obligation_cleared: rendered,
       last_event_id: lastEventId

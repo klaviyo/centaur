@@ -1,0 +1,44 @@
+# Local interactive DM profile, layered after values.dev.yaml and e2e/infra/values.yaml.
+# The Slack fixture supplies these identities; no real Slack credentials are used.
+slackbotv2:
+  agentViewEnabled: true
+  unifiedDmEnabled: true
+  unifiedDmUsers: ["TE2E00001:UE2EUSER1"]
+  channelDefaults:
+    DE2EUSER1: { harness: codex }
+
+secrets:
+  bootstrapSecretName: centaur-local-iron-proxy-env
+
+apiRs:
+  sandboxWarmPoolSize: 0
+  workflowHostSandbox: false
+
+toolServer:
+  enabled: false
+repoCache:
+  enabled: false
+
+console:
+  publicUrl: http://127.0.0.1:30082
+  allowedHosts: [127.0.0.1, localhost]
+  extraEnv:
+    CENTAUR_LOCAL_PLAYGROUND: "1"
+    SLACK_API_URL: http://fake-slack.centaur-e2e-slack.svc.cluster.local:443/api/
+
+sandbox:
+  codexAuthMode: api_key
+  claudeCodeAuthMode: api_key
+  extraEnv:
+    TOOL_DIRS: /opt/centaur/tools
+    CODEX_CONFIG_OVERLAY: |
+      developer_instructions = """
+      Centaur local playground: installed Centaur tools are shell CLIs; discover them with centaur-tools list.
+      When the current request is a run of an existing scheduled or manual task, execute the assigned work directly in your current sandbox. Do not create, update, or run Console tasks from inside that task run, including rerunning the task that assigned your work.
+      Only from the main interactive DM, for user-requested jobs in separate sandbox instances, use centaur-console create-task NAME --prompt PROMPT (no --cron), then centaur-console run-task TASK_ID for each job. Check command help before use. Each task run executes in its own temporary Centaur sandbox, delivers its result to this fake Slack DM, and cleans up its sandbox afterward. Never claim native subagents are separate Centaur sandboxes.
+      The owner-scoped Console task commands authorize through the linked active Console user. sandbox_workflows_read_enabled and sandbox_workflows_write_enabled govern generic workflow APIs, not these task commands; false flags do not prohibit trying an authorized Console task command. Honor any task API 403 and never bypass it. Do not grant broader permissions or call generic workflow APIs as a workaround.
+      Create no recurring schedule unless the user requests one. Do not repeat a successful create or run; report task IDs and distinguish queued work from completed results. Persistent child chat and sandbox selection are not provided by this task mechanism.
+      """
+  resources:
+    requests: { cpu: "1", memory: 2Gi }
+    limits: { cpu: "4", memory: 8Gi }
