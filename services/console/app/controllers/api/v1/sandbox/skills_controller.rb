@@ -3,7 +3,7 @@ module Api
     module Sandbox
       class SkillsController < Api::SandboxBaseController
         MAX_LIMIT = 20
-        before_action :require_authoring_user!, only: %i[create update destroy share unshare add_editor remove_editor]
+        before_action :require_authoring_user!, only: %i[create update destroy share unshare add_editor remove_editor readers add_reader remove_reader]
 
         def index
           scope = visible_skills.order(updated_at: :desc, id: :asc).limit(limit)
@@ -86,6 +86,36 @@ module Api
           render json: { data: editor_management_payload(skill) }
         end
 
+        def readers
+          render json: { data: reader_management_payload(owned_skill) }
+        end
+
+        def add_reader
+          skill = owned_skill
+          reader = resolve_reader!
+          skill.with_lock do
+            assignment = skill.skill_readers.find_or_initialize_by(user: reader)
+            if assignment.new_record?
+              assignment.save!
+              skill.touch
+            end
+          end
+          render json: { data: reader_management_payload(skill) }
+        end
+
+        def remove_reader
+          skill = owned_skill
+          reader = resolve_reader!(removing: true)
+          skill.with_lock do
+            assignment = skill.skill_readers.find_by(user: reader)
+            if assignment
+              assignment.destroy!
+              skill.touch
+            end
+          end
+          render json: { data: reader_management_payload(skill) }
+        end
+
         private
 
         def require_authoring_user!
@@ -146,6 +176,23 @@ module Api
             name: editor.name,
             status: editor.status
           }
+        end
+
+        def reader_management_payload(skill)
+          {
+            id: skill.oid,
+            visibility: skill.visibility,
+            readers: skill.readers.order(:email).map { |reader| editor_payload(reader) },
+            lock_version: skill.lock_version
+          }
+        end
+
+        def resolve_reader!(removing: false)
+          reference = params.require(:data).require(:user).to_s.strip
+          scope = removing ? User.all : User.active
+          return scope.find_by_oid!(reference) if reference.start_with?("usr_")
+
+          scope.find_by!(email: reference.downcase)
         end
 
         def resolve_editor!(scope)
