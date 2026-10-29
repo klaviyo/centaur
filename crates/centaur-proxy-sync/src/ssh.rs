@@ -37,7 +37,10 @@ pub(crate) async fn authorize(
         .ok_or_else(ApiError::unauthorized)?;
     let principal_id = proxy.principal_id.ok_or_else(ApiError::unauthorized)?;
     // Channel/workflow requester attribution cannot select a personal SSH key.
-    if proxy.principal_field("kind").as_str() != Some("user") {
+    if !matches!(
+        proxy.principal_field("kind").as_str(),
+        Some("user" | "console_user" | "slack_dm")
+    ) {
         return Err(ApiError::unauthorized());
     }
     let path = state

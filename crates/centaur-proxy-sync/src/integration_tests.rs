@@ -1276,16 +1276,33 @@ async fn ssh_authorization_is_personal_and_revocable() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(bob_grant["principal"], centaur_console_db::oid("prn", bob));
     assert_eq!(bob_grant["private_key"]["value"], "test-only-bob-value");
-    // A channel principal cannot acquire Alice's SSH grant via requester attribution.
-    sqlx::query("UPDATE principals SET kind = 'channel' WHERE id = $1")
-        .bind(alice)
-        .execute(&f.pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        f.post(endpoint, Some(&alice_token), body.clone()).await.0,
-        StatusCode::UNAUTHORIZED
-    );
+    // Personal ingress kinds retain their own grant; shared contexts cannot use it.
+    for kind in ["user", "console_user", "slack_dm"] {
+        sqlx::query("UPDATE principals SET kind = $1 WHERE id = $2")
+            .bind(kind)
+            .bind(alice)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            f.post(endpoint, Some(&alice_token), body.clone()).await.0,
+            StatusCode::OK,
+            "personal kind {kind}"
+        );
+    }
+    for kind in ["slack_channel", "workflow", "unknown"] {
+        sqlx::query("UPDATE principals SET kind = $1 WHERE id = $2")
+            .bind(kind)
+            .bind(alice)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            f.post(endpoint, Some(&alice_token), body.clone()).await.0,
+            StatusCode::UNAUTHORIZED,
+            "shared kind {kind}"
+        );
+    }
     sqlx::query("UPDATE principals SET kind = 'user' WHERE id = $1")
         .bind(alice)
         .execute(&f.pool)
