@@ -12,10 +12,10 @@ class Console::SshConnectionsControllerTest < ActionDispatch::IntegrationTest
       raise "synthetic key generation failed" unless status.success?
       [ File.read(path), File.read("#{path}.pub").split.first(2).join(" ") ]
     end
-    @attributes = { name: "My SSH key", private_key: @private_key, duration_hours: 24 }
+    @attributes = { name: "My SSH key", private_key: @private_key }
   end
 
-  test "non-admin can enroll manage renew and disconnect only their own connection" do
+  test "non-admin can enroll manage and disconnect only their own connection" do
     get console_integrations_url
     assert_select "a[href=?]", edit_console_ssh_connection_path, text: "Connect"
     patch console_ssh_connection_url, params: { ssh_connection: @attributes.merge(user_id: users(:acme_admin).id) }
@@ -35,9 +35,12 @@ class Console::SshConnectionsControllerTest < ActionDispatch::IntegrationTest
     assert_select "input[name='ssh_connection[destination]']", count: 0
     assert_select "textarea[name='ssh_connection[host_key]']", count: 0
     assert_select "textarea[name='ssh_connection[private_key]']", text: ""
-    patch console_ssh_connection_url, params: { ssh_connection: { name: "Renewed", private_key: "", duration_hours: 168 } }
+    assert_select "select[name='ssh_connection[duration_hours]']", count: 0
+    record.update_columns(expires_at: 1.minute.ago)
+    patch console_ssh_connection_url, params: { ssh_connection: { name: "Updated", private_key: "", expires_at: 1.minute.ago } }
     assert_redirected_to console_ssh_connection_path
-    assert_in_delta 7.days.from_now.to_i, record.reload.expires_at.to_i, 5
+    assert_nil record.reload.expires_at
+    assert record.configured?
     delete console_ssh_connection_url
     assert_redirected_to console_integrations_path
     assert record.reload.revoked?

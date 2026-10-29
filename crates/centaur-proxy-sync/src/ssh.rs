@@ -139,15 +139,16 @@ async fn managed_grant(
     let Some(row) = row else {
         return Ok(None);
     };
-    let expiry: chrono::NaiveDateTime = row.get("expires_at");
-    let expires_at = expiry.and_utc();
+    let expires_at = row
+        .get::<Option<chrono::NaiveDateTime>, _>("expires_at")
+        .map(|expiry| expiry.and_utc());
     // A saved but expired/disconnected connection must not resurrect a file grant.
     if request.route != "ee"
         || row.get::<String, _>("owner_status") != "active"
         || row
             .get::<Option<chrono::NaiveDateTime>, _>("revoked_at")
             .is_some()
-        || expires_at <= Utc::now()
+        || expires_at.is_some_and(|expiry| expiry <= Utc::now())
     {
         return Err(ApiError::unauthorized());
     }
@@ -187,7 +188,7 @@ async fn managed_grant(
         host_key,
         tls_identity,
         private_key_file: String::new(),
-        expires_at,
+        expires_at: expires_at.unwrap_or_else(|| Utc::now() + chrono::Duration::seconds(30)),
     };
     validate_destination(&grant.destination)?;
     Ok(Some((grant, private_key)))

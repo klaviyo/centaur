@@ -3,9 +3,7 @@ require "uri"
 class SshConnection < ApplicationRecord
   belongs_to :user
   encrypts :private_key
-  attr_accessor :duration_hours
 
-  DURATIONS = [ 24, 168, 720 ].freeze
   normalizes :name, :destination, :username, :host_key, with: ->(value) { value.to_s.strip }
   before_validation :prepare_connection
   validates :user_id, uniqueness: true
@@ -13,12 +11,12 @@ class SshConnection < ApplicationRecord
   validates :username, format: { with: /\A[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,63}\z/ }, allow_nil: true
   validates :destination, length: { maximum: 2048 }
   validates :host_key, length: { maximum: 16.kilobytes }
-  validates :expires_at, :generation, presence: true
+  validates :generation, presence: true
   validate :valid_destination, if: -> { destination.present? }
   validate :valid_host_key, if: -> { host_key.present? }
   validate :valid_private_key, unless: :revoked?
 
-  def configured? = !revoked? && expires_at&.future?
+  def configured? = !revoked? && (expires_at.nil? || expires_at.future?)
   def revoked? = revoked_at.present?
 
   def revoke!
@@ -36,13 +34,6 @@ class SshConnection < ApplicationRecord
 
   def prepare_connection
     self.generation = SecureRandom.uuid if new_record? || changed?
-    return if duration_hours.nil?
-
-    if DURATIONS.map(&:to_s).include?(duration_hours.to_s)
-      self.expires_at = duration_hours.to_i.hours.from_now
-    else
-      errors.add(:duration_hours, "must be 24 hours, 7 days, or 30 days")
-    end
   end
 
   def valid_destination

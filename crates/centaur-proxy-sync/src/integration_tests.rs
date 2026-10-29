@@ -1569,6 +1569,21 @@ async fn managed_ssh_connections_follow_verified_ownership_and_revocation() {
         f.post(endpoint, Some(&slack_token), dynamic).await.0,
         StatusCode::OK
     );
+    sqlx::query("UPDATE ssh_connections SET expires_at = NULL WHERE id = $1")
+        .bind(connection)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    for token in [&console_token, &slack_token, &channel_token] {
+        let mut request = body.clone();
+        request["destination"] = json!("wss://one.dev.example.com/events/events");
+        let (status, grant) = f.post(endpoint, Some(token), request).await;
+        assert_eq!(status, StatusCode::OK);
+        let lease =
+            chrono::DateTime::parse_from_rfc3339(grant["expires_at"].as_str().unwrap()).unwrap();
+        assert!(lease > chrono::Utc::now());
+        assert!(lease <= chrono::Utc::now() + chrono::Duration::seconds(30));
+    }
     // Continue testing the retained fixed-target compatibility path.
     sqlx::query("UPDATE ssh_connections SET destination='wss://ee.example.com/events/events', username='dev', host_key='ssh-ed25519 fixture' WHERE id=$1")
         .bind(connection).execute(&f.pool).await.unwrap();
@@ -1631,7 +1646,7 @@ async fn managed_ssh_connections_follow_verified_ownership_and_revocation() {
     f.state.ssh_grants_path = Some(path);
     for sql in [
         "UPDATE ssh_connections SET expires_at = now() - interval '1 minute' WHERE id = $1",
-        "UPDATE ssh_connections SET expires_at = now() + interval '1 day', revoked_at = now(), private_key = NULL WHERE id = $1",
+        "UPDATE ssh_connections SET expires_at = NULL, revoked_at = now(), private_key = NULL WHERE id = $1",
     ] {
         sqlx::query(sql)
             .bind(connection)
