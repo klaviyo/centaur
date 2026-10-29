@@ -45,10 +45,17 @@ Only WSS on port 443 is allowed by this pilot's authorization endpoint. The
 Iron companion also supports explicitly configured direct TCP SSH in standalone
 mode. Neither path needs Kubernetes exec or a Kubernetes service-account token.
 
-The authorizer authenticates the proxy's existing private bearer token and
-uses its assigned principal. Only `kind=user` principals are accepted. Requester
-attribution does not select another user's key; shared-channel and workflow
-principals are refused. Downstream key verification happens in the paired proxy
+The authorizer authenticates the proxy's existing private bearer token. Personal
+`user`, `console_user`, and `slack_dm` sessions use their own grant. A
+`slack_channel` session uses only the Slack user's principal bound by the control
+plane for the current turn, derived from the verified ingress event. The thread
+author and channel grants do not confer SSH access. Missing requester identity,
+non-Slack requesters, and workflows are denied; the tool cannot supply a
+requester or select another user's key. Each authorization and lease renewal
+rereads the binding. Changing or clearing it revokes the previous user's lease,
+and the binding generation prevents a lease surviving a switch away and back.
+The same personal grant works in a DM and in that user's channel turns; no
+channel grant is needed. Downstream key verification happens in the paired proxy
 against the key api-rs supplied. A sandbox supplies only a route alias, never an
 upstream host or a credential reference.
 
