@@ -72,7 +72,8 @@ steps:
         command: |
           kbc docker-utils build-and-publish -f services/proxy-sync/Dockerfile -i klaviyo-centaur-proxy-sync -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
 
-      - label: "Publish slackbotv2 (AMD64)"
+      - &publish-slackbotv2
+        label: "Publish slackbotv2 (AMD64)"
         timeout_in_minutes: 120
         command: |
           kbc docker-utils build-and-publish -f services/slackbotv2/Dockerfile -i klaviyo-centaur-slackbotv2 -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
@@ -95,7 +96,8 @@ steps:
         command: |
           kbc docker-utils build-and-publish -f services/iron-proxy/Dockerfile -i klaviyo-centaur-iron-proxy -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
 
-      - label: "Publish console (AMD64)"
+      - &publish-console
+        label: "Publish console (AMD64)"
         timeout_in_minutes: 120
         command: |
           cd services/console
@@ -108,3 +110,5 @@ steps:
       - *publish-proxy-sync
       - *publish-agent
       - *publish-iron-proxy
+      - *publish-console
+      - *publish-slackbotv2
