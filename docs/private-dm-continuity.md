@@ -6,18 +6,19 @@ Make the private DM the stable conversation with Centaur. A future coordinator
 can delegate project work to several sessions and sandboxes while retaining one
 place for the user to talk, review progress, and resume deferred work.
 
-The first version implements conversation continuity. It routes selected
-Slack DM users to the existing conversation-wide session and posts replies at
-the top level. It adds no database migration, memory extraction, persistent
+The implementation provides conversation continuity and separately gated Git
+memory. It routes selected Slack DM users to the existing conversation-wide
+session and posts replies at the top level. An optional durable workflow extracts
+and verifies bounded memory for one configured DM. It adds no database migration, persistent
 project-session mapping, or automatic import of historical threads.
 
-| Capability | First version | Follow-on work |
+| Capability | Implemented | Follow-on work |
 | --- | --- | --- |
 | One continuing private DM | Opt-in canonical DM session | Product controls and recovery UX |
-| Existing conversation context | Existing session/harness history | Bounded memory injection |
+| Existing conversation context | Native harness history and optional bounded memory injection | Richer retrieval and reconciliation |
 | Multiple project sandboxes | Existing single session assignment | Owner-bound child sessions |
-| Current work, preferences, deferred actions, decisions | No automatic extraction | Versioned memory objects |
-| Revert experiment | Disable ingress configuration | Independently disable extraction/dispatch |
+| Current work, preferences, deferred actions, decisions | Evidence-backed records in a private Git repository | User-facing correction and forget controls |
+| Revert experiment | Independently disable ingress and memory configuration | Child dispatch and cancellation controls |
 
 ## Implemented configuration and behavior
 
@@ -130,74 +131,38 @@ results. A child failure must be visible without discarding successful siblings.
 Cancellation needs an explicit contract for the coordinator and its children;
 changing the opt-in flag must not silently kill already authorized project work.
 
-## Proposed memory objects, not implemented
+## Implemented opt-in memory
 
-Start with one versioned, bounded namespace in the coordinator's existing
-`sessions.metadata` JSONB. This avoids a schema migration during experimentation
-while leaving a later dedicated memory store possible. The current public
-`Session` response does not expose this metadata, so typed read/write operations
-and context assembly are required; this is not available by configuration alone.
+[Git-backed personal memory](../services/api-rs/rfcs/git-personal-memory.md)
+describes the configuration, data contract, recovery behavior, and limits.
+`apiRs.memory.enabled` defaults to false and is independent of DM routing.
+Enabling it requires an exact canonical DM, its existing principal, a private
+Git repository and branch, a model, and sandboxed workflow hosting.
 
-| Kind | Contents | Update policy |
-| --- | --- | --- |
-| Current work | Project, objective, present state, active child session | Refresh after completed work; expire stale state |
-| Work preferences | User-stated style and repeated supported preferences | Keep evidence and confidence; explicit corrections win |
-| Deferred next steps | Proposed action, project, reason deferred, status | Present when relevant; never treat as authorization |
-| Project decisions | Decision or constraint, scope, rationale, supersession | Preserve provenance and make replacement explicit |
+The repository's `memory/state.json` holds versioned current work, preferences,
+deferred steps, decisions, constraints, user facts, and lessons. Bounded evidence
+episodes preserve provenance; generated Markdown provides readable views.
+`sessions.metadata.centaur_memory` holds only a derived context cache. The API
+injects at most 12,000 UTF-8 bytes from that cache into the configured session's
+normal and steering inputs, framed as untrusted evidence. Native harness
+compaction remains responsible for the conversation window.
 
-Each item needs a stable ID, kind, project scope, bounded text, source session
-and message IDs, created/updated times, status, and revision. Distinguish explicit
-user statements from inferred patterns. Keep source text in its owner-protected
-session rather than copying whole transcripts into metadata. Initial limits
-could be 100 active items and 32 KiB total; enforce limits on write and select a
-smaller relevant subset for each prompt. These limits are proposed, not shipped.
+The scheduled `personal_memory` workflow reads bounded sources from the exact
+DM/principal, extracts proposals, independently verifies them, then applies
+revision-checked Git commits. Protected categories require direct user evidence.
+Exact source IDs and window hashes prevent duplicate application; conflicts
+leave evidence unprocessed for a fresh run. The workflow uses the principal's
+credential proxy and does not post maintenance messages to Slack. Its public
+run input/result contain status metadata, counts, and commit IDs rather than
+private excerpts; redacted evidence and proposals remain in durable checkpoints
+and the private repository.
 
-The envelope needs a format version, monotonically increasing revision, opt-in
-generation, per-source completion watermark, and bounded forget tombstones.
-Use a compare-and-swap update against the expected revision while preserving
-unrelated metadata keys. On conflict, reload and reconcile against newer edits.
-`create_or_get_session` does not update an existing row, and
-`create_or_get_session_merging_metadata` performs a shallow JSONB merge
-(`crates/centaur-session-sqlx/src/lib.rs`); neither provides this contract.
-
-Give the user explicit list, edit, forget, and clear-memory actions. User edits
-win over inferred proposals. Forgetting must prevent replay from recreating the
-same fact: retain provenance suppression or advance the relevant watermark and
-revoke older extraction generations. A clear operation is distinct from opting
-out; disabling the experiment should not delete history or memory.
-
-Inject selected memory during control-plane input assembly, alongside recent
-conversation, with clear provenance and freshness. The existing enrichment and
-`input_line_with_session_context` code in `crates/centaur-session-runtime/src/lib.rs`
-are integration points. Treat extracted text as fallible data, not instructions
-that override the current user, access policy, or project constraints. Do not
-duplicate the full memory snapshot into every durable user message.
-
-## Durable extraction and privacy prerequisites
-
-Run extraction after durable execution completion, asynchronously from the
-interactive reply. Add a durable completion trigger plus reconciliation that
-finds eligible completed work beyond the saved watermark. A process-local
-callback alone can miss work during restart. Key each extraction by owner,
-source session, terminal event watermark, and extraction version so replay is
-idempotent. Read only the completed bounded source range, then atomically publish
-the accepted patch and advance its watermark after a successful CAS.
-
-Extraction sessions must use the same verified owner as the source session.
-`ctx.agent_turn` accepts a principal and persists prompts/results in a session;
-resolve that principal in trusted code and reject model-supplied substitutions.
-Validate ownership at source read, child creation, memory read, and publication.
-Recheck opt-in generation immediately before publishing so a delayed job cannot
-write after an opt-out or overwrite a user's forget operation.
-
-Workflow privacy must be addressed before putting DM-derived content into this
-path. `crates/centaur-api-server/src/routes.rs` gates workflow run list/get by
-`WorkflowsRead` and returns full run input/result without owner filtering.
-Private transcripts, extracted memories, and project details must not be placed
-in those broadly readable fields. Use opaque owner-checked source/result
-references and status-only workflow envelopes, or add owner-scoped workflow
-authorization before enabling private extraction. Audit durable checkpoints,
-logs, errors, and Console views as well; opaque IDs alone do not enforce access.
+Disabling memory stops new maintenance and injection without deleting data; an
+already-running maintenance run can finish. Correct records with compensating
+edits or retractions that retain processed source IDs. A plain Git revert can
+remove checkpoints and cause evidence to be processed again. User-facing forget
+and clear-memory controls, broader reconciliation, and project dispatch remain
+follow-on work. Deferred steps never authorize execution or create schedules.
 
 ## Canary validation, rollout, and rollback
 
@@ -220,7 +185,13 @@ logs, errors, and Console views as well; opaque IDs alone do not enforce access.
    No database rollback or deletion is needed. Re-enabling reuses the canonical
    session; it does not create a clean context. Test disable/re-enable explicitly.
 
-Scope the next releases independently: owner-checked memory read/edit/forget,
-then durable extraction, then project dispatch. Each needs its own default-off
-gate and opt-out publication checks. The current change has performed no
-production deployment; rollout and its live verification remain separate work.
+For memory canaries, additionally verify the Git source checkpoint, bounded
+context in actual harness input, and a follow-up recall. Disable the memory flag
+and confirm new inputs omit the context and new workflow runs are no-ops. Memory
+can be disabled without changing DM routing; neither rollback needs a database
+migration.
+
+Scope future user-facing memory controls and persistent project dispatch
+independently, including explicit child cancellation behavior. The current
+change has performed no production deployment; rollout and its live verification
+remain separate work.

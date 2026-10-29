@@ -642,6 +642,18 @@ apiRs:
   workflowAllowedNames: ""
   # Requests/limits for the workflow-host sandbox pod (k8s resources map).
   workflowHostResources: {}
+  # Opt-in Git memory for one exact private DM and its existing principal.
+  # The repository is canonical; session metadata holds only a bounded cache.
+  # No memory is injected into workflow sessions or any other chat.
+  memory:
+    enabled: false
+    threadKey: ""
+    principal: ""
+    repository: ""
+    branch: main
+    intervalSeconds: 3600
+    # Required by the extraction workflow when enabled; no implicit model fallback.
+    model: ""
   # Scheduled ETL workflow configuration. The chart renders these into api-rs
   # env so workflow discovery sees the right schedules, then derives the
   # workflow-host passthrough list from the same non-secret config.

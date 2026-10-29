@@ -108,7 +108,19 @@
   (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_MODEL" "value" $companyContextEmbeddingsModel)
   (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS" "value" $companyContextEmbeddingsDimensions)
 -}}
-{{- $apiRsEtlPassthroughNames := list -}}
+{{- $memory := .Values.apiRs.memory | default dict -}}
+{{- $memoryEnv := list
+  (dict "name" "CENTAUR_MEMORY_ENABLED" "value" (dig "enabled" false $memory))
+  (dict "name" "CENTAUR_MEMORY_THREAD_KEY" "value" (dig "threadKey" "" $memory))
+  (dict "name" "CENTAUR_MEMORY_PRINCIPAL" "value" (dig "principal" "" $memory))
+  (dict "name" "CENTAUR_MEMORY_REPOSITORY" "value" (dig "repository" "" $memory))
+  (dict "name" "CENTAUR_MEMORY_BRANCH" "value" (dig "branch" "main" $memory))
+  (dict "name" "CENTAUR_MEMORY_INTERVAL_SECONDS" "value" (dig "intervalSeconds" 3600 $memory))
+  (dict "name" "CENTAUR_MEMORY_MODEL" "value" (dig "model" "" $memory))
+-}}
+{{- $apiRsEtlEnv = concat $apiRsEtlEnv $memoryEnv -}}
+{{- /* Memory workflows must distinguish a scoped sandbox host from in-process execution. */ -}}
+{{- $apiRsEtlPassthroughNames := list "WORKFLOW_HOST_SANDBOX" -}}
 {{- range $env := $apiRsEtlEnv -}}
 {{- $apiRsEtlPassthroughNames = append $apiRsEtlPassthroughNames $env.name -}}
 {{- end -}}
@@ -318,8 +330,8 @@ spec:
               value: {{ $env.value | toString | quote }}
 {{- end }}
 {{- end }}
-            # Forward the chart-rendered ETL workflow config into workflow-host
-            # sandboxes. Operators should set apiRs.etl.* values, not maintain
+            # Forward chart-rendered ETL and memory config into workflow-host
+            # sandboxes. Operators should set apiRs.etl.* / apiRs.memory.*, not maintain
             # SESSION_SANDBOX_PASSTHROUGH_ENV by hand.
             - name: SESSION_SANDBOX_PASSTHROUGH_ENV
               value: {{ join "," $apiRsEtlPassthroughNames | quote }}
