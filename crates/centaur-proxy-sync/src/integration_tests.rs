@@ -1297,5 +1297,4 @@ async fn ssh_authorization_is_personal_and_revocable() {
         StatusCode::UNAUTHORIZED
     );
     std::fs::remove_dir_all(root).unwrap();
-
 }
