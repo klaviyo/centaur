@@ -9,11 +9,11 @@
       <div class="flex items-center gap-3">
         <span class="flex size-10 shrink-0 items-center justify-center rounded-lg bg-ink-700 font-mono text-sm text-zinc-200" aria-hidden="true">&gt;_</span>
         <div>
-          <h2 class="font-mono text-sm font-semibold text-zinc-100">SSH environment</h2>
+          <h2 class="font-mono text-sm font-semibold text-zinc-100">SSH key</h2>
           <div class="text-[11px] uppercase tracking-wide text-zinc-500">Remote development</div>
         </div>
       </div>
-      <p class="text-xs text-zinc-500">Connect your development environment with a personal SSH key. Available in Console, DMs, and channel turns you initiate.</p>
+      <p class="text-xs text-zinc-500">Save one personal key for multiple allowed SSH destinations. Provide the environment URL in your request. Available in Console, DMs, and channel turns you initiate.</p>
       <div class="mt-auto flex items-center justify-between gap-3 pt-1">
         <%= link_to @ssh_connection&.configured? ? "Manage" : "Connect", @ssh_connection&.configured? ? console_ssh_connection_path : edit_console_ssh_connection_path, class: @ssh_connection&.configured? ? "btn-secondary" : "btn-primary" %>
         <% if @ssh_connection&.configured? %>

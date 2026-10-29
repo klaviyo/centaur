@@ -10,12 +10,12 @@ class SshConnection < ApplicationRecord
   before_validation :prepare_connection
   validates :user_id, uniqueness: true
   validates :name, presence: true, length: { maximum: 100 }
-  validates :username, format: { with: /\A[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,63}\z/ }
+  validates :username, format: { with: /\A[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,63}\z/ }, allow_nil: true
   validates :destination, length: { maximum: 2048 }
   validates :host_key, length: { maximum: 16.kilobytes }
   validates :expires_at, :generation, presence: true
-  validate :valid_destination
-  validate :valid_host_key
+  validate :valid_destination, if: -> { destination.present? }
+  validate :valid_host_key, if: -> { host_key.present? }
   validate :valid_private_key, unless: :revoked?
 
   def configured? = !revoked? && expires_at&.future?

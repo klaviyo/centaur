@@ -10,12 +10,13 @@ class Console::SshConnectionsController < ApplicationController
   end
 
   def update
-    attributes = params.require(:ssh_connection).permit(:name, :destination, :username, :host_key, :private_key, :duration_hours).to_h
+    attributes = params.require(:ssh_connection).permit(:name, :private_key, :duration_hours).to_h
     attributes.delete("private_key") if attributes["private_key"].blank?
     @connection.assign_attributes(attributes)
+    @connection.assign_attributes(destination: nil, username: nil, host_key: nil)
     @connection.revoked_at = nil
     if @connection.save
-      redirect_to console_ssh_connection_path, notice: "SSH connection saved. Register the public key in your environment."
+      redirect_to console_ssh_connection_path, notice: "SSH key saved. Register the public key in your environments."
     else
       render :edit, status: :unprocessable_entity
     end
@@ -23,12 +24,12 @@ class Console::SshConnectionsController < ApplicationController
 
   def destroy
     @connection.revoke! if @connection.persisted?
-    redirect_to console_integrations_path, notice: "SSH disconnected. Remove the public key from your environment if it is no longer needed."
+    redirect_to console_integrations_path, notice: "SSH disconnected. Remove the public key from your environments if it is no longer needed."
   end
 
   private
 
   def load_connection
-    @connection = current_user.ssh_connection || current_user.build_ssh_connection(name: "My development environment", username: "dev", duration_hours: 24)
+    @connection = current_user.ssh_connection || current_user.build_ssh_connection(name: "My SSH key", duration_hours: 24)
   end
 end

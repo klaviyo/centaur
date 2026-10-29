@@ -1,20 +1,18 @@
-<% content_for :title, "SSH environment · Centaur Console" %>
-<%= render "console/page_header", title: @connection.name, subtitle: "Your personal SSH environment" %>
+<% content_for :title, "SSH key · Centaur Console" %>
+<%= render "console/page_header", title: @connection.name, subtitle: "Your personal SSH key" %>
 <div class="max-w-3xl space-y-6">
   <section class="form-section">
-    <h2 class="form-section-heading">Connection details</h2>
-    <p class="form-hint mb-4">Available to your Console sessions. Slack DMs and channel turns use your verified linked Slack identity.</p>
+    <h2 class="form-section-heading">Key details</h2>
+    <p class="form-hint mb-4">Provide the destination URL when asking Centaur to connect. Available to your Console sessions. Slack DMs and channel turns use your verified linked Slack identity.</p>
     <dl class="space-y-4 text-sm">
       <div><dt class="form-label">Status</dt><dd><%= @connection.configured? ? "Configured" : @connection.revoked? ? "Disconnected" : "Expired" %></dd></div>
-      <div><dt class="form-label">SSH tunnel</dt><dd class="break-all font-mono text-zinc-300"><%= @connection.destination %></dd></div>
-      <div><dt class="form-label">Username</dt><dd><%= @connection.username %></dd></div>
       <div><dt class="form-label">Expires</dt><dd><%= @connection.expires_at.utc.strftime("%Y-%m-%d %H:%M UTC") %></dd></div>
       <div><dt class="form-label">Your key fingerprint</dt><dd class="break-all font-mono text-zinc-300"><%= @connection.key_fingerprint %></dd></div>
     </dl>
   </section>
   <section class="form-section">
-    <h2 class="form-section-heading">Register your public key</h2>
-    <p class="form-hint mb-4">Add this public key to your environment's SSH access settings. Saving a connection does not register it automatically.</p>
+    <h2 class="form-section-heading">Register your public key in your environments</h2>
+    <p class="form-hint mb-4">Add this public key to each environment's SSH access settings. You can reuse this key for any URL allowed by your administrator. Saving does not register it automatically.</p>
     <label class="form-label" for="ssh-public-key">Public key</label>
     <textarea id="ssh-public-key" class="form-input font-mono" rows="4" readonly spellcheck="false"><%= @connection.public_key %></textarea>
     <p class="form-hint">Your private key is stored encrypted and cannot be viewed or downloaded.</p>

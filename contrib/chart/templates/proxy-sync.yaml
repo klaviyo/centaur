@@ -106,6 +106,8 @@ spec:
 {{- end }}
             - name: RUST_LOG
               value: info
+            - name: CENTAUR_EE_SSH_TARGETS
+              value: {{ .Values.proxySync.sshTargets | toJson | quote }}
 {{- range $name, $value := .Values.proxySync.extraEnv }}
             - name: {{ $name }}
               value: {{ $value | toString | quote }}

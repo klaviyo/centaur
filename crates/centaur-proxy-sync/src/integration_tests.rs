@@ -71,6 +71,7 @@ impl Fixture {
         let unique = format!("{:032x}", rand_suffix());
         let state = AppState {
             ssh_grants_path: None,
+            ssh_targets: vec![],
             pool: pool.clone(),
             encryption: Arc::new(ActiveRecordEncryption::new(PRIMARY_KEY, SALT)),
             jwt_secret: enabled.then(|| JWT_SECRET.to_owned()),
@@ -1518,6 +1519,59 @@ async fn managed_ssh_connections_follow_verified_ownership_and_revocation() {
         f.post(endpoint, Some(&other_token), body.clone()).await.0,
         StatusCode::UNAUTHORIZED
     );
+    // One stored key can be used for several explicitly allowed targets.
+    f.state.ssh_targets = crate::ssh::target_policies(Some(
+        r#"[{"host":"*.dev.example.com","path":"/events/events","username":"dev"}]"#,
+    ))
+    .unwrap();
+    for target in [
+        "wss://one.dev.example.com/events/events",
+        "wss://two.dev.example.com/events/events",
+    ] {
+        let mut request = body.clone();
+        request["destination"] = json!(target);
+        let (status, grant) = f.post(endpoint, Some(&slack_token), request.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(grant["destination"], target);
+        assert_eq!(grant["tls_identity"], true);
+        assert_eq!(grant["host_key"], "");
+        assert_eq!(
+            f.post(endpoint, Some(&other_token), request).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    for target in [
+        "wss://evil.example.com/events/events",
+        "wss://one.dev.example.com/other",
+    ] {
+        let mut request = body.clone();
+        request["destination"] = json!(target);
+        assert_eq!(
+            f.post(endpoint, Some(&slack_token), request).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    sqlx::query(
+        "UPDATE ssh_connections SET destination=NULL, username=NULL, host_key=NULL WHERE id=$1",
+    )
+    .bind(connection)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        f.post(endpoint, Some(&slack_token), body.clone()).await.0,
+        StatusCode::UNAUTHORIZED,
+        "key-only records require a target"
+    );
+    let mut dynamic = body.clone();
+    dynamic["destination"] = json!("wss://one.dev.example.com/events/events");
+    assert_eq!(
+        f.post(endpoint, Some(&slack_token), dynamic).await.0,
+        StatusCode::OK
+    );
+    // Continue testing the retained fixed-target compatibility path.
+    sqlx::query("UPDATE ssh_connections SET destination='wss://ee.example.com/events/events', username='dev', host_key='ssh-ed25519 fixture' WHERE id=$1")
+        .bind(connection).execute(&f.pool).await.unwrap();
     let mut wrong_route = body.clone();
     wrong_route["route"] = json!("other");
     assert_eq!(

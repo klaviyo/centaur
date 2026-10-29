@@ -14,9 +14,8 @@ class SshConnectionTest < ActiveSupport::TestCase
   end
 
   def connection
-    private_key, public_key = self.class.synthetic_key
-    users(:member_user).build_ssh_connection(name: "My EE", destination: "wss://ee.example.com/events/events", username: "dev",
-      host_key: public_key, private_key: private_key, duration_hours: 24)
+    private_key, = self.class.synthetic_key
+    users(:member_user).build_ssh_connection(name: "My SSH key", private_key: private_key, duration_hours: 24)
   end
 
   test "validates and encrypts a personal key and derives its public key" do

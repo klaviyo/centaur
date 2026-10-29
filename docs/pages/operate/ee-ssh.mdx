@@ -7,21 +7,21 @@ description: Headless remote development through the paired Iron SSH companion.
 
 ## Personal setup in Console
 
-Open **Integrations → SSH environment → Connect**. Enter the full WSS SSH
-tunnel URL, SSH username, a dedicated private key without a passphrase, and the
-server's verified public host key. Choose an access period (24 hours, 7 days,
-or 30 days), then save. The next screen shows the public key to register with
-your environment. Saving does not perform registration or claim a successful
+Open **Integrations → SSH key → Connect**. Enter a name and a dedicated private
+key without a passphrase. Choose an access period (24 hours, 7 days, or 30 days),
+then save. The next screen shows the public key to register with each environment.
+Supply the full WSS SSH tunnel URL on each `ee` command; the same key works with
+all destinations allowed by the deployment. Saving does not perform registration or claim a successful
 connection test.
 
 Private keys are write-only and encrypted with Console's existing Active Record
 encryption settings. Proxy-sync decrypts them only for the paired Iron SSH
 companion. The sandbox never receives the upstream private key. **Edit or
-renew** changes the target/key or starts a new access period; leaving the key
+renew** changes the key or starts a new access period; leaving the key
 blank preserves it. **Disconnect** removes the stored private key and revokes
 new connections and active leases on their next authorization check.
 
-Each user has one active SSH environment, available through the `ee` tool.
+Each user has one active SSH key, available through the `ee` tool.
 Console sessions match the authenticated Console account. Slack DMs and channel
 turns match the owner's verified Slack SSO subject and workspace, never email
 or editable principal labels. Link that Slack identity to the Console account
@@ -51,6 +51,41 @@ changing it requires replacing retained sandboxes and their proxies. The seed
 is never sent to sandbox or proxy pods. Proxy repair preserves identities via
 the same seed and sandbox ID.
 
+Configure allowed destinations through `proxySync.sshTargets` in the deployment:
+
+```yaml
+proxySync:
+  sshTargets:
+    - host: "*.dev.example.com"
+      path: /events/events
+      username: dev
+```
+
+Hosts are exact names or leftmost `*.` suffix patterns (the bare suffix does
+not match); paths are exact. A request must match exactly one policy. The
+default empty policy denies all dynamic targets. Proxy-sync reads this as
+`CENTAUR_EE_SSH_TARGETS`, a JSON array; malformed policies fail startup.
+
+Only WSS on port 443 is permitted, without URL credentials, query, or fragment.
+Iron verifies the gateway's TLS certificate and hostname without redirects.
+This authenticates the gateway, which is trusted to route SSH to the selected
+container; it does not separately pin that container's SSH host key. URL policy
+and TLS verification are checked for every connection, and authorization policy
+is reevaluated on lease renewal.
+
+For example:
+
+```bash
+ee exec --url wss://chat.dev.example.com/events/events -- pwd
+ee read --url wss://chat.dev.example.com/events/events path/to/file
+ee write --url wss://other.dev.example.com/events/events path/to/file < local-file
+```
+
+### Legacy fixed-target provisioning
+
+Existing fixed-target UI records remain usable by older clients until their
+owner saves the key-only form. New saved keys require a target on each call.
+An optional operator grants file retains per-target SSH host-key pinning.
 Mount an operator-controlled JSON grants file and private-key files in
 proxy-sync only using `proxySync.extraVolumes` and `extraVolumeMounts`. Set `CENTAUR_EE_SSH_GRANTS_FILE` to that JSON file through `proxySync.extraEnv`. Example:
 
@@ -86,8 +121,9 @@ rereads the binding. Changing or clearing it revokes the previous user's lease,
 and the binding generation prevents a lease surviving a switch away and back.
 The same personal grant works in a DM and in that user's channel turns; no
 channel grant is needed. Downstream key verification happens in the paired proxy
-against the key api-rs supplied. A sandbox supplies only a route alias, never an
-upstream host or a credential reference.
+against the key api-rs supplied. A sandbox supplies its route and requested WSS URL, never a credential reference.
+Proxy-sync decides whether the current user may use that target and returns the
+credential only to the paired Iron companion.
 
 Grants are reread on every authorization and renewed at five-second intervals
 with a maximum 30-second lease. Removing a grant, changing its key/destination,
