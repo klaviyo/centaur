@@ -1,6 +1,7 @@
 env:
   AWS_ECR_LOGIN_REGISTRY_IDS: "340433579684,439508887365"
   DOCKER_BUILDKIT: "1"
+  IRON_PROXY_IMAGE: "340433579684.dkr.ecr.us-east-1.amazonaws.com/klaviyo-iron-proxy:672d834196bd31c7ba04a2a4429d3a919a9e02b9@sha256:29acd0aa78a1c86ab935f92cde35aa4499b3365af1a344f7cbf733aac45677d1"
 
 # centaur-dev uses x86 nodes.
 agents:
@@ -8,7 +9,7 @@ agents:
 
 steps:
   - group: "Build images"
-    if: build.branch != "klaviyo-main" || build.pull_request.id != null
+    if: (build.branch != "klaviyo-main" || build.pull_request.id != null) && !(build.branch == "feat/ee-ssh-access" && (build.pull_request.id == null || build.pull_request.id == "32"))
     steps:
       - label: "Build api-rs (AMD64)"
         timeout_in_minutes: 120
@@ -44,7 +45,7 @@ steps:
       - label: "Build iron-proxy (AMD64)"
         timeout_in_minutes: 120
         command: |
-          docker build --platform linux/amd64 --build-arg RUST_BUILD_PROFILE=release -f services/iron-proxy/Dockerfile -t 340433579684.dkr.ecr.us-east-1.amazonaws.com/klaviyo-centaur-iron-proxy:${BUILDKITE_COMMIT} .
+          docker build --platform linux/amd64 --build-arg RUST_BUILD_PROFILE=release -f services/iron-proxy/Dockerfile --build-arg IRON_PROXY_IMAGE=${IRON_PROXY_IMAGE} -t 340433579684.dkr.ecr.us-east-1.amazonaws.com/klaviyo-centaur-iron-proxy:${BUILDKITE_COMMIT} .
 
       - label: "Build console (AMD64)"
         timeout_in_minutes: 120
@@ -55,7 +56,8 @@ steps:
   - group: "Publish images to eng and dev ECR"
     if: build.branch == "klaviyo-main" && build.pull_request.id == null
     steps:
-      - label: "Publish api-rs (AMD64)"
+      - &publish-api-rs
+        label: "Publish api-rs (AMD64)"
         timeout_in_minutes: 120
         command: |
           kbc docker-utils build-and-publish -f services/api-rs/Dockerfile -i klaviyo-centaur-api-rs -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
@@ -65,12 +67,14 @@ steps:
         command: |
           kbc docker-utils build-and-publish -f services/company-context/Dockerfile -i klaviyo-centaur-company-context -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
 
-      - label: "Publish proxy-sync (AMD64)"
+      - &publish-proxy-sync
+        label: "Publish proxy-sync (AMD64)"
         timeout_in_minutes: 120
         command: |
           kbc docker-utils build-and-publish -f services/proxy-sync/Dockerfile -i klaviyo-centaur-proxy-sync -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
 
-      - label: "Publish slackbotv2 (AMD64)"
+      - &publish-slackbotv2
+        label: "Publish slackbotv2 (AMD64)"
         timeout_in_minutes: 120
         command: |
           kbc docker-utils build-and-publish -f services/slackbotv2/Dockerfile -i klaviyo-centaur-slackbotv2 -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
@@ -80,19 +84,32 @@ steps:
         command: |
           kbc docker-utils build-and-publish -f services/githubbot/Dockerfile -i klaviyo-centaur-githubbot -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
 
-      - label: "Publish agent (AMD64)"
+      - &publish-agent
+        label: "Publish agent (AMD64)"
         timeout_in_minutes: 120
         command: |
           set -euo pipefail
           kbc docker-utils build-and-publish -f services/sandbox/Dockerfile --target sandbox -i klaviyo-centaur-agent -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
 
-      - label: "Publish iron-proxy (AMD64)"
+      - &publish-iron-proxy
+        label: "Publish iron-proxy (AMD64)"
         timeout_in_minutes: 120
         command: |
-          kbc docker-utils build-and-publish -f services/iron-proxy/Dockerfile -i klaviyo-centaur-iron-proxy -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
+          kbc docker-utils build-and-publish -f services/iron-proxy/Dockerfile -b IRON_PROXY_IMAGE=${IRON_PROXY_IMAGE} -i klaviyo-centaur-iron-proxy -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
 
-      - label: "Publish console (AMD64)"
+      - &publish-console
+        label: "Publish console (AMD64)"
         timeout_in_minutes: 120
         command: |
           cd services/console
           kbc docker-utils build-and-publish -f Dockerfile -i klaviyo-centaur-console -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
+
+  - group: "Publish SSH pilot images"
+    if: build.branch == "feat/ee-ssh-access" && (build.pull_request.id == null || build.pull_request.id == "32")
+    steps:
+      - *publish-api-rs
+      - *publish-proxy-sync
+      - *publish-agent
+      - *publish-iron-proxy
+      - *publish-console
+      - *publish-slackbotv2
