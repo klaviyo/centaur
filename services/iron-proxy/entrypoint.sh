@@ -14,6 +14,11 @@ log_json() {
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$3"
 }
 
+# Request the integrated listener explicitly so older Iron images fail closed.
+if [ -n "${IRON_SSH_CONFIG_JSON:-}" ]; then
+    set -- --ssh "$@"
+fi
+
 mkdir -p "$CONFIG_DIR" "$CERT_SHARE"
 
 # ── Load required CA from the pre-created Kubernetes Secret volume ─────────
@@ -36,7 +41,7 @@ log_json "info" "ca_shared" "CA cert shared at /certs/ca-cert.pem"
 # -config. A local config file would conflict (e.g. management.listen). ────
 if [ -n "${IRON_CONTROL_PLANE_URL:-}" ]; then
     log_json "info" "managed_mode" "IRON_CONTROL_PLANE_URL set; running without a local config"
-    exec iron-proxy
+    exec iron-proxy "$@"
 fi
 
 # ── Unmanaged mode: seed the local config from the baked default and pass it
@@ -46,4 +51,4 @@ if (set -C; cat "$DEFAULT_CONFIG" > "$CONFIG_FILE") 2>/dev/null; then
     log_json "info" "config_seeded" "seeded $CONFIG_FILE from default"
 fi
 
-exec iron-proxy -config "$CONFIG_FILE"
+exec iron-proxy "$@" -config "$CONFIG_FILE"
