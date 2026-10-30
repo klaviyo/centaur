@@ -784,6 +784,30 @@ describe('CodexAppServerRendererEventMapper', () => {
       }
     ])
   })
+
+  it.each(['interrupted', 'cancelled', 'canceled'])('renders raw Codex terminal status %s before the session cancellation envelope', async status => {
+    const chunks = await collect(
+      codexAppServerToChatSdkStream(
+        toAsyncIterable([
+          {
+            eventKind: 'session.output.line',
+            data: JSON.stringify({
+              method: 'turn/completed',
+              params: { threadId: 'thread-1', turn: { id: 'turn-1', items: [], status, error: null } }
+            })
+          },
+          {
+            eventKind: 'session.execution_cancelled',
+            data: { error: 'Execution interrupted' }
+          }
+        ])
+      )
+    )
+
+    expect(chunks.filter(chunk => chunk.type === 'markdown_text')).toEqual([
+      { type: 'markdown_text', text: 'Execution interrupted' }
+    ])
+  })
 })
 
 async function collect<T>(source: AsyncIterable<T>): Promise<T[]> {

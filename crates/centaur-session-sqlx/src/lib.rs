@@ -266,6 +266,31 @@ impl PgSessionStore {
         Ok(session)
     }
 
+    /// Read a bounded, untrusted derived memory cache for one exact owner.
+    /// The 100 KB JSON limit permits escaped 12 KB context plus binding fields,
+    /// while preventing oversized metadata from crossing the database boundary.
+    pub async fn get_memory_cache(
+        &self,
+        thread_key: &ThreadKey,
+        principal: &str,
+    ) -> Result<Option<Value>, SessionStoreError> {
+        Ok(sqlx::query_scalar::<_, Value>(
+            r#"
+            select metadata->'centaur_memory'
+            from sessions
+            where thread_key = $1 and iron_control_principal = $2
+              and jsonb_typeof(metadata->'centaur_memory') = 'object'
+              and octet_length((metadata->'centaur_memory')::text) <= 100000
+              and jsonb_typeof(metadata->'centaur_memory'->'context') = 'string'
+              and octet_length(metadata->'centaur_memory'->>'context') <= 12000
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(principal)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     pub async fn get_session(&self, thread_key: &ThreadKey) -> Result<Session, SessionStoreError> {
         let row = sqlx::query_as::<_, SessionRow>(
             r#"
@@ -2165,6 +2190,74 @@ mod tests {
             .await
             .expect("run migrations");
         Some(store)
+    }
+
+    #[tokio::test]
+    async fn memory_cache_read_is_owner_scoped_and_bounded() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key = ThreadKey::parse(format!("test:memory-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+        store
+            .set_iron_control_principal(&thread_key, Some("prn_memory"))
+            .await
+            .unwrap();
+        let cache = json!({"context": "project notes"});
+        for (cache, readable) in [
+            (cache, true),
+            (json!({"context": "x".repeat(12_000)}), true),
+            (json!({"context": "x".repeat(12_001)}), false),
+            (json!({"context": "é".repeat(6_001)}), false),
+            (
+                json!({"context": "notes", "extra": "x".repeat(100_000)}),
+                false,
+            ),
+            (json!({"context": {"text": "wrong shape"}}), false),
+            (json!([]), false),
+            (serde_json::Value::Null, false),
+        ] {
+            sqlx::query("update sessions set metadata = $2 where thread_key = $1")
+                .bind(thread_key.as_str())
+                .bind(json!({"centaur_memory": cache}))
+                .execute(store.pool())
+                .await
+                .unwrap();
+            let actual = store
+                .get_memory_cache(&thread_key, "prn_memory")
+                .await
+                .unwrap();
+            assert_eq!(actual, readable.then_some(cache));
+            assert!(
+                store
+                    .get_memory_cache(&thread_key, "prn_other")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let other = ThreadKey::parse("test:other-memory-thread").unwrap();
+            assert!(
+                store
+                    .get_memory_cache(&other, "prn_memory")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        sqlx::query("delete from sessions where thread_key = $1")
+            .bind(thread_key.as_str())
+            .execute(store.pool())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

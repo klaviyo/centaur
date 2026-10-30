@@ -642,6 +642,22 @@ apiRs:
   workflowAllowedNames: ""
   # Requests/limits for the workflow-host sandbox pod (k8s resources map).
   workflowHostResources: {}
+  # Opt-in Git memory for one exact private DM and its existing principal.
+  # The repository is canonical; session metadata holds only a bounded cache.
+  # No memory is injected into workflow sessions or any other chat.
+  memory:
+    enabled: false
+    threadKey: ""
+    principal: ""
+    repository: ""
+    branch: main
+    intervalSeconds: 3600
+    # Daily reflection also requires memory.enabled. Both loops skip model work
+    # when their independent source checkpoints have no new events.
+    reflectionEnabled: true
+    reflectionIntervalSeconds: 86400
+    # Required by the memory workflows when enabled; no implicit model fallback.
+    model: ""
   # Scheduled ETL workflow configuration. The chart renders these into api-rs
   # env so workflow discovery sees the right schedules, then derives the
   # workflow-host passthrough list from the same non-secret config.
@@ -777,6 +793,12 @@ slackbotv2:
   # Match Slack's features.agent_view manifest setting. Changing Slack's
   # manifest is irreversible; this switch only controls the service behavior.
   agentViewEnabled: false
+  # Experimental continuous, top-level chat for explicitly selected private DMs.
+  # Both the switch and a team:user entry are required; channels and group DMs
+  # keep their existing behavior. Disable to restore ordinary DM routing without
+  # deleting sessions or changing the database schema.
+  unifiedDmEnabled: false
+  unifiedDmUsers: [] # e.g. ["TEXAMPLE:UEXAMPLE"]
   # React to mentioned follow-ups while an execution is active, then remove
   # their reactions after the assistant response is posted. Requires the Slack
   # app to grant reactions:write. Slackbot disables the feature for the running

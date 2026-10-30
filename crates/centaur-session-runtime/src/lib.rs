@@ -1,4 +1,5 @@
 mod cleanup;
+mod memory;
 mod retention;
 mod title_generator;
 
@@ -171,6 +172,7 @@ pub struct SessionRuntime {
     execution_spans: ExecutionSpanRegistry,
     iron_control: Arc<dyn SessionPrincipalRegistrar>,
     session_principal_admission: SessionPrincipalAdmission,
+    memory_config: Option<memory::MemoryConfig>,
     warm_pool: Option<Arc<WarmPoolManager>>,
     personas: Option<Arc<PersonaRegistry>>,
     session_title_generator: Option<SessionTitleGenerator>,
@@ -787,6 +789,7 @@ impl SessionRuntime {
             execution_spans: Arc::new(Mutex::new(HashMap::new())),
             iron_control: Arc::new(iron_control),
             session_principal_admission: SessionPrincipalAdmission::default(),
+            memory_config: memory::MemoryConfig::from_env(),
             warm_pool: None,
             personas: None,
             session_title_generator: None,
@@ -2392,6 +2395,7 @@ impl SessionRuntime {
                 traceparent.or_else(|| execution_traceparent(&execution).map(ToOwned::to_owned)),
                 Some(&execution.execution_id),
             );
+            let input_lines = self.input_lines_with_memory(&session, &input_lines).await;
             let input_lines = input_lines_with_session_context(thread_key, &trace, &input_lines);
             if let Err(error) = write_input_lines(
                 &pipe,
@@ -2655,6 +2659,39 @@ impl SessionRuntime {
             .await;
     }
 
+    async fn input_lines_with_memory(
+        &self,
+        session: &Session,
+        input_lines: &[String],
+    ) -> Vec<String> {
+        let Some(config) = self
+            .memory_config
+            .as_ref()
+            .filter(|config| config.matches_session(session))
+        else {
+            return input_lines.to_vec();
+        };
+        match self
+            .store
+            .get_memory_cache(&session.thread_key, config.principal())
+            .await
+        {
+            Ok(Some(cache)) => match memory::memory_context(session, config, &cache) {
+                Some(context) => memory::prepend_memory_context(input_lines, &context),
+                None => input_lines.to_vec(),
+            },
+            Ok(None) => input_lines.to_vec(),
+            Err(error) => {
+                warn!(
+                    thread_key = %session.thread_key,
+                    %error,
+                    "memory cache lookup failed; continuing without memory"
+                );
+                input_lines.to_vec()
+            }
+        }
+    }
+
     async fn forward_messages_to_active_execution(
         &self,
         thread_key: &ThreadKey,
@@ -2679,10 +2716,13 @@ impl SessionRuntime {
         // A steer that lands after the turn ends starts a new turn, which must
         // run the pinned model too.
         let input_lines = match self.store.get_session(thread_key).await {
-            Ok(session) => match self.persona_model(&session) {
-                Some(model) => input_lines_with_persona_model(input_lines, model),
-                None => input_lines,
-            },
+            Ok(session) => {
+                let input_lines = self.input_lines_with_memory(&session, &input_lines).await;
+                match self.persona_model(&session) {
+                    Some(model) => input_lines_with_persona_model(input_lines, model),
+                    None => input_lines,
+                }
+            }
             Err(error) => {
                 warn!(%thread_key, %error, "session lookup failed during steering");
                 input_lines

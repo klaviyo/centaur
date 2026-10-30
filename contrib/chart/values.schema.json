@@ -412,6 +412,20 @@
         "sandboxOrphanSweepGraceSecs": { "type": "integer", "minimum": 1 },
         "workflowHostSandbox": { "type": "boolean" },
         "workflowHostResources": { "type": "object" },
+        "memory": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "threadKey": { "type": "string" },
+            "principal": { "type": "string" },
+            "repository": { "type": "string" },
+            "branch": { "type": "string" },
+            "intervalSeconds": { "type": "integer", "minimum": 1 },
+            "reflectionEnabled": { "type": "boolean" },
+            "reflectionIntervalSeconds": { "type": "integer", "minimum": 1 },
+            "model": { "type": "string" }
+          }
+        },
         "etl": {
           "type": "object",
           "properties": {
@@ -519,6 +533,12 @@
       "type": "object",
       "properties": {
         "agentViewEnabled": { "type": "boolean" },
+        "unifiedDmEnabled": { "type": "boolean" },
+        "unifiedDmUsers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^T[A-Z0-9]+:[UW][A-Z0-9]+$" }
+        },
         "mcpPublicUrl": { "type": "string" },
         "responseMetadataMode": {
           "type": "string",

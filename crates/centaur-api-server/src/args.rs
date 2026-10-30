@@ -1480,6 +1480,20 @@ impl SandboxArgs {
             }
         }
 
+        // Workflow hosts use the same sandbox image and tool bootstrap as chat
+        // sessions. Its explicit environment must override API-local discovery
+        // paths such as /app/tools when tools are baked into the sandbox image.
+        for (name, value) in self.sandbox_extra_env() {
+            if let Some((_, existing_value)) = envs
+                .iter_mut()
+                .find(|(existing_name, _)| existing_name == &name)
+            {
+                *existing_value = value;
+            } else {
+                envs.push((name, value));
+            }
+        }
+
         Ok(envs)
     }
 
@@ -3106,6 +3120,37 @@ mod tests {
                 && mount.read_only
                 && mount.kind == MountKind::NamedVolume("centaur-repo-cache".to_owned())
         }));
+    }
+
+    #[test]
+    fn workflow_host_env_template_honors_sandbox_tool_overrides() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--tool-dirs",
+            "/app/tools",
+            "--tools-path",
+            "/api-only/tools",
+            "--session-sandbox-extra-env",
+            r#"[{"name":"TOOL_DIRS","value":"/opt/centaur/tools"},{"name":"TOOLS_PATH","value":"/sandbox/overlay/tools"},{"name":"CENTAUR_SANDBOX_REPO_CACHE_ENABLED","value":"false"}]"#,
+        ])
+        .unwrap();
+
+        let spec = args.sandbox.workflow_host_spec("prn_test").unwrap();
+        for (name, value) in [
+            ("TOOL_DIRS", "/opt/centaur/tools"),
+            ("TOOLS_PATH", "/sandbox/overlay/tools"),
+            ("CENTAUR_SANDBOX_REPO_CACHE_ENABLED", "false"),
+        ] {
+            let values: Vec<_> = spec
+                .env
+                .iter()
+                .filter(|env| env.name == name)
+                .map(|env| env.value.as_str())
+                .collect();
+            assert_eq!(values, vec![value]);
+        }
     }
 
     #[test]

@@ -170,6 +170,15 @@ export class CodexAppServerRendererEventMapper
     if (event?.thread_id) this.state.threadId = String(event.thread_id)
     if (event?.threadId) this.state.threadId = String(event.threadId)
 
+    // Codex sends this terminal notification before the durable session
+    // cancellation envelope; consumers may close the stream on this event.
+    if (event.type === 'turn.completed') {
+      const status = String(event.turn?.status ?? event.status ?? '').toLowerCase()
+      if (['interrupted', 'cancelled', 'canceled'].includes(status)) {
+        return this.complete(terminalResultText(event).trim() || 'Execution interrupted')
+      }
+    }
+
     const error = errorMessage(event)
     if (error) return this.fail(error)
 

@@ -1,5 +1,6 @@
 import { createSlackbotV2, type SlackbotV2Options } from './index'
 import { parseChannelDefaults } from './channel-defaults'
+import { parseUnifiedDmUsers } from './unified-dm'
 import { isHarnessEnabled, parseEnabledHarnesses } from './overrides'
 import { resolveSlackHomeTeamId } from './session-api'
 import { resolveSlackBotUserId } from './slack-user'
@@ -53,6 +54,8 @@ const consoleLogger = {
 const options: SlackbotV2Options = {
   apiUrl,
   agentViewEnabled: booleanEnv('SLACKBOTV2_AGENT_VIEW_ENABLED', false),
+  unifiedDmEnabled: booleanEnv('SLACKBOTV2_UNIFIED_DM_ENABLED', false),
+  unifiedDmUsers: parseUnifiedDmUsers(optionalEnv('SLACKBOTV2_UNIFIED_DM_USERS')),
   apiKey: optionalEnv('SLACKBOT_API_KEY'),
   assistantStatus: optionalEnv('SLACKBOTV2_ASSISTANT_STATUS'),
   activitySummaryStatusEnabled: booleanEnv('SLACKBOTV2_ACTIVITY_SUMMARY_STATUS_ENABLED', false),
@@ -121,6 +124,8 @@ console.log(
     event: 'slackbotv2_started',
     service: 'slackbotv2',
     agent_view_enabled: options.agentViewEnabled,
+    unified_dm_enabled: options.unifiedDmEnabled,
+    unified_dm_user_count: options.unifiedDmUsers?.length ?? 0,
     activity_summary_status_enabled: options.activitySummaryStatusEnabled,
     auto_join_created_channels_enabled: options.autoJoinCreatedChannels,
     message_overrides_strategy: messageOverridesStrategyMode,

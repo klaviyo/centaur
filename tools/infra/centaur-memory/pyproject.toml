@@ -1,0 +1,26 @@
+[project]
+name = "centaur-memory"
+description = "Provenance-backed personal memory in a private Git repository"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+centaur-memory = "centaur_tool_centaur_memory.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[tool.hatch.build.targets.wheel.sources]
+"." = "centaur_tool_centaur_memory"
+
+[tool.centaur]
+module = "client.py"
+hosts = ["api.github.com"]
+secrets = [
+    {type = "http", name = "GITHUB_TOKEN", match_headers = ["Authorization"], hosts = ["api.github.com"]},
+]
