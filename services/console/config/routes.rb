@@ -120,6 +120,11 @@ Rails.application.routes.draw do
   # User-facing list of enabled OAuth apps and their consent start links. Not
   # admin-gated: any signed-in team member connects integrations from here.
   get "console/integrations", to: "console/integrations#index", as: :console_integrations
+  namespace :console do
+    resource :ssh_connection, only: %i[show edit update destroy] do
+      post :validate_key
+    end
+  end
   delete "console/integrations/:id", to: "console/integrations#disconnect", as: :console_integration_connection
   # Create/edit forms for OAuth apps. Declared before the show route so
   # /console/oauth_apps/new wins over the generic `:id` match. Named
