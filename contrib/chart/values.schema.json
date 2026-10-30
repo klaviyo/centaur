@@ -421,6 +421,8 @@
             "repository": { "type": "string" },
             "branch": { "type": "string" },
             "intervalSeconds": { "type": "integer", "minimum": 1 },
+            "reflectionEnabled": { "type": "boolean" },
+            "reflectionIntervalSeconds": { "type": "integer", "minimum": 1 },
             "model": { "type": "string" }
           }
         },

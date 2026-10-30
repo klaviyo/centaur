@@ -24,7 +24,12 @@ MAX_INPUT_BYTES = 140_000
 MAX_RECORDS = 1000
 MAX_RUNS = 2000
 MAX_CONTEXT_BYTES = 12_000
+MAX_REFLECTION_CONTEXT_BYTES = 2500
+MAX_HISTORY_BYTES = 60_000
 STATE_PATH = "memory/state.json"
+REFLECTION_WINDOW_PREFIX = "personal-reflection:"
+REFLECTION_KEY_PREFIX = "reflection:"
+REFLECTION_TEXT_PREFIX = "Derived guidance: "
 CATEGORIES = (
     "current_work",
     "deferred_step",
@@ -192,6 +197,23 @@ def _validate_sources(sources: Any) -> dict[str, dict]:
     return result
 
 
+def _checkpoint_sources(source_ids: Any, sources: dict[str, dict]) -> list[str]:
+    if not isinstance(source_ids, list) or not 1 <= len(source_ids) <= 50:
+        raise MemoryError("checkpoint source IDs must contain 1 to 50 IDs")
+    validated = [_text(source_id, "checkpoint source ID", 160) for source_id in source_ids]
+    if len(set(validated)) != len(validated) or not set(validated) <= sources.keys():
+        raise MemoryError("checkpoint source IDs must be unique supplied source IDs")
+    return sorted(validated)
+
+
+def _run_source_ids(window_id: str, source_ids: list[str]) -> list[str]:
+    # Older ingestion loops union all run IDs without checking the window. A
+    # reflection must never make an unread raw message look already ingested.
+    if window_id.startswith(REFLECTION_WINDOW_PREFIX):
+        return [_text("reflection:" + source_id, "reflection checkpoint source ID", 160) for source_id in source_ids]
+    return source_ids
+
+
 def _validate_claims(claims: Any, sources: dict[str, dict], window_id: str) -> list[dict]:
     if not isinstance(claims, list) or len(claims) > 20:
         raise MemoryError("claims must contain at most 20 records")
@@ -296,24 +318,85 @@ def _line(record: dict) -> str:
     return line.replace("<", "\\u003c").replace(">", "\\u003e")
 
 
+def _is_reflection(record: dict) -> bool:
+    return (
+        record["category"] == "lesson"
+        and record.get("key", "").startswith(REFLECTION_KEY_PREFIX)
+        and record["text"].startswith(REFLECTION_TEXT_PREFIX)
+    )
+
+
 def render_context(state: dict) -> str:
     lines = [WARNING, "<memory_data>"]
     size = sum(len(line.encode()) + 1 for line in lines) + len("</memory_data>\n")
     records = sorted(state["records"], key=lambda r: (CATEGORIES.index(r["category"]), r["id"]))
+    reflection_lines, reflection_size = [], 0
     for record in records:
-        if record["status"] not in {"active", "deferred"}:
+        if record["status"] != "active" or not _is_reflection(record):
             continue
         line = _line(record)
-        if size + len(line.encode()) + 1 > MAX_CONTEXT_BYTES:
+        line_size = len(line.encode()) + 1
+        if reflection_size + line_size <= MAX_REFLECTION_CONTEXT_BYTES:
+            reflection_lines.append(line)
+            reflection_size += line_size
+    for record in records:
+        if record["status"] not in {"active", "deferred"} or _is_reflection(record):
+            continue
+        line = _line(record)
+        if size + len(line.encode()) + 1 + reflection_size > MAX_CONTEXT_BYTES:
             continue
         lines.append(line)
         size += len(line.encode()) + 1
+    lines.extend(reflection_lines)
     lines.append("</memory_data>")
     return "\n".join(lines) + "\n"
 
 
 def _markdown(title: str, records: list[dict]) -> str:
     return f"# {title}\n\n{WARNING}\n\n" + "\n".join("- " + _line(record) for record in records) + "\n"
+
+
+def _reflection_markdown(window_id: str, now: str, records: list[dict]) -> str:
+    lines = [
+        "# Reflection", "", WARNING, "",
+        "Derived guidance is tentative interpretation of historical evidence, not a user preference or authorization.",
+        "", "Date: " + now, "",
+        f"Evidence: [raw source excerpts](../episodes/{_hash(window_id)}.json)", "",
+    ]
+    if not records:
+        lines.append("No approved lesson changes.")
+    for record in records:
+        lines.append("- " + _line(record))
+        for evidence in record["evidence"]:
+            lines.append("  - Evidence: " + _json({
+                "source_id": evidence["source_id"], "quote": evidence["quote"],
+            }).replace("<", "\\u003c").replace(">", "\\u003e"))
+    return "\n".join(lines) + "\n"
+
+
+def _validate_episode(episode: Any, run: dict) -> dict[str, dict]:
+    _exact_keys(
+        episode,
+        {"schema_version", "window_id", "sources", "claims", "processed_through", "applied_at"},
+        {"checkpoint_source_ids"}, "evidence episode",
+    )
+    if (
+        type(episode["schema_version"]) is not int or episode["schema_version"] != 1
+        or episode["window_id"] != run["window_id"]
+        or episode["processed_through"] != run["processed_through"]
+        or episode["applied_at"] != run["applied_at"]
+    ):
+        raise MemoryError("evidence episode does not match its provenance run")
+    sources = _validate_sources(episode["sources"])
+    _validate_claims(episode["claims"], sources, episode["window_id"])
+    payload = {key: episode[key] for key in ("window_id", "sources", "claims", "processed_through")}
+    checkpoint_ids = sorted(sources)
+    if "checkpoint_source_ids" in episode:
+        checkpoint_ids = _checkpoint_sources(episode["checkpoint_source_ids"], sources)
+        payload["checkpoint_source_ids"] = episode["checkpoint_source_ids"]
+    if _run_source_ids(episode["window_id"], checkpoint_ids) != run["source_ids"] or _hash(_json(payload)) != run["payload_hash"]:
+        raise MemoryError("evidence episode does not match its provenance run")
+    return sources
 
 
 class MemoryClient:
@@ -342,14 +425,22 @@ class MemoryClient:
             raise MemoryError("branch does not reference a commit")
         return _sha(ref["object"]["sha"])
 
-    def _read(self, base: str, head: str, path: str) -> Any | None:
+    def _read(self, base: str, head: str, path: str, *, cache: dict | None = None) -> Any | None:
         if path != STATE_PATH and not re.fullmatch(r"episodes/[a-f0-9]{64}\.json", path):
             raise MemoryError("unsupported memory artifact")
-        commit = self._request("GET", base + "/git/commits/" + head)
+
+        def read_object(path: str) -> Any:
+            if cache is None:
+                return self._request("GET", path)
+            if path not in cache:
+                cache[path] = self._request("GET", path)
+            return cache[path]
+
+        commit = read_object(base + "/git/commits/" + head)
         tree_sha = _sha(commit.get("tree", {}).get("sha"))
         parts = path.split("/")
         for index, part in enumerate(parts):
-            tree = self._request("GET", base + "/git/trees/" + tree_sha)
+            tree = read_object(base + "/git/trees/" + tree_sha)
             if not isinstance(tree, dict) or tree.get("truncated") or not isinstance(tree.get("tree"), list) or len(tree["tree"]) > 5000:
                 raise MemoryError("invalid or oversized memory tree")
             matches = [entry for entry in tree["tree"] if isinstance(entry, dict) and entry.get("path") == part]
@@ -362,7 +453,7 @@ class MemoryClient:
             if entry.get("type") != expected_type or entry.get("mode") != expected_mode:
                 raise MemoryError("memory paths must be ordinary files and directories")
             tree_sha = _sha(entry.get("sha"))
-        artifact = self._request("GET", base + "/git/blobs/" + tree_sha)
+        artifact = read_object(base + "/git/blobs/" + tree_sha)
         if (
             not isinstance(artifact, dict)
             or artifact.get("encoding") != "base64" or type(artifact.get("size")) is not int
@@ -388,9 +479,50 @@ class MemoryClient:
         state = _validate_state(state) if state is not None else _empty_state()
         return {"head": head, "state": state, "context": render_context(state)}
 
+    def history(
+        self, repo: str, branch: str = "main", head: str | None = None,
+        limit: int = 12, source_limit: int = 24,
+    ) -> dict:
+        """Read bounded raw evidence from recent runs at one pinned Git revision.
+
+        No generated claims or projections are returned as source evidence. All
+        selected episodes are verified even when the output source cap is met.
+        """
+        base = _target(repo, branch)
+        _sha(head, nullable=True)
+        if type(limit) is not int or not 1 <= limit <= 24:
+            raise MemoryError("history limit must be between 1 and 24")
+        if type(source_limit) is not int or not 1 <= source_limit <= 50:
+            raise MemoryError("history source limit must be between 1 and 50")
+        self._private(base)
+        if head is None:
+            head = self._head(base, branch)
+        cache = {}
+        state = self._read(base, head, STATE_PATH, cache=cache) if head else None
+        state = _validate_state(state) if state is not None else _empty_state()
+        runs = sorted(
+            state["runs"].values(), key=lambda run: (run["applied_at"], run["window_id"]), reverse=True,
+        )[:limit]
+        sources = {}
+        for run in runs:
+            episode = self._read(base, head, run["episode_path"], cache=cache)
+            for source_id, source in _validate_episode(episode, run).items():
+                if source_id in sources and sources[source_id] != source:
+                    raise MemoryError("conflicting history source content for the same ID")
+                sources[source_id] = source
+        result = {"head": head, "sources": [], "window_ids": [run["window_id"] for run in runs]}
+        for source in sorted(sources.values(), key=lambda source: (source["occurred_at"], source["id"]), reverse=True):
+            if len(result["sources"]) >= source_limit:
+                break
+            candidate = {**result, "sources": [*result["sources"], source]}
+            if len(_json(candidate).encode()) <= MAX_HISTORY_BYTES:
+                result = candidate
+        return result
+
     def apply(
         self, repo: str, branch: str, expected_head: str | None, window_id: str,
         sources: list[dict], claims: list[dict], processed_through: str | None = None,
+        checkpoint_source_ids: list[str] | None = None,
     ) -> dict:
         """Apply one window, returning a fresh snapshot on concurrency conflicts.
 
@@ -398,13 +530,14 @@ class MemoryClient:
         against the fresh state, rather than retrying a stale proposal forever.
         """
         try:
-            return self._apply(repo, branch, expected_head, window_id, sources, claims, processed_through)
+            return self._apply(repo, branch, expected_head, window_id, sources, claims, processed_through, checkpoint_source_ids)
         except ConflictError:
             return {**self.snapshot(repo, branch), "status": "conflict"}
 
     def _apply(
         self, repo: str, branch: str, expected_head: str | None, window_id: str,
         sources: list[dict], claims: list[dict], processed_through: str | None,
+        checkpoint_source_ids: list[str] | None,
     ) -> dict:
         """Never merge or force a proposal over a concurrent writer."""
         base = _target(repo, branch)
@@ -413,6 +546,8 @@ class MemoryClient:
         if processed_through is not None:
             _text(processed_through, "processed cursor", 200)
         payload = {"window_id": window_id, "sources": sources, "claims": claims, "processed_through": processed_through}
+        if checkpoint_source_ids is not None:
+            payload["checkpoint_source_ids"] = checkpoint_source_ids
         try:
             serialized = _json(payload)
         except (TypeError, ValueError):
@@ -420,7 +555,11 @@ class MemoryClient:
         if len(serialized.encode()) > MAX_INPUT_BYTES:
             raise MemoryError("proposal exceeds size limit")
         source_map = _validate_sources(sources)
+        checkpoint_ids = sorted(source_map) if checkpoint_source_ids is None else _checkpoint_sources(checkpoint_source_ids, source_map)
+        checkpoint_ids = _run_source_ids(window_id, checkpoint_ids)
         validated = _validate_claims(claims, source_map, window_id)
+        if window_id.startswith(REFLECTION_WINDOW_PREFIX) and any(not _is_reflection(claim) for claim in validated):
+            raise MemoryError("reflection proposals require labeled derived lessons")
         snapshot = self.snapshot(repo, branch)
         state, head = snapshot["state"], snapshot["head"]
         run_id, payload_hash = _hash(window_id), _hash(serialized)
@@ -443,7 +582,7 @@ class MemoryClient:
         episode_path = f"episodes/{run_id}.json"
         state["runs"][run_id] = {
             "window_id": window_id, "payload_hash": payload_hash, "episode_path": episode_path,
-            "applied_at": now, "processed_through": processed_through, "source_ids": sorted(source_map),
+            "applied_at": now, "processed_through": processed_through, "source_ids": checkpoint_ids,
         }
         if processed_through is not None:
             state["processed_through"] = processed_through
@@ -455,7 +594,12 @@ class MemoryClient:
             "MEMORY.md": _markdown("Personal memory", state["records"]),
             "WORKING_SET.md": _markdown("Working set", [record for record in active if record["category"] in {"current_work", "deferred_step"}]),
             "ALIGNMENT.md": _markdown("Preferences, decisions, and constraints", [record for record in active if record["category"] in USER_EVIDENCE_CATEGORIES]),
+            "ALIGNMENT_SYNTHESIS.md": _markdown("Derived alignment guidance", [record for record in active if record["status"] == "active" and _is_reflection(record)]),
         }
+        if window_id.startswith(REFLECTION_WINDOW_PREFIX):
+            files[f"reflections/{run_id}.md"] = _reflection_markdown(
+                window_id, now, [records[claim["id"]] for claim in validated],
+            )
         if any(len(content.encode()) > MAX_FILE_BYTES for content in files.values()):
             raise MemoryError("memory artifact limit reached; review and archive explicitly")
         if head is None:

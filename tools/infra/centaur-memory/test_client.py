@@ -31,6 +31,7 @@ class FakeGitHub:
         self.race_before_patch = False
         self.fail_patch = False
         self.symlink_state = False
+        self.symlink_names = set()
         if not empty:
             blob = self.object(self.blobs, "unrelated existing file")
             tree = self.object(self.trees, {"project.txt": blob})
@@ -65,7 +66,7 @@ class FakeGitHub:
                     directory, child = name.split("/", 1)
                     directories.setdefault(directory, {})[child] = sha
                 else:
-                    entries.append({"path": name, "sha": sha, "type": "blob", "mode": "120000" if self.symlink_state and name == "state.json" else "100644"})
+                    entries.append({"path": name, "sha": sha, "type": "blob", "mode": "120000" if (self.symlink_state and name == "state.json") or name in self.symlink_names else "100644"})
             for name, children in directories.items():
                 entries.append({"path": name, "sha": self.object(self.trees, children), "type": "tree", "mode": "040000"})
             return {"tree": entries, "truncated": False}
@@ -310,3 +311,291 @@ def test_empty_project_normalizes_to_unscoped_record_identity():
     record = result["state"]["records"][0]
     assert record["project"] is None
     assert record["id"] == module._record_id("work_preference", "progress-updates", None)
+
+
+def episode_proposal(transport, index, *, text=None):
+    payload = proposal(transport, window=f"event-window-{index}", text=text or f"Raw source excerpt {index}.")
+    payload["sources"][0]["id"] = f"message-{index}"
+    payload["sources"][0]["occurred_at"] = f"2026-01-{index:02}T00:00:00Z"
+    payload["claims"] = []
+    payload["processed_through"] = f"message-{index}"
+    return payload
+
+
+def reflection_proposal(transport, *, window="personal-reflection:one", status="active", revision=0):
+    payload = proposal(transport, window=window, category="lesson", status=status, revision=revision)
+    payload["claims"][0]["key"] = "reflection:progress-updates"
+    payload["claims"][0]["text"] = "Derived guidance: Keep progress updates concise."
+    return payload
+
+
+def test_history_reads_raw_sources_including_no_claim_episodes_and_pins_revision():
+    transport = FakeGitHub()
+    client = MemoryClient(transport)
+    first = client.apply(**episode_proposal(transport, 1))
+    second = client.apply(**episode_proposal(transport, 2))
+    pinned = client.history(REPO, head=first["head"])
+    assert pinned == {
+        "head": first["head"], "window_ids": ["event-window-1"],
+        "sources": episode_proposal(transport, 1)["sources"],
+    }
+    latest = client.history(REPO)
+    assert latest["head"] == second["head"]
+    assert latest["window_ids"] == ["event-window-2", "event-window-1"]
+    assert [source["id"] for source in latest["sources"]] == ["message-2", "message-1"]
+    assert client.history(REPO, limit=1)["window_ids"] == ["event-window-2"]
+    assert len(client.history(REPO, source_limit=1)["sources"]) == 1
+
+
+def test_history_deduplicates_sources_without_recycling_derived_guidance():
+    transport = FakeGitHub()
+    client = MemoryClient(transport)
+    client.apply(**proposal(transport))
+    client.apply(**reflection_proposal(transport))
+    history = client.history(REPO)
+    assert len(history["window_ids"]) == 2
+    assert len(history["sources"]) == 1
+    assert "Derived guidance:" not in json.dumps(history)
+    assert history["sources"][0]["text"] == "I prefer concise progress updates."
+
+
+def test_history_rejects_conflicting_duplicate_ids_even_after_output_limit():
+    transport = FakeGitHub()
+    client = MemoryClient(transport)
+    client.apply(**episode_proposal(transport, 1))
+    payload = episode_proposal(transport, 2, text="Conflicting text for the same source.")
+    payload["sources"][0]["id"] = "message-1"
+    client.apply(**payload)
+    with pytest.raises(MemoryError, match="conflicting history source"):
+        client.history(REPO, source_limit=1)
+
+
+@pytest.mark.parametrize("change", ["missing", "hash", "source_ids", "schema", "role", "extra"])
+def test_history_validates_every_selected_episode_and_source(change):
+    transport = FakeGitHub()
+    client = MemoryClient(transport)
+    client.apply(**episode_proposal(transport, 1))
+    client.apply(**episode_proposal(transport, 2))
+    run = transport.state()["runs"][module._hash("event-window-1")]
+    path = run["episode_path"]
+    files = transport.files()
+    episode = json.loads(transport.blobs[files[path]])
+    if change == "missing":
+        del files[path]
+    else:
+        if change == "hash":
+            episode["sources"][0]["text"] = "Altered original evidence."
+        elif change == "source_ids":
+            episode["sources"][0]["id"] = "wrong-source"
+        elif change == "schema":
+            episode["schema_version"] = 2
+        elif change == "role":
+            episode["sources"][0]["role"] = "summary"
+        else:
+            episode["summary"] = "Generated content is not evidence."
+        transport.blobs[files[path]] = json.dumps(episode)
+    with pytest.raises(MemoryError):
+        client.history(REPO, source_limit=1)
+
+
+def test_history_uses_one_call_local_object_cache_and_never_trusts_symlinks():
+    transport = FakeGitHub()
+    client = MemoryClient(transport)
+    client.apply(**episode_proposal(transport, 1))
+    client.apply(**episode_proposal(transport, 2))
+    transport.calls.clear()
+    client.history(REPO)
+    paths = [path for method, path, _ in transport.calls if method == "GET"]
+    assert len(paths) == len(set(paths))
+    assert sum("/git/commits/" in path for path in paths) == 1
+    transport.symlink_names.add(module._hash("event-window-1") + ".json")
+    with pytest.raises(MemoryError, match="ordinary files"):
+        client.history(REPO)
+
+
+@pytest.mark.parametrize("kwargs", [{"limit": 0}, {"limit": 25}, {"limit": True}, {"source_limit": 0}, {"source_limit": 51}, {"source_limit": True}, {"head": "main"}])
+def test_history_rejects_invalid_bounds_before_transport(kwargs):
+    transport = FakeGitHub()
+    with pytest.raises(MemoryError):
+        MemoryClient(transport).history(REPO, **kwargs)
+    assert transport.calls == []
+
+
+def test_history_requires_private_repository_and_handles_empty_state():
+    transport = FakeGitHub(private=False)
+    with pytest.raises(MemoryError, match="private repository"):
+        MemoryClient(transport).history(REPO, head=transport.head)
+    empty = FakeGitHub(empty=True)
+    assert MemoryClient(empty).history(REPO) == {"head": None, "sources": [], "window_ids": []}
+    assert all(method == "GET" for method, _, _ in empty.calls)
+
+
+def test_history_omits_whole_sources_to_fit_utf8_json_budget():
+    transport = FakeGitHub()
+    payload = episode_proposal(transport, 1, text="🦊" * 2000)
+    payload["sources"] = [{**payload["sources"][0], "id": f"message-{index}"} for index in range(12)]
+    client = MemoryClient(transport)
+    client.apply(**payload)
+    history = client.history(REPO, source_limit=50)
+    assert 1 <= len(history["sources"]) < 12
+    assert len(module._json(history).encode()) <= module.MAX_HISTORY_BYTES
+    assert all(source["text"] == "🦊" * 2000 for source in history["sources"])
+
+
+def test_reflection_artifacts_are_atomic_and_keep_v1_state_and_existing_files():
+    transport = FakeGitHub()
+    client = MemoryClient(transport)
+    before = transport.head
+    unrelated = transport.files()["project.txt"]
+    payload = reflection_proposal(transport)
+    result = client.apply(**payload)
+    state = result["state"]
+    assert state.keys() == {"schema_version", "records", "runs", "processed_through"}
+    assert state["schema_version"] == 1
+    assert state["records"][0].keys() == {"id", "key", "category", "project", "text", "status", "evidence", "revision", "updated_at"}
+    assert next(iter(state["runs"].values())).keys() == {"window_id", "payload_hash", "episode_path", "applied_at", "processed_through", "source_ids"}
+    run_id = module._hash(payload["window_id"])
+    paths = transport.files()
+    assert paths["project.txt"] == unrelated
+    assert f"episodes/{run_id}.json" in paths
+    reflection_path = f"reflections/{run_id}.md"
+    reflection = transport.blobs[paths[reflection_path]]
+    synthesis = transport.blobs[paths["ALIGNMENT_SYNTHESIS.md"]]
+    assert "Derived guidance:" in reflection and "Derived guidance:" in synthesis
+    assert "UNTRUSTED" in reflection and "message-1" in reflection
+    assert "I prefer concise progress updates." in reflection
+    assert f"../episodes/{run_id}.json" in reflection
+    assert "Date: " in reflection
+    assert transport.commits[result["head"]]["parents"] == [before]
+    assert client.apply(**payload)["status"] == "no_duplicate"
+    # Existing v1 callers can continue applying ordinary windows. Reflection
+    # artifacts are projections; unrelated historical files stay untouched.
+    client.apply(**episode_proposal(transport, 2))
+    assert transport.files()[reflection_path] == paths[reflection_path]
+    assert client.snapshot(REPO)["state"]["schema_version"] == 1
+
+
+def test_reflection_no_change_and_retracted_guidance_have_honest_projections():
+    transport = FakeGitHub()
+    client = MemoryClient(transport)
+    client.apply(**reflection_proposal(transport))
+    payload = reflection_proposal(transport, window="personal-reflection:two", status="retracted", revision=1)
+    closed = client.apply(**payload)
+    assert "Derived guidance:" not in closed["context"]
+    assert "Derived guidance:" not in transport.blobs[transport.files()["ALIGNMENT_SYNTHESIS.md"]]
+    payload = reflection_proposal(transport, window="personal-reflection:three")
+    payload["claims"] = []
+    client.apply(**payload)
+    reflection = transport.blobs[transport.files()[f"reflections/{module._hash(payload['window_id'])}.md"]]
+    assert "No approved lesson changes." in reflection
+    assert "raw source excerpts" in reflection
+
+
+@pytest.mark.parametrize("field,value", [("category", "work_preference"), ("key", "unlabeled"), ("text", "Unlabeled interpretation.")])
+def test_reflection_writes_require_derived_lesson_labels(field, value):
+    transport = FakeGitHub()
+    payload = reflection_proposal(transport)
+    payload["claims"][0][field] = value
+    with pytest.raises(MemoryError, match="labeled derived lessons"):
+        MemoryClient(transport).apply(**payload)
+    assert transport.calls == []
+
+
+def test_reflection_cas_conflict_never_publishes_projection_or_state():
+    transport = FakeGitHub()
+    transport.race_before_patch = True
+    result = MemoryClient(transport).apply(**reflection_proposal(transport))
+    assert result["status"] == "conflict"
+    assert module.STATE_PATH not in transport.files()
+    assert "ALIGNMENT_SYNTHESIS.md" not in transport.files()
+    assert not any(path.startswith("reflections/") for path in transport.files())
+
+
+def test_context_reserves_bounded_reflection_space_without_displacing_all_facts():
+    state = module._empty_state()
+    for index in range(80):
+        reflection = index >= 40
+        state["records"].append({
+            "id": f"memory-{index:03}", "category": "lesson" if reflection else "current_work",
+            "key": f"reflection:{index}" if reflection else f"project-{index}", "project": None,
+            "status": "active", "text": ("Derived guidance: " if reflection else "") + "記" * 300,
+            "evidence": [{"window_id": "window", "source_id": "source"}],
+        })
+    context = module.render_context(state)
+    reflection_lines = [line for line in context.splitlines() if "Derived guidance:" in line]
+    assert reflection_lines
+    assert sum(len(line.encode()) + 1 for line in reflection_lines) <= module.MAX_REFLECTION_CONTEXT_BYTES
+    assert "memory-000" in context
+    assert len(context.encode()) <= module.MAX_CONTEXT_BYTES
+
+
+def test_checkpoint_only_marks_fresh_sources_processed_but_preserves_borrowed_evidence():
+    transport = FakeGitHub()
+    client = MemoryClient(transport)
+    old = episode_proposal(transport, 1)
+    client.apply(**old)
+    payload = episode_proposal(transport, 2)
+    payload["sources"].extend(old["sources"])
+    payload["checkpoint_source_ids"] = ["message-2"]
+    result = client.apply(**payload)
+    run = result["state"]["runs"][module._hash(payload["window_id"])]
+    assert run["source_ids"] == ["message-2"]
+    episode = json.loads(transport.blobs[transport.files()[run["episode_path"]]])
+    assert episode["checkpoint_source_ids"] == ["message-2"]
+    assert len(episode["sources"]) == 2
+    assert {source["id"] for source in client.history(REPO, limit=1)["sources"]} == {"message-1", "message-2"}
+    assert client.apply(**payload)["status"] == "no_duplicate"
+
+
+@pytest.mark.parametrize("source_ids", [[], ["message-1", "message-1"], ["unknown"], "message-1", [True]])
+def test_checkpoint_rejects_empty_duplicate_or_unavailable_source_ids(source_ids):
+    transport = FakeGitHub()
+    payload = proposal(transport)
+    payload["checkpoint_source_ids"] = source_ids
+    with pytest.raises(MemoryError, match="checkpoint source"):
+        MemoryClient(transport).apply(**payload)
+    assert transport.calls == []
+
+
+def test_legacy_episode_payload_hash_and_replay_are_unchanged():
+    transport = FakeGitHub()
+    client = MemoryClient(transport)
+    payload = proposal(transport)
+    result = client.apply(**payload)
+    run = result["state"]["runs"][module._hash(payload["window_id"])]
+    old_payload = {key: payload[key] for key in ("window_id", "sources", "claims", "processed_through")}
+    assert run["payload_hash"] == module._hash(module._json(old_payload))
+    episode = json.loads(transport.blobs[transport.files()[run["episode_path"]]])
+    assert "checkpoint_source_ids" not in episode
+    assert client.apply(**payload)["status"] == "no_duplicate"
+    assert client.history(REPO)["sources"] == payload["sources"]
+
+
+@pytest.mark.parametrize("explicit_checkpoint", [False, True])
+def test_reflection_checkpoints_do_not_hide_raw_events_from_older_ingestion(explicit_checkpoint):
+    transport = FakeGitHub()
+    client = MemoryClient(transport)
+    payload = reflection_proposal(transport)
+    if explicit_checkpoint:
+        payload["checkpoint_source_ids"] = ["message-1"]
+    result = client.apply(**payload)
+    run = result["state"]["runs"][module._hash(payload["window_id"])]
+    assert run["source_ids"] == ["reflection:message-1"]
+    old_ingestion_processed = {source_id for run in result["state"]["runs"].values() for source_id in run["source_ids"]}
+    assert "message-1" not in old_ingestion_processed
+    assert result["state"]["records"][0]["evidence"][0]["source_id"] == "message-1"
+    episode = json.loads(transport.blobs[transport.files()[run["episode_path"]]])
+    assert episode["sources"][0]["id"] == "message-1"
+    if explicit_checkpoint:
+        assert episode["checkpoint_source_ids"] == ["message-1"]
+    assert client.history(REPO)["sources"] == payload["sources"]
+
+
+def test_reflection_checkpoint_namespace_respects_existing_id_length_bound():
+    transport = FakeGitHub()
+    payload = reflection_proposal(transport)
+    payload["sources"][0]["id"] = "x" * 151
+    payload["claims"][0]["evidence"][0]["source_id"] = "x" * 151
+    with pytest.raises(MemoryError, match="reflection checkpoint source ID"):
+        MemoryClient(transport).apply(**payload)
+    assert transport.calls == []

@@ -116,6 +116,8 @@
   (dict "name" "CENTAUR_MEMORY_REPOSITORY" "value" (dig "repository" "" $memory))
   (dict "name" "CENTAUR_MEMORY_BRANCH" "value" (dig "branch" "main" $memory))
   (dict "name" "CENTAUR_MEMORY_INTERVAL_SECONDS" "value" (dig "intervalSeconds" 3600 $memory))
+  (dict "name" "CENTAUR_MEMORY_REFLECTION_ENABLED" "value" (and (dig "enabled" false $memory) (dig "reflectionEnabled" true $memory)))
+  (dict "name" "CENTAUR_MEMORY_REFLECTION_INTERVAL_SECONDS" "value" (dig "reflectionIntervalSeconds" 86400 $memory))
   (dict "name" "CENTAUR_MEMORY_MODEL" "value" (dig "model" "" $memory))
 -}}
 {{- $apiRsEtlEnv = concat $apiRsEtlEnv $memoryEnv -}}

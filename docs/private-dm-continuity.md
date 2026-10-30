@@ -8,14 +8,14 @@ place for the user to talk, review progress, and resume deferred work.
 
 The implementation provides conversation continuity and separately gated Git
 memory. It routes selected Slack DM users to the existing conversation-wide
-session and posts replies at the top level. An optional durable workflow extracts
-and verifies bounded memory for one configured DM. It adds no database migration, persistent
+session and posts replies at the top level. Optional durable workflows consolidate
+and reflect on bounded memory for one configured DM. They add no database migration, persistent
 project-session mapping, or automatic import of historical threads.
 
 | Capability | Implemented | Follow-on work |
 | --- | --- | --- |
 | One continuing private DM | Opt-in canonical DM session | Product controls and recovery UX |
-| Existing conversation context | Native harness history and optional bounded memory injection | Richer retrieval and reconciliation |
+| Existing conversation context | Native harness history, bounded memory injection, hourly consolidation, and daily reflection | Richer retrieval and user-facing memory controls |
 | Multiple project sandboxes | Existing single session assignment | Owner-bound child sessions |
 | Current work, preferences, deferred actions, decisions | Evidence-backed records in a private Git repository | User-facing correction and forget controls |
 | Revert experiment | Independently disable ingress and memory configuration | Child dispatch and cancellation controls |
@@ -147,21 +147,42 @@ injects at most 12,000 UTF-8 bytes from that cache into the configured session's
 normal and steering inputs, framed as untrusted evidence. Native harness
 compaction remains responsible for the conversation window.
 
-The scheduled `personal_memory` workflow reads bounded sources from the exact
-DM/principal, extracts proposals, independently verifies them, then applies
-revision-checked Git commits. Protected categories require direct user evidence.
-Exact source IDs and window hashes prevent duplicate application; conflicts
-leave evidence unprocessed for a fresh run. The workflow uses the principal's
-credential proxy and does not post maintenance messages to Slack. Its public
-run input/result contain status metadata, counts, and commit IDs rather than
+Two independently checkpointed loops run for the exact DM/principal:
+
+- `personal_memory` runs hourly by default. It consolidates new messages and
+  completion results with existing records and bounded historical raw evidence.
+  Corrections preserve still-applicable constraints, uncertainty, and open work.
+- `personal_reflection` runs daily by default. It derives cautious guidance from
+  recurring patterns, friction, and explicit corrections. It requires new events
+  since its own last checkpoint, even when hourly consolidation has already
+  processed those events.
+
+Both loops skip model calls and Git writes when their exact source-ID checkpoint
+has no new events. Each proposal receives independent verification, followed by
+an atomic preservation review of the complete approved plan. Protected facts
+require direct user evidence. Reflections are labeled `Derived guidance: `
+lessons with `reflection:` keys; they are fallible priors, never fresh evidence,
+user preferences, or authorization. Recurring patterns need at least two distinct
+user sources; an explicit correction or preference can support guidance with one.
+Readable reflections appear in `ALIGNMENT_SYNTHESIS.md` and `reflections/*.md`.
+
+Exact source IDs and window hashes prevent duplicate application; Git conflicts
+leave evidence unprocessed for a fresh run. Both workflows use the principal's
+credential proxy and do not post maintenance messages to Slack. Their public
+run input/results contain status metadata, counts, and commit IDs rather than
 private excerpts; redacted evidence and proposals remain in durable checkpoints
-and the private repository.
+and the private repository. When workflow enablement uses an allowlist, include
+both `personal_memory` and `personal_reflection` while retaining existing names.
+Reflection has its own `apiRs.memory.reflectionEnabled` switch and requires the
+overall `apiRs.memory.enabled` gate.
 
 Disabling memory stops new maintenance and injection without deleting data; an
 already-running maintenance run can finish. Correct records with compensating
 edits or retractions that retain processed source IDs. A plain Git revert can
-remove checkpoints and cause evidence to be processed again. User-facing forget
-and clear-memory controls, broader reconciliation, and project dispatch remain
+remove checkpoints and cause evidence to be processed again. The state remains
+schema version 1; derived lessons and reflection checkpoints use compatible
+prefixes rather than new canonical fields. User-facing forget and clear-memory
+controls, automatic collection from project sandboxes, and project dispatch remain
 follow-on work. Deferred steps never authorize execution or create schedules.
 
 ## Canary validation, rollout, and rollback
@@ -185,9 +206,11 @@ follow-on work. Deferred steps never authorize execution or create schedules.
    No database rollback or deletion is needed. Re-enabling reuses the canonical
    session; it does not create a clean context. Test disable/re-enable explicitly.
 
-For memory canaries, additionally verify the Git source checkpoint, bounded
-context in actual harness input, and a follow-up recall. Disable the memory flag
-and confirm new inputs omit the context and new workflow runs are no-ops. Memory
+For memory canaries, additionally verify independent hourly/daily source
+checkpoints, historical evidence retrieval, preservation rejection without partial
+record changes, bounded context in actual harness input, and a follow-up recall.
+An idle run must make no model calls or Git writes. Disable the memory flag and
+confirm new inputs omit the context and new workflow runs are no-ops. Memory
 can be disabled without changing DM routing; neither rollback needs a database
 migration.
 

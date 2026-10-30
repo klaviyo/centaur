@@ -14,15 +14,20 @@ import os
 import re
 import shutil
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
-from workflows import memory_models
+from workflows import memory_consolidation, memory_models
 
 WORKFLOW_NAME = "personal_memory"
 WORKFLOW_STARTERS = {"admin"}
 SOURCE_BATCH_SIZE = 6
 MAX_SOURCE_IDS = 100_000
 MAX_CONTEXT_BYTES = 12_000
+MAX_SOURCE_CHARS = 16_000
+MAX_BATCHES = {"consolidation": 8, "reflection": 32}
+REFLECTION_WINDOW_PREFIX = "personal-reflection:"
+LOCK_ATTEMPTS = 60
 
 
 def _enabled(env: Any = os.environ) -> bool:
@@ -104,7 +109,7 @@ def _excerpt(text: str) -> str:
     return text.strip() or "[No supported text; attachments are not ingested.]"
 
 
-def processed_source_ids(state: dict) -> list[str]:
+def processed_source_ids(state: dict, mode: str = "consolidation") -> list[str]:
     """Use exact durable IDs, not an unsafe timestamp/sequence high-water mark.
 
     A message transaction may commit after a later timestamp has been observed.
@@ -112,13 +117,46 @@ def processed_source_ids(state: dict) -> list[str]:
     """
     ids: set[str] = set()
     for run in state["runs"].values():
+        reflection = run.get("window_id", "").startswith(REFLECTION_WINDOW_PREFIX)
+        if reflection != (mode == "reflection"):
+            continue
         for source_id in run["source_ids"]:
             if not isinstance(source_id, str) or len(source_id) > 160:
                 raise ValueError("invalid memory source checkpoint")
+            if reflection:
+                if not source_id.startswith("reflection:"):
+                    raise ValueError("invalid reflection source checkpoint")
+                source_id = source_id.removeprefix("reflection:")
             ids.add(source_id)
     if len(ids) > MAX_SOURCE_IDS:
         raise ValueError("personal memory checkpoint capacity reached")
     return sorted(ids)
+
+
+def evidence_window(fresh: list[dict], historical: list[dict]) -> list[dict]:
+    """Keep fresh events and retrieve whole historical excerpts, never summaries."""
+    selected = {source["id"]: source for source in fresh}
+    terms = set(re.findall(r"[a-z0-9_-]{4,}", " ".join(s["text"] for s in fresh).lower()))
+
+    def rank(source: dict) -> tuple:
+        words = set(re.findall(r"[a-z0-9_-]{4,}", source["text"].lower()))
+        return (len(words & terms), source["occurred_at"], source["id"])
+
+    if len(_json(list(selected.values()))) > MAX_SOURCE_CHARS:
+        raise ValueError("fresh memory evidence exceeds input budget")
+    for source in sorted(historical, key=rank, reverse=True):
+        if source["id"] in selected:
+            if source != selected[source["id"]]:
+                raise ValueError("conflicting memory evidence for the same source")
+            continue
+        candidate = [*selected.values(), source]
+        if len(candidate) <= 50 and len(_json(candidate)) <= MAX_SOURCE_CHARS:
+            selected[source["id"]] = source
+    return list(selected.values())
+
+
+def _is_reflection(record: dict) -> bool:
+    return record["category"] == "lesson" and record["key"].startswith("reflection:")
 
 
 async def _read_sources(pool: Any, config: Config, seen: list[str]) -> list[dict]:
@@ -212,63 +250,141 @@ async def _refresh_cache(ctx: Any, connection: Any, config: Config) -> None:
 
 
 async def handler(params: Any, ctx: Any) -> dict:
+    return await run_loop(params, ctx, "consolidation")
+
+
+async def _review_plan(ctx: Any, step: str, config: Config, mode: str,
+                       sources: list[dict], records: list[dict], fresh_ids: list[str],
+                       *, max_candidates: int = 4) -> list[dict]:
+    proposer = memory_consolidation.reflect if mode == "reflection" else memory_consolidation.reconcile
+    claims = await ctx.step(step + "propose", partial(proposer,
+        config.model, sources, records, fresh_source_ids=fresh_ids, max_candidates=max_candidates))
+    if mode == "consolidation" and any(_is_reflection(claim) for claim in claims):
+        raise ValueError("consolidation cannot write derived reflection guidance")
+    if not claims:
+        return []
+    if mode == "reflection":
+        return await ctx.step(step + "verify", partial(memory_consolidation.verify_reflections,
+            config.model, sources, records, claims, fresh_source_ids=fresh_ids))
+    return await ctx.step(step + "verify", partial(memory_models.verify,
+        config.model, sources, records, claims))
+
+
+def _affected(records: list[dict], claims: list[dict]) -> list[dict]:
+    identities = {(c["category"], c["key"], c.get("project") or "") for c in claims}
+    return [record for record in records
+            if (record["category"], record["key"], record.get("project") or "") in identities]
+
+
+async def run_loop(params: Any, ctx: Any, mode: str) -> dict:
+    if mode not in MAX_BATCHES:
+        raise ValueError("invalid personal memory loop")
     config = Config.read()
     if config is None:
         return {"status": "disabled"}
+    workflow_name = "personal_reflection" if mode == "reflection" else WORKFLOW_NAME
     scheduled_input = {"metadata": {
-        "source": "workflow_schedule", "workflow_name": WORKFLOW_NAME, "no_delivery": True,
+        "source": "workflow_schedule", "workflow_name": workflow_name, "no_delivery": True,
     }}
     if params not in ({}, None, scheduled_input):
         raise ValueError("personal memory targets cannot be overridden by workflow input")
     if ctx._pool is None:
         raise RuntimeError("personal memory requires the durable session store")
 
-    # This lock limits duplicate model work. Git's compare-and-swap remains the
-    # correctness boundary if a worker crashes, loses its connection, or an
-    # independent editor changes the branch while a proposal is being reviewed.
-    async with ctx._pool.acquire() as connection:
-        lock_name = "personal_memory:" + config.thread_key
-        locked = await connection.fetchval("SELECT pg_try_advisory_lock(hashtextextended($1, 0))", lock_name)
-        if not locked:
-            return {"status": "busy"}
-        try:
-            bound = await connection.fetchval(
-                "SELECT EXISTS(SELECT 1 FROM sessions WHERE thread_key=$1 AND iron_control_principal=$2)",
-                config.thread_key, config.principal,
-            )
-            if not bound:
-                raise ValueError("personal memory session does not match the configured principal")
-            return await _maintain(config, ctx, connection)
-        finally:
-            await connection.fetchval("SELECT pg_advisory_unlock(hashtextextended($1, 0))", lock_name)
+    # Daily and hourly ticks may coincide. Release the connection and use a
+    # durable sleep on contention rather than dropping the day's reflection.
+    # Git CAS still protects against independent editors and connection loss.
+    lock_name = "personal_memory:" + config.thread_key
+    for attempt in range(LOCK_ATTEMPTS + 1):
+        async with ctx._pool.acquire() as connection:
+            locked = await connection.fetchval(
+                "SELECT pg_try_advisory_lock(hashtextextended($1, 0))", lock_name)
+            if locked:
+                try:
+                    bound = await connection.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM sessions WHERE thread_key=$1 AND iron_control_principal=$2)",
+                        config.thread_key, config.principal,
+                    )
+                    if not bound:
+                        raise ValueError("personal memory session does not match the configured principal")
+                    return await _maintain(config, ctx, connection, mode)
+                finally:
+                    await connection.fetchval("SELECT pg_advisory_unlock(hashtextextended($1, 0))", lock_name)
+        if attempt < LOCK_ATTEMPTS:
+            await ctx.sleep(f"{mode}_v2_wait_for_lock_{attempt}", 30)
+    raise RuntimeError("personal memory lock remained busy after durable retries")
 
 
-async def _maintain(config: Config, ctx: Any, connection: Any) -> dict:
+async def _maintain(config: Config, ctx: Any, connection: Any, mode: str) -> dict:
     target = {"repo": config.repository, "branch": config.branch}
-    snapshot = await ctx.step("read_repository", lambda: _tool(ctx, "snapshot", **target))
-    sources = await ctx.step("read_sources", lambda: _read_sources(
-        connection, config, processed_source_ids(snapshot["state"])))
-    if not sources:
-        # Also refresh externally corrected Git data when there is no new chat.
-        await ctx.step("refresh_context", lambda: _refresh_cache(ctx, connection, config))
-        return {"status": "no_new_sources", "head": snapshot["head"]}
-    window_id = "personal-memory:" + hashlib.sha256(_json({
-        "thread": config.thread_key, "sources": [s["id"] for s in sources],
-    }).encode()).hexdigest()
-    records = model_records(snapshot["state"]["records"], sources)
-    claims = await ctx.step("extract_claims", lambda: memory_models.extract(config.model, sources, records))
-    approved = await ctx.step("verify_claims", lambda: memory_models.verify(
-        config.model, sources, records, claims))
-    result = await ctx.step("apply_verified_memory", lambda: _tool(
-        ctx, "apply", **target, expected_head=snapshot["head"], window_id=window_id,
-        sources=sources, claims=approved, processed_through=window_id,
-    ))
-    if result["status"] == "conflict":
-        # Do not replay a pinned, stale proposal forever. A fresh scheduled run
-        # rereads Git and re-evaluates the same unprocessed sources.
-        return {"status": "conflict", "head": result["head"]}
-    if result["status"] not in {"applied", "no_duplicate"}:
-        raise ValueError("unexpected memory application result")
-    await ctx.step("publish_context", lambda: _refresh_cache(ctx, connection, config))
-    ctx.log("personal_memory_applied", source_count=len(sources), claim_count=len(approved), head=result["head"])
-    return {"status": result["status"], "head": result["head"], "sources": len(sources), "claims": len(approved)}
+    prefix = mode + "_v2_"
+    snapshot = await ctx.step(prefix + "read_repository", lambda: _tool(ctx, "snapshot", **target))
+    historical: list[dict] = []
+    source_count = claim_count = batches = 0
+    for index in range(MAX_BATCHES[mode]):
+        step = prefix + str(index) + "_"
+        fresh = await ctx.step(step + "read_sources", partial(_read_sources,
+            connection, config, processed_source_ids(snapshot["state"], mode)))
+        if not fresh:
+            break
+        if index == 0 and snapshot["head"] is not None:
+            history = await ctx.step(prefix + "read_history", partial(_tool,
+                ctx, "history", **target, head=snapshot["head"], limit=24, source_limit=50))
+            if history["head"] != snapshot["head"]:
+                raise ValueError("memory history is not pinned to the reviewed repository")
+            historical = history["sources"]
+        sources = evidence_window(fresh, historical)
+        fresh_ids = [source["id"] for source in fresh]
+        # Hourly reconciliation cannot rewrite the separate derived guidance.
+        eligible = [record for record in snapshot["state"]["records"]
+                    if mode == "reflection" or not _is_reflection(record)]
+        records = model_records(eligible, sources)
+        approved = await _review_plan(ctx, step, config, mode, sources, records, fresh_ids)
+        # Review the entire approved plan against the complete original records
+        # it changes, including evidence. Never prune affected before-records to
+        # fit a budget or partially apply a rejected preservation plan.
+        affected = _affected(snapshot["state"]["records"], approved)
+        if not memory_consolidation.preservation_fits(sources, affected, approved):
+            # Discard the whole oversized plan, then independently propose and
+            # review one self-contained change. Do not take a partial subset of
+            # potentially coupled edits or shorten original evidence to fit.
+            # Acknowledge only one event as well: the rest remain eligible for
+            # the following batch instead of losing additional useful updates.
+            fresh = fresh[:1]
+            fresh_ids = [fresh[0]["id"]]
+            approved = await _review_plan(ctx, step + "small_", config, mode,
+                                          sources, records, fresh_ids, max_candidates=1)
+            affected = _affected(snapshot["state"]["records"], approved)
+        preservation = await ctx.step(step + "preserve", partial(memory_consolidation.preserve,
+            config.model, sources, affected, approved))
+        if not preservation["approved"]:
+            approved = []
+        window_id = (REFLECTION_WINDOW_PREFIX if mode == "reflection" else "personal-memory:consolidation-v2:") + hashlib.sha256(_json({
+            "thread": config.thread_key, "sources": fresh_ids,
+        }).encode()).hexdigest()
+        result = await ctx.step(step + "apply", partial(_tool,
+            ctx, "apply", **target, expected_head=snapshot["head"], window_id=window_id,
+            sources=sources, claims=approved, processed_through=window_id,
+            checkpoint_source_ids=fresh_ids,
+        ))
+        if result["status"] == "conflict":
+            # A fresh run reevaluates unprocessed evidence against the new head.
+            await ctx.step(prefix + "refresh_conflict", lambda: _refresh_cache(ctx, connection, config))
+            return {"status": "conflict", "head": result["head"], "sources": source_count, "claims": claim_count}
+        if result["status"] not in {"applied", "no_duplicate"}:
+            raise ValueError("unexpected memory application result")
+        snapshot = result
+        source_count += len(fresh)
+        claim_count += len(approved)
+        batches += 1
+        # Keep only a bounded bank of whole raw excerpts for later batches.
+        history_by_id = {source["id"]: source for source in [*historical, *fresh]}
+        historical = sorted(history_by_id.values(), key=lambda source: (source["occurred_at"], source["id"]), reverse=True)[:50]
+        ctx.log("personal_memory_batch", loop=mode, source_count=len(fresh), claim_count=len(approved),
+                preservation_approved=preservation["approved"], head=result["head"])
+    # This is a fresh read inside the retryable step, including after idle ticks
+    # and successful Git writes replayed following a projection failure.
+    await ctx.step(prefix + "publish_context", lambda: _refresh_cache(ctx, connection, config))
+    return {"status": "applied" if batches else "no_new_sources", "head": snapshot["head"],
+            "sources": source_count, "claims": claim_count, "batches": batches,
+            "batch_limit_reached": batches == MAX_BATCHES[mode]}

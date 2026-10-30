@@ -652,7 +652,11 @@ apiRs:
     repository: ""
     branch: main
     intervalSeconds: 3600
-    # Required by the extraction workflow when enabled; no implicit model fallback.
+    # Daily reflection also requires memory.enabled. Both loops skip model work
+    # when their independent source checkpoints have no new events.
+    reflectionEnabled: true
+    reflectionIntervalSeconds: 86400
+    # Required by the memory workflows when enabled; no implicit model fallback.
     model: ""
   # Scheduled ETL workflow configuration. The chart renders these into api-rs
   # env so workflow discovery sees the right schedules, then derives the
