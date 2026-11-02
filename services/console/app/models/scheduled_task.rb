@@ -110,7 +110,7 @@ class ScheduledTask < ApplicationRecord
   end
 
   def execution_principal
-    ConsoleUserPrincipalProvisioner.call(author)
+    ConsoleUserPrincipalProvisioner.call(author, enable_workflow_writes: true)
   end
 
   def api_input

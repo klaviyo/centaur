@@ -28,6 +28,14 @@ It is a Rails application backed by Postgres. It provides a JSON API, an operato
 
 Operators manage credentials, principals, roles, and grants through the API or the console. Each `iron-proxy` instance signs in with its own token, fetches the configuration for its assigned principal, and adds the granted credentials to matching outbound requests.
 
+Scheduled tasks enable workflow write access on their author's Console principal
+when preparing each run, including for existing principals. This allows tasks to
+create and cancel child workflow runs without a separate permission grant.
+Scheduled tasks and MCP share that principal, so the grant also applies to the
+author's MCP sessions after a task runs. Workflow read and session read access
+remain separately controlled. The next scheduled run re-enables workflow writes
+after an explicit revocation.
+
 ## Local Development
 
 Console runs on stock PostgreSQL 16, including managed services such as RDS

@@ -64,6 +64,8 @@ class ScheduledTaskJobsTest < ActiveJob::TestCase
 
   test "runner sends the scheduled task input and a stable idempotency key" do
     task = create_task
+    principal = ConsoleUserPrincipalProvisioner.call(task.author)
+    assert_not principal.sandbox_workflows_write_enabled
     client = FakeApiClient.new
     ScheduledTaskRunJob.client_factory = -> { client }
 
@@ -72,6 +74,7 @@ class ScheduledTaskJobsTest < ActiveJob::TestCase
     end
 
     request = client.requests.fetch(0)
+    assert principal.reload.sandbox_workflows_write_enabled
     assert_equal "console_workflow", request[:workflow_name]
     assert_equal task.execution_principal.foreign_id, request.dig(:input, :principal)
     assert_equal users(:acme_admin), task.execution_principal.console_user

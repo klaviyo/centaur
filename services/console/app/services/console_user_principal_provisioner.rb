@@ -3,12 +3,13 @@ require "digest"
 class ConsoleUserPrincipalProvisioner
   USER_MCP_ROLE_FOREIGN_ID = "user-mcp".freeze
 
-  def self.call(user)
-    new(user).call
+  def self.call(user, enable_workflow_writes: false)
+    new(user, enable_workflow_writes: enable_workflow_writes).call
   end
 
-  def initialize(user)
+  def initialize(user, enable_workflow_writes: false)
     @user = user
+    @enable_workflow_writes = enable_workflow_writes
   end
 
   def call
@@ -21,6 +22,10 @@ class ConsoleUserPrincipalProvisioner
       principal.console_user = user
       principal.assign_attributes(slack_identity_fields)
       principal.labels = principal.labels.merge("managed-by" => "centaur")
+      # Scheduled jobs need to launch child workflows, including when their
+      # owner's principal already exists. Ordinary MCP provisioning never
+      # revokes an existing grant or enables writes on its own.
+      principal.sandbox_workflows_write_enabled = true if @enable_workflow_writes
       # Runs once per console execute: skip the write (and its after_commit
       # hooks) when nothing changed.
       principal.save! if principal.changed?

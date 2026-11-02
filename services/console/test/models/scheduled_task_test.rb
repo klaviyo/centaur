@@ -101,6 +101,9 @@ class ScheduledTaskTest < ActiveSupport::TestCase
 
     assert_equal "console_user", principal.kind
     assert_equal task.author, principal.console_user
+    assert principal.sandbox_workflows_write_enabled
+    assert_not principal.sandbox_workflows_read_enabled
+    assert_not principal.sandbox_sessions_read_enabled
     assert_equal(
       {
         prompt: "Summarize open incidents.",
