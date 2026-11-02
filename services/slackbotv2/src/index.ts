@@ -1936,10 +1936,14 @@ async function renderExecutionAttempt(
   let rendered = false
   let retry = false
   let fallbackLastEventId = 0
+  const sessionOutcome = { failed: false }
   try {
     const streamResult = await renderExecutionStream(
       thread,
-      clearRejectedStickyModel(thread, input, streamSessionAfterHandoff(options, input), options),
+      trackSessionFailures(
+        clearRejectedStickyModel(thread, input, streamSessionAfterHandoff(options, input), options),
+        sessionOutcome
+      ),
       message,
       options,
       trace,
@@ -1947,7 +1951,7 @@ async function renderExecutionAttempt(
       responseContextBlock
     )
     rendered = true
-    outcome = 'complete'
+    outcome = sessionOutcome.failed ? 'stream_error_rendered' : 'complete'
     let divergenceReconciled = false
     if (streamResult.diverged && streamResult.messageId) {
       // The live answer stream diverged from the recomposed answer, so the delta
@@ -1969,6 +1973,7 @@ async function renderExecutionAttempt(
       )
       if (reconciled) {
         divergenceReconciled = true
+        if (reconciled.sessionFailed) outcome = 'stream_error_rendered'
         fallbackLastEventId = reconciled.lastEventId
       }
     }
@@ -2003,7 +2008,7 @@ async function renderExecutionAttempt(
       // (for example a progress-card stop failed). Reposting would duplicate
       // the answer, so record the failure and finish.
       rendered = true
-      outcome = 'answer_visible'
+      outcome = sessionOutcome.failed ? 'stream_error_rendered' : 'answer_visible'
       traceLog(
         options,
         'slackbotv2_render_failed_answer_visible',
@@ -2059,7 +2064,7 @@ async function renderExecutionAttempt(
     )
     if (fallback) {
       rendered = true
-      outcome = 'fallback'
+      outcome = fallback.sessionFailed ? 'stream_error_rendered' : 'fallback'
       fallbackLastEventId = fallback.lastEventId
       return 'complete'
     }
@@ -2079,6 +2084,20 @@ async function renderExecutionAttempt(
       last_event_id: getLastEventId()
     })
     recordRenderAttempt('live', outcome, renderStartedAtMs)
+  }
+}
+
+/** An error message reaching Slack is delivery of an error, not a successful answer. */
+async function* trackSessionFailures(
+  stream: AsyncIterable<SlackbotV2RendererSource>,
+  outcome: { failed: boolean }
+): AsyncIterable<SlackbotV2RendererSource> {
+  for await (const event of stream) {
+    const kind = 'eventKind' in event ? event.eventKind : 'event' in event ? event.event : ''
+    if (kind === 'session.execution_failed' || kind === 'session.stream_error') {
+      outcome.failed = true
+    }
+    yield event
   }
 }
 
@@ -2175,7 +2194,7 @@ async function renderFallbackFinalAnswer(
   source: { afterEventId: number; executionId?: string; threadId: string },
   trace?: SlackbotV2Trace,
   replacement?: { replaceMessageId: string }
-): Promise<{ lastEventId: number } | null> {
+): Promise<{ lastEventId: number; sessionFailed: boolean } | null> {
   const startedAtMs = nowMs()
   let outcome = 'error'
   let lastEventId = source.afterEventId
@@ -2201,10 +2220,11 @@ async function renderFallbackFinalAnswer(
       }
     }
     const fallback = new SlackRenderFallback()
+    const sessionOutcome = { failed: false }
     const chatStream = fallback.collectChatSdk(
       slackSafeChatSdkStream(
         harnessToChatSdkStream(
-          fallback.collectSource(stream),
+          fallback.collectSource(trackSessionFailures(stream, sessionOutcome)),
           fallbackRendererOptions(options)
         )
       )
@@ -2242,8 +2262,8 @@ async function renderFallbackFinalAnswer(
       replacement_message_id: replacement?.replaceMessageId,
       phase_ms: elapsedMs(startedAtMs)
     })
-    outcome = 'complete'
-    return { lastEventId }
+    outcome = sessionOutcome.failed ? 'error_visible' : 'complete'
+    return { lastEventId, sessionFailed: sessionOutcome.failed }
   } catch (error) {
     outcome = 'error'
     traceLog(
@@ -2536,6 +2556,7 @@ async function recoverRenderObligation(
   }
   const renderStartedAtMs = nowMs()
   let renderOutcome = 'failure'
+  const sessionOutcome = { failed: false }
 
   let openedStream: AsyncIterable<SlackbotV2RendererSource>
   try {
@@ -2571,13 +2592,13 @@ async function recoverRenderObligation(
     })
     const streamResult = await renderRecoveredExecutionStream(
       thread,
-      streamOpenedSession(input, openedStream),
+      trackSessionFailures(streamOpenedSession(input, openedStream), sessionOutcome),
       obligation.message,
       options,
       trace
     )
     rendered = true
-    renderOutcome = 'complete'
+    renderOutcome = sessionOutcome.failed ? 'stream_error_rendered' : 'complete'
     let divergenceReconciled = false
     if (streamResult.diverged && streamResult.messageId) {
       // Same divergence reconcile as the live path: the answer stream was
@@ -2596,6 +2617,7 @@ async function recoverRenderObligation(
       )
       if (reconciled) {
         divergenceReconciled = true
+        if (reconciled.sessionFailed) renderOutcome = 'stream_error_rendered'
         lastEventId = Math.max(lastEventId, reconciled.lastEventId)
       }
     }
@@ -2609,7 +2631,7 @@ async function recoverRenderObligation(
       // The recovered stream broke only after the final answer became
       // visible; reposting would duplicate it.
       rendered = true
-      renderOutcome = 'answer_visible'
+      renderOutcome = sessionOutcome.failed ? 'stream_error_rendered' : 'answer_visible'
       traceLog(options, 'slackbotv2_render_recovery_failed_answer_visible', trace, {
         error: errorMessage(error)
       })
@@ -2658,7 +2680,7 @@ async function recoverRenderObligation(
       )
       if (!fallback) throw error
       rendered = true
-      renderOutcome = 'fallback'
+      renderOutcome = fallback.sessionFailed ? 'stream_error_rendered' : 'fallback'
       lastEventId = Math.max(lastEventId, fallback.lastEventId)
     }
   } finally {

@@ -879,6 +879,88 @@ describe('slackbotv2', () => {
     )
   })
 
+  for (const terminalEvent of ['session.execution_failed', 'session.stream_error']) {
+    it(`counts a live ${terminalEvent} as an error-visible delivery`, async () => {
+      codexApi.autoRespond = false
+      const before = deliveryMetric('error_visible')
+      const successfulBefore = deliveryMetric('streamed')
+      slackbotMetrics.lastSuccessfulRenderTimestamp.set({ source: 'live' }, 42)
+      const parent = await postUserMessage('Context before a failed execution.')
+      const mention = await sendMessage(`<@${BOT_USER_ID}> investigate`, { threadTs: parent.ts })
+      expect(mention.response.status).toBe(200)
+      await waitFor(() => codexApi.eventRequests.length === 1)
+      codexApi.emitSessionEvent(threadKey(parent.ts), terminalEvent, {
+        error: 'The provider stream failed.'
+      })
+      await mention.finished()
+
+      expect(await threadText(parent.ts)).toContain('The provider stream failed.')
+      expect(deliveryMetric('error_visible')).toBe(before + 1)
+      expect(deliveryMetric('streamed')).toBe(successfulBefore)
+      expect(slackbotMetrics.expose()).toContain(
+        'slackbotv2_last_successful_render_timestamp_seconds{source="live"} 42'
+      )
+    })
+
+    it(`counts a recovered ${terminalEvent} as an error-visible delivery`, async () => {
+      const sharedState = createMemoryState()
+      await sharedState.connect()
+      const parent = await postUserMessage('Context before recovery of a failed execution.')
+      const mention = await postUserMessage(`<@${BOT_USER_ID}> investigate`, parent.ts)
+      const key = threadKey(parent.ts)
+      const message = apiMessageFromSlackEvent({
+        isMention: true,
+        text: `<@${BOT_USER_ID}> investigate`,
+        threadId: key,
+        ts: mention.ts
+      })
+      await sharedState.set(`thread-state:${key}`, {
+        activeExecution: true,
+        lastEventId: 0,
+        renderObligation: { afterEventId: 0, executionId: 'exe-failed-recovery', message }
+      })
+      await sharedState.appendToList('slackbotv2:render:index', key)
+      codexApi.emitSessionEvent(key, terminalEvent, { error: 'The recovered execution failed.' })
+      const before = deliveryMetric('error_visible')
+      const successfulBefore = deliveryMetric('streamed')
+      slackbotMetrics.lastSuccessfulRenderTimestamp.set({ source: 'recovery' }, 42)
+      bot = createTestBot({ state: sharedState })
+      await waitFor(async () =>
+        (await sharedState.get<Record<string, unknown>>(`thread-state:${key}`))?.renderObligation === null
+      )
+      await waitFor(() => deliveryMetric('error_visible') === before + 1)
+
+      expect(await threadText(parent.ts)).toContain('The recovered execution failed.')
+      expect(deliveryMetric('streamed')).toBe(successfulBefore)
+      expect(slackbotMetrics.expose()).toContain(
+        'slackbotv2_last_successful_render_timestamp_seconds{source="recovery"} 42'
+      )
+    })
+  }
+
+  it('counts a failed execution replayed by Slack fallback as an error-visible delivery', async () => {
+    codexApi.autoRespond = false
+    slackApi.failStreamStopsLongerThan(10)
+    const before = deliveryMetric('error_visible')
+    const fallbackBefore = deliveryMetric('fallback_sent')
+    slackbotMetrics.lastSuccessfulRenderTimestamp.set({ source: 'fallback' }, 42)
+    const parent = await postUserMessage('Context before fallback of a failed execution.')
+    const mention = await sendMessage(`<@${BOT_USER_ID}> investigate`, { threadTs: parent.ts })
+    await waitFor(() => codexApi.eventRequests.length === 1)
+    codexApi.emitSessionEvent(threadKey(parent.ts), 'session.execution_failed', {
+      error: 'The provider failed before producing an answer.'
+    })
+    await mention.finished()
+
+    expect(codexApi.eventRequests).toHaveLength(2)
+    expect(await threadText(parent.ts)).toContain('The provider failed before producing an answer.')
+    expect(deliveryMetric('error_visible')).toBe(before + 1)
+    expect(deliveryMetric('fallback_sent')).toBe(fallbackBefore)
+    expect(slackbotMetrics.expose()).toContain(
+      'slackbotv2_last_successful_render_timestamp_seconds{source="fallback"} 42'
+    )
+  })
+
   it('clears a sticky model rejected by the harness and accepts a later override', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()
@@ -4573,6 +4655,12 @@ describe('slackbotv2', () => {
     expect(hasLog(logs, 'slackbotv2_render_failed')).toBe(false)
   })
 })
+
+function deliveryMetric(status: string): number {
+  const prefix = `centaur_session_delivery_total{delivery_status="${status}"} `
+  const line = slackbotMetrics.expose().split('\n').find(line => line.startsWith(prefix))
+  return line ? Number(line.slice(prefix.length)) : 0
+}
 
 function createTestBot(
   overrides: Partial<Parameters<typeof createSlackbotV2>[0]> = {}
