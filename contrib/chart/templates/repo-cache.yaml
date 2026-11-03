@@ -28,13 +28,19 @@
 {{- end -}}
 {{- end -}}
 {{- end }}
+{{- $repoCacheOverlayRepositories := list -}}
 {{- range $source := $overlaySources }}
 {{- with (get $source "repo") }}
-{{- $repoCacheRepositories = append $repoCacheRepositories . -}}
+{{- $repoCacheOverlayRepositories = append $repoCacheOverlayRepositories . -}}
 {{- $_ := set $repoCacheRepositoryVisibilities . (get $source "visibility" | default "private") -}}
 {{- end }}
 {{- end }}
-{{- $repoCacheRepositories = uniq $repoCacheRepositories -}}
+{{- /*
+Overlay sources sync first. Every sandbox's tools-bootstrap init waits on
+them, and repo-cache syncs one repository at a time, so on a fresh node a
+large work repository listed ahead of them blocks every sandbox there.
+*/ -}}
+{{- $repoCacheRepositories = concat $repoCacheOverlayRepositories $repoCacheRepositories | uniq -}}
 {{- if $repoCacheRepositories }}
 {{- $repoCacheHasGithubToken := or .Values.repoCache.githubToken.existingSecretName .Values.repoCache.githubToken.token -}}
 {{- $repoCacheImageRepository := default .Values.sandbox.image.repository .Values.repoCache.image.repository -}}
