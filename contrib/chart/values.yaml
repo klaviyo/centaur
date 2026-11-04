@@ -437,7 +437,11 @@ agentSandbox:
 # for POST /api/v1/proxy/sync while all operator/admin traffic continues to use
 # Console. The service reads Console's database directly.
 proxySync:
-  # Additional non-secret process environment settings.
+  # Deployment-owned WSS destinations for reusable personal SSH keys.
+  # Example: [{host: "*.dev.example.com", path: /events/events, username: dev}]
+  # Empty denies dynamic targets. Exact paths and TLS verification are mandatory.
+  sshTargets: []
+  # Additional non-secret environment settings.
   extraEnv: {}
   # Two replicas keep sync available during pod restarts and rolling updates.
   replicaCount: 2
