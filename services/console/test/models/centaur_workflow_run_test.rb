@@ -112,6 +112,17 @@ class CentaurWorkflowRunTest < ActiveSupport::TestCase
     )
   end
 
+  test "ACL workflow names filter before pagination and counts" do
+    insert_run(workflow_name: "hidden", completed_at: 1.minute.ago)
+    insert_run(workflow_name: "alpha", completed_at: 2.minutes.ago)
+    insert_run(workflow_name: "beta", completed_at: 3.minutes.ago)
+    runs = CentaurWorkflowRun.latest_per_workflow(limit: 1, workflow_keys: %w[alpha beta])
+    assert_equal [ "alpha" ], runs.map(&:workflow_key)
+    assert_equal 2, CentaurWorkflowRun.workflow_count(workflow_keys: %w[alpha beta])
+    assert_empty CentaurWorkflowRun.latest_per_workflow(limit: 10, workflow_keys: [])
+    assert_equal 0, CentaurWorkflowRun.workflow_count(workflow_keys: [])
+  end
+
   private
 
   def ensure_workflow_runs_table

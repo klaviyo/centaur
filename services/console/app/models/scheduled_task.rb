@@ -1,6 +1,8 @@
 require "fugit"
 
 class ScheduledTask < ApplicationRecord
+  include WorkflowSharing
+
   class DeliveryDestinationUnavailable < StandardError; end
 
   oid_prefix "tsk"
@@ -38,6 +40,10 @@ class ScheduledTask < ApplicationRecord
   DELIVERY_DESTINATION_FORMAT = /\A[CDGUW][A-Z0-9]{8,}\z/
 
   belongs_to :author, class_name: "User"
+
+  scope :owned_by, ->(user) { where(author: user) }
+
+  def sharing_owner = author
 
   scope :due, ->(now = Time.current) { where(enabled: true, next_run_at: ..now) }
 
@@ -110,6 +116,8 @@ class ScheduledTask < ApplicationRecord
   end
 
   def execution_principal
+    raise DeliveryDestinationUnavailable, "Task author is inactive" unless author.active?
+
     ConsoleUserPrincipalProvisioner.call(author)
   end
 

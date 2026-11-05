@@ -227,6 +227,56 @@ class Api::V1::SandboxScheduledTasksControllerTest < ActionDispatch::Integration
     assert_response :forbidden
   end
 
+  test "reader can inspect but cannot edit run delete or grant access" do
+    task = create_task(author: users(:acme_admin), name: "Read-only task")
+    task.replace_access!(reader_oids: [ @user.oid ])
+    with_token(@proxy) do |headers|
+      get "/api/v1/sandbox/scheduled_tasks/#{task.oid}", headers: headers
+      assert_response :ok
+      patch "/api/v1/sandbox/scheduled_tasks/#{task.oid}", params: { data: { prompt: "Hijacked" } }, headers: headers, as: :json
+      assert_response :not_found
+      post "/api/v1/sandbox/scheduled_tasks/#{task.oid}/run", headers: headers
+      assert_response :not_found
+      patch "/api/v1/sandbox/scheduled_tasks/#{task.oid}/access", params: { data: { editor_oids: [ @user.oid ] } }, headers: headers, as: :json
+      assert_response :not_found
+      delete "/api/v1/sandbox/scheduled_tasks/#{task.oid}", headers: headers
+      assert_response :not_found
+    end
+    assert_equal "Summarize updates.", task.reload.prompt
+  end
+
+  test "editor can edit and run but cannot change owner visibility or ACLs" do
+    owner = users(:acme_admin)
+    task = create_task(author: owner, name: "Editable task")
+    task.replace_access!(editor_oids: [ @user.oid ])
+    with_token(@proxy) do |headers|
+      patch "/api/v1/sandbox/scheduled_tasks/#{task.oid}", params: { data: { prompt: "Updated", author_id: @user.id, visibility: "shared" } }, headers: headers, as: :json
+      assert_response :ok
+      assert_enqueued_jobs 1, only: ScheduledTaskRunJob do
+        post "/api/v1/sandbox/scheduled_tasks/#{task.oid}/run", headers: headers
+      end
+      assert_response :accepted
+      patch "/api/v1/sandbox/scheduled_tasks/#{task.oid}/access", params: { data: { reader_oids: [ @user.oid ] } }, headers: headers, as: :json
+      assert_response :not_found
+    end
+    assert_equal owner, task.reload.author
+    assert task.visibility_private?
+    assert_equal owner, task.execution_principal.console_user
+  end
+
+  test "owner grants and revokes access via API" do
+    task = create_task(author: @user, name: "My shared task")
+    reader = users(:acme_admin)
+    with_token(@proxy) do |headers|
+      patch "/api/v1/sandbox/scheduled_tasks/#{task.oid}/access", params: { data: { reader_oids: [ reader.oid ] } }, headers: headers, as: :json
+      assert_response :ok
+      assert task.reload.readable_by?(reader)
+      patch "/api/v1/sandbox/scheduled_tasks/#{task.oid}/access", params: { data: { reader_oids: [] } }, headers: headers, as: :json
+      assert_response :ok
+      assert_not task.reload.readable_by?(reader)
+    end
+  end
+
   private
 
   def create_task(author:, name:)

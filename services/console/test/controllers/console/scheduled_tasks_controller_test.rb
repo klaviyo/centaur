@@ -159,7 +159,7 @@ class Console::ScheduledTasksControllerTest < ActionDispatch::IntegrationTest
     assert_response :ok
     assert_select ".console-thread-group-title-active", text: /Scheduled/
     assert_select "h1", text: "Scheduled Tasks"
-    assert_select "a[href=?]", edit_console_scheduled_task_path(task.oid), text: task.name
+    assert_select "a[href=?]", console_scheduled_task_path(task.oid), text: task.name
     assert_select "td", text: /0 \* \* \* \*/
     assert_select "td", text: /#general/
     assert_select "td", text: /#{task.delivery_channel}/
@@ -247,6 +247,26 @@ class Console::ScheduledTasksControllerTest < ActionDispatch::IntegrationTest
       delete console_scheduled_task_url(task.oid)
     end
     assert_redirected_to console_scheduled_tasks_path
+  end
+
+  test "reader sees shared task without execution editing deletion or sharing controls" do
+    task = create_task
+    reader = users(:member_user)
+    task.replace_access!(reader_oids: [ reader.oid ])
+    delete logout_url
+    post login_url, params: { email: reader.email, password: "password123456" }
+    get console_scheduled_task_url(task.oid)
+    assert_response :ok
+    assert_select "pre", text: task.prompt
+    assert_select "form[action=?]", run_console_scheduled_task_path(task.oid), count: 0
+    assert_select "form[action=?]", access_console_scheduled_task_path(task.oid), count: 0
+    get edit_console_scheduled_task_url(task.oid)
+    assert_response :not_found
+    post run_console_scheduled_task_url(task.oid)
+    assert_response :not_found
+    task.replace_access!(reader_oids: [])
+    get console_scheduled_task_url(task.oid)
+    assert_response :not_found
   end
 
   private

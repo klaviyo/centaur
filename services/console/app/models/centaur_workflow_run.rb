@@ -37,11 +37,15 @@ class CentaurWorkflowRun < CentaurSessionRecord
     end
 
     # The most recent run of each distinct workflow, newest activity first.
-    def latest_per_workflow(limit:, offset: 0)
-      find_by_sql([ <<~SQL, { limit: limit, offset: offset } ])
+    def latest_per_workflow(limit:, offset: 0, workflow_keys: nil)
+      return [] if workflow_keys == []
+
+      filter = workflow_keys.nil? ? "" : "WHERE #{WORKFLOW_KEY_SQL} IN (:keys)"
+      find_by_sql([ <<~SQL, { limit: limit, offset: offset, keys: workflow_keys } ])
         SELECT * FROM (
           SELECT DISTINCT ON (#{WORKFLOW_KEY_SQL}) *
           FROM #{table_name}
+          #{filter}
           ORDER BY #{WORKFLOW_KEY_SQL}, #{RECENCY_SQL} DESC, task_id DESC
         ) latest_runs
         ORDER BY #{RECENCY_SQL} DESC, task_id DESC
@@ -49,11 +53,11 @@ class CentaurWorkflowRun < CentaurSessionRecord
       SQL
     end
 
-    def workflow_count
-      count_by_sql(
-        "SELECT COUNT(*) FROM " \
-          "(SELECT DISTINCT #{WORKFLOW_KEY_SQL} FROM #{table_name}) workflow_keys"
-      )
+    def workflow_count(workflow_keys: nil)
+      return 0 if workflow_keys == []
+
+      filter = workflow_keys.nil? ? "" : "WHERE #{WORKFLOW_KEY_SQL} IN (:keys)"
+      count_by_sql([ "SELECT COUNT(*) FROM (SELECT DISTINCT #{WORKFLOW_KEY_SQL} FROM #{table_name} #{filter}) workflow_keys", { keys: workflow_keys } ])
     end
 
     # The most recent run per (workflow, queue) for the given workflow keys,

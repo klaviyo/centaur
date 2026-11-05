@@ -47,11 +47,13 @@ Rails.application.routes.draw do
   get "console/principals/:id", to: "console#principal", as: :console_principal
   namespace :console do
     resources :workflows, only: %i[index show] do
+      patch :access, on: :member
       member do
         post :run, action: :force_start
       end
     end
-    resources :scheduled_tasks, except: :show do
+    resources :scheduled_tasks do
+      patch :access, on: :member
       post :run, on: :member
       get :slack_channel_options,
           on: :collection,
@@ -255,7 +257,12 @@ Rails.application.routes.draw do
       namespace :sandbox do
         resource :permissions, only: :show
         resources :oauth_apps, only: :index
+        resources :workflows, only: %i[index show] do
+          patch :access, on: :member
+          post :run, on: :member
+        end
         resources :scheduled_tasks, only: %i[index show create update destroy] do
+          patch :access, on: :member
           post :run, on: :member
         end
         resources :skills, only: %i[index show create update destroy] do

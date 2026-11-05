@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_10_29_162508) do
+ActiveRecord::Schema[8.1].define(version: 2026_11_05_173120) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -395,9 +395,11 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_29_162508) do
     t.text "prompt", null: false
     t.string "timezone", default: "America/Los_Angeles", null: false
     t.datetime "updated_at", null: false
+    t.string "visibility", default: "private", null: false
     t.index ["author_id", "name"], name: "index_scheduled_tasks_on_author_id_and_name", unique: true
     t.index ["author_id"], name: "index_scheduled_tasks_on_author_id"
     t.index ["enabled", "next_run_at"], name: "index_scheduled_tasks_on_enabled_and_next_run_at"
+    t.check_constraint "visibility::text = ANY (ARRAY['private'::character varying, 'shared'::character varying]::text[])", name: "scheduled_tasks_visibility"
   end
 
   create_table "secret_sources", force: :cascade do |t|
@@ -597,6 +599,32 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_29_162508) do
     t.index ["email"], name: "index_users_on_email", unique: true
   end
 
+  create_table "workflow_accesses", force: :cascade do |t|
+    t.datetime "created_at", null: false
+    t.string "name", null: false
+    t.bigint "owner_id", null: false
+    t.datetime "updated_at", null: false
+    t.string "visibility", default: "private", null: false
+    t.index ["name"], name: "index_workflow_accesses_on_name", unique: true
+    t.index ["owner_id"], name: "index_workflow_accesses_on_owner_id"
+    t.check_constraint "name::text <> 'console_workflow'::text", name: "workflow_accesses_no_task_runner"
+    t.check_constraint "visibility::text = ANY (ARRAY['private'::character varying, 'shared'::character varying]::text[])", name: "workflow_accesses_visibility"
+  end
+
+  create_table "workflow_grants", force: :cascade do |t|
+    t.string "access", null: false
+    t.datetime "created_at", null: false
+    t.bigint "resource_id", null: false
+    t.string "resource_type", null: false
+    t.datetime "updated_at", null: false
+    t.bigint "user_id", null: false
+    t.index ["resource_type", "resource_id", "user_id", "access"], name: "index_workflow_grants_unique_access", unique: true
+    t.index ["resource_type", "resource_id"], name: "index_workflow_grants_on_resource"
+    t.index ["user_id"], name: "index_workflow_grants_on_user_id"
+    t.check_constraint "access::text = ANY (ARRAY['reader'::character varying, 'editor'::character varying]::text[])", name: "workflow_grants_access"
+    t.check_constraint "resource_type::text = ANY (ARRAY['ScheduledTask'::character varying, 'WorkflowAccess'::character varying]::text[])", name: "workflow_grants_resource_type"
+  end
+
   add_foreign_key "api_keys", "users"
   add_foreign_key "aws_auth_secrets", "users", column: "created_by_id"
   add_foreign_key "broker_credentials", "oauth_apps"
@@ -659,4 +687,6 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_29_162508) do
   add_foreign_key "thread_shares", "users", column: "created_by_id"
   add_foreign_key "user_identities", "users"
   add_foreign_key "users", "users", column: "approved_by_id"
+  add_foreign_key "workflow_accesses", "users", column: "owner_id"
+  add_foreign_key "workflow_grants", "users", on_delete: :cascade
 end

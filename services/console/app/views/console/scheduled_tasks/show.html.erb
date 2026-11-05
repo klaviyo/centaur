@@ -1,0 +1,11 @@
+<% content_for :title, "#{@task.name} · Scheduled" %>
+<%= render "console/page_header", title: @task.name, subtitle: "Runs as #{@task.author.name.presence || @task.author.email}", icon: "clock" %>
+<div class="console-panel mb-5 space-y-3 p-5">
+  <p class="text-sm text-zinc-300"><%= @task.schedule_label %> · <%= @task.delivery_channel %> · <%= @task.enabled? ? "Enabled" : "Disabled" %></p>
+  <pre class="whitespace-pre-wrap break-words text-sm text-zinc-300"><%= @task.prompt %></pre>
+  <% if @task.editable_by?(current_user) %>
+    <%= link_to "Edit", edit_console_scheduled_task_path(@task.oid), class: "btn-secondary" %>
+    <%= button_to "Run now", run_console_scheduled_task_path(@task.oid), method: :post, disabled: !@task.enabled?, class: "btn-secondary" %>
+  <% end %>
+</div>
+<%= render "console/shared/workflow_access", record: @task, url: access_console_scheduled_task_path(@task.oid) %>

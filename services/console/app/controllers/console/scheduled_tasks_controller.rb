@@ -1,10 +1,22 @@
 class Console::ScheduledTasksController < ApplicationController
   layout "console"
-  before_action :set_task, only: %i[edit update destroy run]
+  before_action :set_task, only: %i[show edit update destroy run access]
 
   def index
-    @tasks = current_user.scheduled_tasks.order(:name, :id)
+    @tasks = ScheduledTask.readable_by(current_user).order(:name, :id)
     @slack_destination_names = slack_destination_names
+  end
+
+  def show
+  end
+
+  def access
+    raise ActiveRecord::RecordNotFound unless @task.author == current_user
+
+    @task.replace_access!(params.require(:access).permit(:visibility, reader_oids: [], editor_oids: []))
+    redirect_to console_scheduled_task_path(@task.oid), notice: "Access saved."
+  rescue ActiveRecord::RecordInvalid => e
+    redirect_to console_scheduled_task_path(@task.oid), alert: e.message
   end
 
   def new
@@ -39,6 +51,8 @@ class Console::ScheduledTasksController < ApplicationController
   end
 
   def destroy
+    raise ActiveRecord::RecordNotFound unless @task.author == current_user
+
     @task.destroy!
     redirect_to console_scheduled_tasks_path, notice: "Task deleted."
   end
@@ -55,7 +69,10 @@ class Console::ScheduledTasksController < ApplicationController
   private
 
   def set_task
-    @task = current_user.scheduled_tasks.find_by_oid!(params[:id])
+    @task = ScheduledTask.readable_by(current_user).find_by_oid!(params[:id])
+    if %w[edit update run].include?(action_name) && !@task.editable_by?(current_user)
+      raise ActiveRecord::RecordNotFound
+    end
   end
 
   def task_attributes
@@ -79,7 +96,7 @@ class Console::ScheduledTasksController < ApplicationController
   end
 
   def delivery_channel_for(delivery_mode, channel_id)
-    return SlackDeliveryPolicy.new(current_user).direct_message_user_id if delivery_mode == "dm"
+    return SlackDeliveryPolicy.new(@task&.author || current_user).direct_message_user_id if delivery_mode == "dm"
     return channel_id if delivery_mode == "channel"
 
     nil
@@ -99,7 +116,7 @@ class Console::ScheduledTasksController < ApplicationController
   end
 
   def prepare_form
-    @slack_dm_user_id = SlackDeliveryPolicy.new(current_user).direct_message_user_id
+    @slack_dm_user_id = SlackDeliveryPolicy.new(@task&.author || current_user).direct_message_user_id
     submitted_schedule = params[:scheduled_task]
     @schedule_preset = submitted_schedule&.[](:schedule_preset).presence || @task.schedule_preset
     @custom_schedule_days = if submitted_schedule&.key?(:custom_days)
