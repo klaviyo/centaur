@@ -289,6 +289,24 @@ class Console::ScheduledTasksControllerTest < ActionDispatch::IntegrationTest
     assert_response :not_found
   end
 
+  test "admin cannot manage sharing for an inactive scheduled task author" do
+    task = create_task
+    admin = users(:globex_admin)
+    task.replace_access!(reader_oids: [ admin.oid ])
+    @operator.update!(status: :disabled)
+    delete logout_url
+    post login_url, params: { email: admin.email, password: "password123456" }
+
+    get console_scheduled_task_url(task.oid)
+    assert_response :ok
+    assert_select "form[action=?]", access_console_scheduled_task_path(task.oid), count: 0
+
+    patch access_console_scheduled_task_url(task.oid), params: { access: { visibility: "shared" } }
+    assert_response :not_found
+    assert task.reload.visibility_private?
+    assert_equal @operator, task.author
+  end
+
   private
 
   def task_params

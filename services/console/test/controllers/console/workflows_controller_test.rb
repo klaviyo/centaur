@@ -221,13 +221,38 @@ class Console::WorkflowsControllerTest < ActionDispatch::IntegrationTest
     editor = users(:member_user)
     record = WorkflowAccess.create!(name: "echo", owner: @operator)
     record.replace_access!(editor_oids: [ editor.oid ])
-    client = FakeApiClient.new
+    registered_input = { "principal" => "configured-principal", "mode" => "incremental" }
+    client = FakeApiClient.new(schedules: [ { "workflow_name" => "echo", "input" => registered_input } ])
     with_api_client(client)
     delete logout_url
     post login_url, params: { email: editor.email, password: "password123456" }
     post run_console_workflow_url("echo"), params: { input: { principal: "spoofed" } }
     assert_redirected_to console_workflow_url("echo")
-    assert_equal [ { workflow_name: "echo", input: nil } ], client.created_runs
+    assert_equal [ { workflow_name: "echo", input: registered_input } ], client.created_runs
+  end
+
+  test "admin sharing controls appear only for an inactive workflow owner" do
+    owner = users(:globex_admin)
+    reader = users(:member_user)
+    record = WorkflowAccess.create!(name: "echo", owner: owner)
+    record.replace_access!(reader_oids: [ reader.oid ])
+
+    with_workflow_history("echo", runs: [ fake_run ]) do
+      get console_workflow_url("echo")
+      assert_response :ok
+      assert_select "form[action=?]", access_console_workflow_path("echo"), count: 0
+
+      owner.update!(status: :disabled)
+      get console_workflow_url("echo")
+      assert_response :ok
+      assert_select "form[action=?]", access_console_workflow_path("echo"), count: 1
+
+      delete logout_url
+      post login_url, params: { email: reader.email, password: "password123456" }
+      get console_workflow_url("echo")
+      assert_response :ok
+      assert_select "form[action=?]", access_console_workflow_path("echo"), count: 0
+    end
   end
 
   private

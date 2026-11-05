@@ -1,4 +1,4 @@
-<% if record.sharing_owner == current_user %>
+<% if record.sharing_owner == current_user || (local_assigns[:allow_inactive_owner_admin] && acting_admin? && !record.sharing_owner.active?) %>
   <%= form_with url: url, method: :patch, scope: :access, class: "console-panel space-y-4 p-5" do |form| %>
     <h2 class="text-sm font-semibold text-zinc-200">Sharing</h2>
     <%= form.label :visibility, "Visibility", class: "block text-sm text-zinc-300" %>
@@ -11,6 +11,9 @@
       </div>
     <% end %>
     <p class="text-xs text-zinc-400">Readers can view. Editors can edit task prompts and schedules and trigger runs. Only the owner can manage access or delete tasks. Granting editor access delegates execution with the task author's credentials; workflow runs keep their configured identity. Hold Command or Control to select multiple users.</p>
+    <% if local_assigns[:allow_inactive_owner_admin] %>
+      <p class="text-xs text-zinc-400">Administrators can also manage workflow access when its owner is inactive.</p>
+    <% end %>
     <%= form.submit "Save access", class: "btn-primary" %>
   <% end %>
 <% end %>

@@ -207,7 +207,7 @@
 <% end %>
 
 <% if @workflow_access %>
-  <%= render "console/shared/workflow_access", record: @workflow_access, url: access_console_workflow_path(@workflow_name) %>
+  <%= render "console/shared/workflow_access", record: @workflow_access, url: access_console_workflow_path(@workflow_name), allow_inactive_owner_admin: true %>
 <% elsif acting_admin? && @latest_run.present? && @workflow_name != ScheduledTask::WORKFLOW_NAME %>
   <%= form_with url: access_console_workflow_path(@workflow_name), method: :patch, scope: :access, class: "console-panel space-y-4 p-5" do |form| %>
     <%= form.label :owner_oid, "Assign workflow owner", class: "block text-sm text-zinc-300" %>

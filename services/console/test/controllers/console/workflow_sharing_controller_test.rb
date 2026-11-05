@@ -37,6 +37,36 @@ class Console::WorkflowSharingControllerTest < ActionDispatch::IntegrationTest
     assert_response :not_found
   end
 
+  test "admin can recover access only when the workflow owner is inactive" do
+    sign_in(@editor)
+    patch access_console_workflow_url(@workflow.name), params: { access: { reader_oids: [] } }
+    assert_response :not_found
+    assert @workflow.workflow_grants.exists?(user: @reader, access: "reader")
+
+    @owner.update!(status: :disabled)
+    patch access_console_workflow_url(@workflow.name), params: {
+      access: { visibility: "shared", reader_oids: [], editor_oids: [ @reader.oid ], owner_oid: @editor.oid }
+    }
+    assert_redirected_to console_workflow_url(@workflow.name)
+    assert @workflow.reload.visibility_shared?
+    assert_equal @owner, @workflow.owner
+    assert_not @workflow.workflow_grants.exists?(access: "reader")
+    assert @workflow.editable_by?(@reader)
+    assert_not @workflow.editable_by?(@editor)
+  end
+
+  test "non-admin editor cannot recover access for an inactive workflow owner" do
+    @workflow.replace_access!(reader_oids: [], editor_oids: [ @reader.oid ])
+    @owner.update!(status: :disabled)
+    sign_in(@reader)
+
+    patch access_console_workflow_url(@workflow.name), params: { access: { visibility: "shared" } }
+
+    assert_response :not_found
+    assert @workflow.reload.visibility_private?
+    assert_equal @owner, @workflow.owner
+  end
+
   private
 
   def sign_in(user)

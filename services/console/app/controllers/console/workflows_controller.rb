@@ -112,7 +112,8 @@ class Console::WorkflowsController < ApplicationController
       owner = User.active.find_by_oid!(attributes.delete(:owner_oid))
       record = WorkflowAccess.new(name: params[:id], owner: owner)
     else
-      raise ActiveRecord::RecordNotFound unless record.owner == current_user
+      raise ActiveRecord::RecordNotFound unless record.owner == current_user ||
+        (acting_admin? && !record.owner.active?)
     end
     record.replace_access!(attributes)
     redirect_to console_workflow_path(record.name), notice: "Access saved."
