@@ -133,7 +133,7 @@ class Console::ScheduledTasksController < ApplicationController
       user_id = SlackDeliveryPolicy.new(task.author).direct_message_user_id
       next unless task.delivery_channel == user_id
 
-      names[user_id] = "Direct message to you"
+      names[user_id] = task.author == current_user ? "Direct message to you" : "Direct message to task author"
     end
     names
   rescue StandardError => e

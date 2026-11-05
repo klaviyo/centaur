@@ -176,6 +176,26 @@ class Console::ScheduledTasksControllerTest < ActionDispatch::IntegrationTest
     assert_select "td", text: /U0123456789/
   end
 
+  test "shared task viewers see the author's DM destination without being called the recipient" do
+    task = create_task
+    task.update!(delivery_channel: "U0123456789")
+    reader = users(:member_user)
+    editor = users(:globex_admin)
+    task.replace_access!(reader_oids: [ reader.oid ], editor_oids: [ editor.oid ])
+
+    [ reader, editor ].each do |viewer|
+      delete logout_url
+      post login_url, params: { email: viewer.email, password: "password123456" }
+
+      get console_scheduled_tasks_url
+
+      assert_response :ok
+      assert_select "td", text: /Direct message to task author/
+      assert_select "td", text: /Direct message to you/, count: 0
+      assert_select "td", text: /U0123456789/
+    end
+  end
+
   test "queues a manual run" do
     task = create_task
 
