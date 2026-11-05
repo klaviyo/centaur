@@ -184,7 +184,7 @@ class Console::WorkflowsControllerTest < ActionDispatch::IntegrationTest
 
     post run_console_workflow_url("slack_sync")
 
-    assert_redirected_to console_integrations_path
+    assert_response :not_found
     assert_empty client.created_runs
   end
 
@@ -195,6 +195,64 @@ class Console::WorkflowsControllerTest < ActionDispatch::IntegrationTest
 
     assert_response :not_found
     assert_select "body", text: /No workflow runs found for missing/
+  end
+
+  test "shared reader views only granted workflow and cannot trigger it" do
+    reader = users(:member_user)
+    record = WorkflowAccess.create!(name: "echo", owner: @operator)
+    record.replace_access!(reader_oids: [ reader.oid ])
+    delete logout_url
+    post login_url, params: { email: reader.email, password: "password123456" }
+    run = fake_run
+    with_workflow_history("echo", runs: [ run ]) do
+      get console_workflow_url("echo")
+    end
+    assert_response :ok
+    assert_select "h1", text: "echo"
+    assert_select "form[action=?]", run_console_workflow_path("echo"), count: 0
+    assert_select "form[action=?]", access_console_workflow_path("echo"), count: 0
+    post run_console_workflow_url("echo")
+    assert_response :not_found
+    get console_workflow_url("unshared")
+    assert_response :not_found
+  end
+
+  test "non-admin editor may trigger regular workflow using registered schedule input" do
+    editor = users(:member_user)
+    record = WorkflowAccess.create!(name: "echo", owner: @operator)
+    record.replace_access!(editor_oids: [ editor.oid ])
+    registered_input = { "principal" => "configured-principal", "mode" => "incremental" }
+    client = FakeApiClient.new(schedules: [ { "workflow_name" => "echo", "input" => registered_input } ])
+    with_api_client(client)
+    delete logout_url
+    post login_url, params: { email: editor.email, password: "password123456" }
+    post run_console_workflow_url("echo"), params: { input: { principal: "spoofed" } }
+    assert_redirected_to console_workflow_url("echo")
+    assert_equal [ { workflow_name: "echo", input: registered_input } ], client.created_runs
+  end
+
+  test "admin sharing controls appear only for an inactive workflow owner" do
+    owner = users(:globex_admin)
+    reader = users(:member_user)
+    record = WorkflowAccess.create!(name: "echo", owner: owner)
+    record.replace_access!(reader_oids: [ reader.oid ])
+
+    with_workflow_history("echo", runs: [ fake_run ]) do
+      get console_workflow_url("echo")
+      assert_response :ok
+      assert_select "form[action=?]", access_console_workflow_path("echo"), count: 0
+
+      owner.update!(status: :disabled)
+      get console_workflow_url("echo")
+      assert_response :ok
+      assert_select "form[action=?]", access_console_workflow_path("echo"), count: 1
+
+      delete logout_url
+      post login_url, params: { email: reader.email, password: "password123456" }
+      get console_workflow_url("echo")
+      assert_response :ok
+      assert_select "form[action=?]", access_console_workflow_path("echo"), count: 0
+    end
   end
 
   private

@@ -84,6 +84,27 @@ class ScheduledTaskJobsTest < ActiveJob::TestCase
     assert_equal Time.utc(2026, 8, 19, 12, 5), task.last_run_at
   end
 
+  test "shared task keeps author principal after editor changes the prompt" do
+    task = create_task
+    editor = users(:member_user)
+    task.replace_access!(editor_oids: [ editor.oid ])
+    ScheduledTask.editable_by(editor).find(task.id).update!(prompt: "Updated by a delegated editor")
+    client = FakeApiClient.new
+    ScheduledTaskRunJob.client_factory = -> { client }
+    ScheduledTaskRunJob.perform_now(task.id)
+    assert_equal task.author, task.execution_principal.console_user
+    assert_equal task.execution_principal.foreign_id, client.requests.first.dig(:input, :principal)
+  end
+
+  test "disabled author cannot execute a previously queued shared task" do
+    task = create_task
+    task.author.update!(status: :disabled)
+    client = FakeApiClient.new
+    ScheduledTaskRunJob.client_factory = -> { client }
+    assert_raises(ScheduledTask::DeliveryDestinationUnavailable) { ScheduledTaskRunJob.perform_now(task.id) }
+    assert_empty client.requests
+  end
+
   test "runner skips a task disabled after it was enqueued" do
     task = create_task
     task.update!(enabled: false)

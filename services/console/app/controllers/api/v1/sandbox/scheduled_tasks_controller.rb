@@ -6,12 +6,12 @@ module Api
         before_action :disable_caching
 
         def index
-          tasks = task_author.scheduled_tasks.order(:name, :id)
+          tasks = ScheduledTask.readable_by(task_author).order(:name, :id)
           render json: { data: tasks.map { |task| task_payload(task) } }
         end
 
         def show
-          render json: { data: task_payload(owned_task) }
+          render json: { data: task_payload(readable_task) }
         end
 
         def create
@@ -20,7 +20,7 @@ module Api
         end
 
         def update
-          task = owned_task
+          task = editable_task
           task.update!(task_attributes)
           render json: { data: task_payload(task) }
         end
@@ -31,7 +31,7 @@ module Api
         end
 
         def run
-          task = owned_task
+          task = editable_task
           unless task.enabled?
             return render_error(status: :unprocessable_entity, message: "scheduled task is disabled")
           end
@@ -42,6 +42,11 @@ module Api
           end
 
           render json: { data: task_payload(task).merge(queued: true) }, status: :accepted
+        end
+
+        def access
+          owned_task.replace_access!(params.require(:data).permit(:visibility, reader_oids: [], editor_oids: []))
+          render json: { data: task_payload(readable_task) }
         end
 
         private
@@ -63,6 +68,14 @@ module Api
           @task_author = user if user&.active?
         end
 
+        def readable_task
+          ScheduledTask.readable_by(task_author).find_by_oid!(params[:id])
+        end
+
+        def editable_task
+          ScheduledTask.editable_by(task_author).find_by_oid!(params[:id])
+        end
+
         def owned_task
           task_author.scheduled_tasks.find_by_oid!(params[:id])
         end
@@ -76,7 +89,7 @@ module Api
             :enabled
           )
           if attributes[:delivery_channel].to_s.strip.casecmp?("dm")
-            attributes[:delivery_channel] = SlackDeliveryPolicy.new(task_author).direct_message_user_id
+            attributes[:delivery_channel] = SlackDeliveryPolicy.new(params[:id].present? ? editable_task.author : task_author).direct_message_user_id
           end
           attributes
         end
@@ -84,6 +97,7 @@ module Api
         def task_payload(task)
           {
             id: task.oid,
+            access: task.access_payload,
             name: task.name,
             prompt: task.prompt,
             delivery_channel: task.delivery_channel,

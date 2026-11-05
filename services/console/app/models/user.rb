@@ -15,6 +15,8 @@ class User < ApplicationRecord
   has_many :skills, dependent: :destroy
   has_many :skill_reader_assignments, class_name: "SkillReader", dependent: :destroy
   has_many :readable_skills, through: :skill_reader_assignments, source: :skill
+  has_many :workflow_grants, dependent: :destroy
+  has_many :owned_workflow_accesses, class_name: "WorkflowAccess", foreign_key: :owner_id, dependent: :restrict_with_error
   has_many :scheduled_tasks, foreign_key: :author_id, dependent: :restrict_with_error
   has_many :skill_editor_assignments, class_name: "SkillEditor", dependent: :destroy
   has_many :edited_skills, through: :skill_editor_assignments, source: :skill

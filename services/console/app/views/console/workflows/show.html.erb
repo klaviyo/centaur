@@ -30,9 +30,11 @@
         <%= status.tr("_", " ") %>
       </span>
       <div class="ml-auto">
+        <% if acting_admin? || @workflow_access&.editable_by?(current_user) %>
         <%= button_to "Manually Trigger", run_console_workflow_path(@workflow_name), method: :post,
               class: "btn-primary",
               data: { turbo_confirm: "Manually trigger a #{@workflow_name} run?#{schedule ? " It starts with the registered schedule input." : ""}" } %>
+        <% end %>
       </div>
     </div>
     <div class="mt-2 flex flex-wrap items-center gap-2 text-sm">
@@ -202,4 +204,15 @@
                total_count: @filtered_count.to_i,
                unit: "run" %>
   </section>
+<% end %>
+
+<% if @workflow_access %>
+  <%= render "console/shared/workflow_access", record: @workflow_access, url: access_console_workflow_path(@workflow_name), allow_inactive_owner_admin: true %>
+<% elsif acting_admin? && @latest_run.present? && @workflow_name != ScheduledTask::WORKFLOW_NAME %>
+  <%= form_with url: access_console_workflow_path(@workflow_name), method: :patch, scope: :access, class: "console-panel space-y-4 p-5" do |form| %>
+    <%= form.label :owner_oid, "Assign workflow owner", class: "block text-sm text-zinc-300" %>
+    <%= form.select :owner_oid, User.active.order(:email).map { |user| [user.name.presence || user.email, user.oid] }, {}, class: "form-input" %>
+    <p class="text-xs text-zinc-400">The owner can share run history and delegate triggering. Source code, registered schedules, runtime identity, and starter restrictions remain managed by deployment.</p>
+    <%= form.submit "Assign owner", class: "btn-primary" %>
+  <% end %>
 <% end %>

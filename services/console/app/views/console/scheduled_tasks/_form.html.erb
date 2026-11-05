@@ -56,7 +56,7 @@
                                slack_channel_autocomplete_target: "deliveryMode",
                                action: "slack-channel-autocomplete#deliveryModeChanged"
                              } %>
-        <span>Deliver to my DM</span>
+        <span>Deliver to the task author’s DM</span>
       </label>
       <label class="flex items-center gap-2 text-sm text-zinc-300">
         <%= radio_button_tag "scheduled_task[delivery_mode]",
@@ -79,7 +79,7 @@
                  attribute: :delivery_channel,
                  picker_id: delivery_channel_picker_id,
                  display_value: delivery_mode == "channel" ? task.delivery_channel.presence : nil %>
-      <p class="text-xs text-zinc-500">Public channels are always available. Private channels require both you and the Centaur bot to be members.</p>
+      <p class="text-xs text-zinc-500">Delivery is checked against the task author. Private channels require both the author and the Centaur bot to be members.</p>
     </div>
     <% if @slack_dm_user_id.blank? %>
       <p class="mt-2 text-xs text-zinc-500">Connect your Slack account to deliver to your DM.</p>

@@ -159,7 +159,7 @@ class Console::ScheduledTasksControllerTest < ActionDispatch::IntegrationTest
     assert_response :ok
     assert_select ".console-thread-group-title-active", text: /Scheduled/
     assert_select "h1", text: "Scheduled Tasks"
-    assert_select "a[href=?]", edit_console_scheduled_task_path(task.oid), text: task.name
+    assert_select "a[href=?]", console_scheduled_task_path(task.oid), text: task.name
     assert_select "td", text: /0 \* \* \* \*/
     assert_select "td", text: /#general/
     assert_select "td", text: /#{task.delivery_channel}/
@@ -174,6 +174,26 @@ class Console::ScheduledTasksControllerTest < ActionDispatch::IntegrationTest
     assert_response :ok
     assert_select "td", text: /Direct message to you/
     assert_select "td", text: /U0123456789/
+  end
+
+  test "shared task viewers see the author's DM destination without being called the recipient" do
+    task = create_task
+    task.update!(delivery_channel: "U0123456789")
+    reader = users(:member_user)
+    editor = users(:globex_admin)
+    task.replace_access!(reader_oids: [ reader.oid ], editor_oids: [ editor.oid ])
+
+    [ reader, editor ].each do |viewer|
+      delete logout_url
+      post login_url, params: { email: viewer.email, password: "password123456" }
+
+      get console_scheduled_tasks_url
+
+      assert_response :ok
+      assert_select "td", text: /Direct message to task author/
+      assert_select "td", text: /Direct message to you/, count: 0
+      assert_select "td", text: /U0123456789/
+    end
   end
 
   test "queues a manual run" do
@@ -247,6 +267,44 @@ class Console::ScheduledTasksControllerTest < ActionDispatch::IntegrationTest
       delete console_scheduled_task_url(task.oid)
     end
     assert_redirected_to console_scheduled_tasks_path
+  end
+
+  test "reader sees shared task without execution editing deletion or sharing controls" do
+    task = create_task
+    reader = users(:member_user)
+    task.replace_access!(reader_oids: [ reader.oid ])
+    delete logout_url
+    post login_url, params: { email: reader.email, password: "password123456" }
+    get console_scheduled_task_url(task.oid)
+    assert_response :ok
+    assert_select "pre", text: task.prompt
+    assert_select "form[action=?]", run_console_scheduled_task_path(task.oid), count: 0
+    assert_select "form[action=?]", access_console_scheduled_task_path(task.oid), count: 0
+    get edit_console_scheduled_task_url(task.oid)
+    assert_response :not_found
+    post run_console_scheduled_task_url(task.oid)
+    assert_response :not_found
+    task.replace_access!(reader_oids: [])
+    get console_scheduled_task_url(task.oid)
+    assert_response :not_found
+  end
+
+  test "admin cannot manage sharing for an inactive scheduled task author" do
+    task = create_task
+    admin = users(:globex_admin)
+    task.replace_access!(reader_oids: [ admin.oid ])
+    @operator.update!(status: :disabled)
+    delete logout_url
+    post login_url, params: { email: admin.email, password: "password123456" }
+
+    get console_scheduled_task_url(task.oid)
+    assert_response :ok
+    assert_select "form[action=?]", access_console_scheduled_task_path(task.oid), count: 0
+
+    patch access_console_scheduled_task_url(task.oid), params: { access: { visibility: "shared" } }
+    assert_response :not_found
+    assert task.reload.visibility_private?
+    assert_equal @operator, task.author
   end
 
   private

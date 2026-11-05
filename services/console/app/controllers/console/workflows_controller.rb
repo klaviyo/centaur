@@ -1,6 +1,6 @@
 class Console::WorkflowsController < ApplicationController
   layout "console"
-  before_action :require_admin
+  before_action :authorize_workflow
 
   class_attribute :client_factory, default: -> { CentaurApiClient.new }
 
@@ -18,13 +18,14 @@ class Console::WorkflowsController < ApplicationController
       return
     end
 
-    @total_workflows = CentaurWorkflowRun.workflow_count
+    @total_workflows = acting_admin? ? CentaurWorkflowRun.workflow_count : CentaurWorkflowRun.workflow_count(workflow_keys: visible_workflow_names)
     @total_pages = [ (@total_workflows.to_f / PER_PAGE).ceil, 1 ].max
     @page = [ @page, @total_pages ].min
 
     @workflow_runs = CentaurWorkflowRun.latest_per_workflow(
       limit: PER_PAGE,
-      offset: (@page - 1) * PER_PAGE
+      offset: (@page - 1) * PER_PAGE,
+      **(acting_admin? ? {} : { workflow_keys: visible_workflow_names })
     )
     @queue_breakdown = CentaurWorkflowRun.latest_per_queue(@workflow_runs.map(&:workflow_key))
   rescue ActiveRecord::ActiveRecordError, PG::Error => e
@@ -35,6 +36,7 @@ class Console::WorkflowsController < ApplicationController
   end
 
   def show
+    @workflow_access = WorkflowAccess.find_by(name: params[:id])
     @workflow_db_unavailable = false
     @workflow_name = params[:id].to_s
     @workflow_runs = []
@@ -101,7 +103,43 @@ class Console::WorkflowsController < ApplicationController
     redirect_to console_workflow_path(workflow_name), alert: "Could not start workflow: #{e.message}"
   end
 
+  def access
+    record = WorkflowAccess.find_by(name: params[:id])
+    attributes = params.require(:access).permit(:owner_oid, :visibility, reader_oids: [], editor_oids: [])
+    if record.nil?
+      raise ActiveRecord::RecordNotFound unless acting_admin? && CentaurWorkflowRun.for_workflow(params[:id], limit: 1).any?
+
+      owner = User.active.find_by_oid!(attributes.delete(:owner_oid))
+      record = WorkflowAccess.new(name: params[:id], owner: owner)
+    else
+      raise ActiveRecord::RecordNotFound unless record.owner == current_user ||
+        (acting_admin? && !record.owner.active?)
+    end
+    record.replace_access!(attributes)
+    redirect_to console_workflow_path(record.name), notice: "Access saved."
+  rescue ActiveRecord::RecordInvalid => e
+    redirect_to console_workflow_path(params[:id]), alert: e.message
+  end
+
   private
+
+  def authorize_workflow
+    return if acting_admin?
+    if action_name == "index"
+      require_admin unless WorkflowAccess.readable_by(current_user).exists?
+      return
+    end
+
+    @workflow_access = WorkflowAccess.readable_by(current_user).find_by!(name: params[:id])
+    if action_name == "force_start" && !@workflow_access.editable_by?(current_user)
+      raise ActiveRecord::RecordNotFound
+    end
+  end
+
+  def visible_workflow_names
+    WorkflowAccess.readable_by(current_user).pluck(:name)
+  end
+
 
   # Best-effort enrichment from the workflows API: the registered schedule
   # (cron/interval, source path for the GitHub link) and the latest run's

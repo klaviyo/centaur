@@ -1469,22 +1469,39 @@ Returns `201`. The plaintext `token` is included **only** in this create respons
 
 ## Scheduled Tasks
 
-Tasks run one agent prompt and deliver the result to Slack. A task may have a five-field cron schedule in Pacific Time; omitting `cron_expression` or sending `null` or an empty string makes it manual-only. Task IDs use the `tsk_` prefix. The `delivery_channel` can be a Slack channel ID available to the task author, or the special value `dm`, which resolves to the linked user's Slack direct message when the task is created or updated.
+Tasks run one agent prompt and deliver the result to Slack. A task may have a five-field cron schedule in Pacific Time; omitting `cron_expression` or sending `null` or an empty string makes it manual-only. Task IDs use the `tsk_` prefix. The `delivery_channel` can be a Slack channel ID available to the task author, or the special value `dm`, which resolves to the task author’s Slack direct message, including when an editor updates the task.
 
-These endpoints use the sandbox entitlement JWT injected by `iron-proxy`. Every operation requires an active Console user linked to the sandbox principal and is scoped to tasks owned by that user. A task owned by another user returns `404`.
+These endpoints use the sandbox entitlement JWT injected by `iron-proxy`. Every operation requires an active Console user linked to the sandbox principal. Tasks default to private: the author manages access and deletion, readers can list/read, and editors can change prompts/schedules/delivery and trigger runs. Unshared tasks return `404`. Sharing with an editor delegates execution using the original author’s credentials; delivery is checked against that author at save and dispatch. Disabled authors cannot execute tasks. Visibility `shared` grants read-only access to all active Console users.
 
 | Method | Path | Notes |
 | ------ | ---- | ----- |
-| `GET` | `/api/v1/sandbox/scheduled_tasks` | List the linked user's tasks. |
-| `GET` | `/api/v1/sandbox/scheduled_tasks/:id` | Read one owned task by `tsk_...` OID. |
+| `GET` | `/api/v1/sandbox/scheduled_tasks` | List owned tasks and tasks shared with the linked user. |
+| `GET` | `/api/v1/sandbox/scheduled_tasks/:id` | Read one accessible task by `tsk_...` OID. |
 | `POST` | `/api/v1/sandbox/scheduled_tasks` | Create a task from `data.name`, `data.prompt`, `data.delivery_channel`, and optional `data.cron_expression` and `data.enabled`. |
 | `PUT`/`PATCH` | `/api/v1/sandbox/scheduled_tasks/:id` | Update any supplied task fields. Set `data.cron_expression` to `null` or an empty string to make the task manual-only. |
 | `DELETE` | `/api/v1/sandbox/scheduled_tasks/:id` | Delete an owned task. Returns `204`. |
 | `POST` | `/api/v1/sandbox/scheduled_tasks/:id/run` | Queue an immediate run. Returns `202`; disabled tasks return `422`. |
 
+`PATCH /api/v1/sandbox/scheduled_tasks/:id/access` is owner-only. Send `data.visibility` (`private` or `shared`), `data.reader_oids`, and/or `data.editor_oids`. Arrays replace that role's membership; an empty array revokes all grants for that role, omitted fields remain unchanged. Members must be active users other than the owner. Task responses include `access` with owner OID, visibility, and reader/editor OID arrays. Revocation applies on the next request.
+
 The admin API also exposes `GET /api/v1/scheduled_tasks/:id` for scheduled workflows to read the task's current ID, enabled state, and delivery channel. It requires an active admin API key, returns `404` for deleted tasks, and sets `Cache-Control: no-store`.
 
 Responses include the task's optional cron expression, fixed timezone, human-readable schedule, enabled state, next run time, and latest run metadata. The `centaur-console` CLI exposes the same operations through `tasks`, `task`, `create-task`, `update-task`, `delete-task`, and `run-task`. Omit `--cron` when creating a manual-only task, or pass `update-task --cron ""` to remove an existing recurring schedule.
+
+## Workflow sharing
+
+Registered workflows default to the existing admin-only Console dashboard. On a workflow's run page an admin can assign an active Console owner; that owner can set visibility and readers/editors through the Sharing form. If the workflow owner becomes inactive, an administrator can manage its visibility and grants without transferring ownership or changing its deployed execution identity. This recovery exception does not apply to scheduled tasks. Readers can inspect that workflow's run history and details; editors and the owner can trigger runs. Workflow source, recurring schedule declarations, runtime identity, and starter restrictions are managed through deployment rather than this ACL. Sharing grants access to the workflow's complete run history and configured execution authority, so owners should share deliberately. The aggregate `console_workflow` runner cannot be shared because it contains every user's scheduled task runs; share individual scheduled tasks instead.
+
+The sandbox entitlement JWT API requires the principal’s existing `sandbox_workflows_read_enabled` capability for reads and `sandbox_workflows_write_enabled` for runs/access changes, in addition to the user ACL. It exposes:
+
+| Method | Path | Notes |
+| ------ | ---- | ----- |
+| `GET` | `/api/v1/sandbox/workflows` | List accessible workflow names and access metadata. |
+| `GET` | `/api/v1/sandbox/workflows/:name` | Read access metadata and whether the user can run. |
+| `POST` | `/api/v1/sandbox/workflows/:name/run` | Owner/editor only; uses the registered schedule input or no input for an unscheduled workflow. Caller-supplied input/principal is ignored. |
+| `PATCH` | `/api/v1/sandbox/workflows/:name/access` | Owner-only; same visibility/reader/editor fields as task access. |
+
+Unshared resources return `404`; unlinked or disabled Console users return `403`. Existing privileged operator APIs remain separate from per-user sharing. Scheduled workflows continue on their configured runtime identity and schedule; sharing never transfers ownership or credentials to the caller.
 
 ## Skills
 

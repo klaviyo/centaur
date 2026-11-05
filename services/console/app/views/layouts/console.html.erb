@@ -974,7 +974,7 @@
             </a>
           </div>
 
-          <% if acting_admin? %>
+          <% if acting_admin? || WorkflowAccess.readable_by(current_user).exists? %>
             <div class="console-thread-group">
               <a href="<%= console_workflows_path %>"
                  class="console-thread-group-title <%= "console-thread-group-title-active" if workflows_view %>"
