@@ -66,6 +66,17 @@
     </article>
   </section>
 
+  <% if owned && @skill.readers.active.any? %>
+    <section aria-labelledby="skill-readers-heading">
+      <h2 id="skill-readers-heading" class="mb-3 text-sm font-semibold text-zinc-100">Readers</h2>
+      <ul class="space-y-2 text-sm text-zinc-400">
+        <% @skill.readers.active.order(:email).each do |reader| %>
+          <li><%= reader.name.present? ? "#{reader.name} (#{reader.email})" : reader.email %></li>
+        <% end %>
+      </ul>
+    </section>
+  <% end %>
+
   <% if @skill.editors.active.any? %>
     <section aria-labelledby="skill-editors-heading">
       <h2 id="skill-editors-heading" class="mb-3 text-sm font-semibold text-zinc-100">Editors</h2>

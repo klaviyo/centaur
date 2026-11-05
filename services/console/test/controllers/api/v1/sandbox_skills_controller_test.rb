@@ -427,6 +427,120 @@ class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
     assert_response :unauthorized
   end
 
+  test "reader sees private skill in list search and reads by name and OID" do
+    skill = skills(:other_private)
+    skill.readers << users(:member_user)
+    with_token(@member_proxy) do |headers|
+      get "/api/v1/sandbox/skills", params: { scope: "private" }, headers: headers
+      assert_response :ok
+      assert_includes json_body.fetch("data").map { |row| row.fetch("id") }, skill.oid
+
+      get "/api/v1/sandbox/skills/search", params: { q: "finance" }, headers: headers
+      assert_response :ok
+      assert_equal [ skill.oid ], json_body.fetch("data").map { |row| row.fetch("id") }
+
+      [ skill.name, skill.oid ].each do |identifier|
+        get "/api/v1/sandbox/skills/#{identifier}", headers: headers
+        assert_response :ok
+        assert_equal skill.skill_document, json_body.dig("data", "document")
+      end
+    end
+    with_token(@channel_proxy) do |headers|
+      get "/api/v1/sandbox/skills/#{skill.oid}", headers: headers
+    end
+    assert_response :not_found
+  end
+
+  test "reader cannot edit archive share unshare or manage access" do
+    skill = skills(:other_private)
+    skill.readers << users(:member_user)
+    with_token(@member_proxy) do |headers|
+      patch "/api/v1/sandbox/skills/#{skill.oid}", params: { data: { instructions: "Changed" } }, headers: headers, as: :json
+      assert_response :not_found
+      delete "/api/v1/sandbox/skills/#{skill.oid}", headers: headers
+      assert_response :not_found
+      %w[share unshare readers editors].each do |operation|
+        post "/api/v1/sandbox/skills/#{skill.oid}/#{operation}", params: { data: { user: users(:globex_admin).oid } }, headers: headers, as: :json
+        assert_response :not_found
+      end
+      get "/api/v1/sandbox/skills/#{skill.oid}/readers", headers: headers
+      assert_response :not_found
+      delete "/api/v1/sandbox/skills/#{skill.oid}/readers", params: { data: { user: users(:member_user).oid } }, headers: headers, as: :json
+      assert_response :not_found
+    end
+    assert_equal [ users(:member_user) ], skill.reload.readers.to_a
+    assert_nil skill.archived_at
+    assert_not skill.shared?
+  end
+
+  test "owner manages read ACL by email and OID with idempotent changes" do
+    skill = skills(:member_private)
+    reader = users(:globex_admin)
+    version = skill.lock_version
+    with_token(@member_proxy) do |headers|
+      2.times do
+        post "/api/v1/sandbox/skills/#{skill.oid}/readers", params: { data: { user: reader.email.upcase } }, headers: headers, as: :json
+        assert_response :ok
+        assert_equal version + 1, json_body.dig("data", "lock_version")
+      end
+      get "/api/v1/sandbox/skills/#{skill.oid}/readers", headers: headers
+      assert_response :ok
+      assert_equal [ reader.oid ], json_body.dig("data", "readers").map { |row| row.fetch("id") }
+
+      reader.update!(status: :disabled)
+      delete "/api/v1/sandbox/skills/#{skill.oid}/readers", params: { data: { user: reader.oid } }, headers: headers, as: :json
+      assert_response :ok
+      assert_empty json_body.dig("data", "readers")
+      assert_equal version + 2, json_body.dig("data", "lock_version")
+    end
+  end
+
+  test "editor cannot grant read access or change visibility" do
+    skill = skills(:other_private)
+    skill.editors << users(:member_user)
+    with_token(@member_proxy) do |headers|
+      post "/api/v1/sandbox/skills/#{skill.oid}/readers", params: { data: { user: users(:globex_admin).oid } }, headers: headers, as: :json
+      assert_response :not_found
+      patch "/api/v1/sandbox/skills/#{skill.oid}", params: { data: { description: skill.description, visibility: "shared", reader_oids: [ users(:globex_admin).oid ] } }, headers: headers, as: :json
+      assert_response :ok
+    end
+    assert_not skill.reload.shared?
+    assert_empty skill.readers
+  end
+
+  test "revoked readers lose list search and direct read access immediately" do
+    skill = skills(:other_private)
+    skill.readers << users(:member_user)
+    skill.readers.delete(users(:member_user))
+    with_token(@member_proxy) do |headers|
+      get "/api/v1/sandbox/skills", headers: headers
+      assert_not_includes json_body.fetch("data").map { |row| row.fetch("id") }, skill.oid
+      get "/api/v1/sandbox/skills/search", params: { q: "finance" }, headers: headers
+      assert_empty json_body.fetch("data")
+      [ skill.name, skill.oid ].each do |identifier|
+        get "/api/v1/sandbox/skills/#{identifier}", headers: headers
+        assert_response :not_found
+      end
+    end
+  end
+
+  test "owner cannot grant read access to disabled or missing users" do
+    with_token(@member_proxy) do |headers|
+      [ users(:disabled_user).oid, "missing@example.test" ].each do |reference|
+        post "/api/v1/sandbox/skills/#{skills(:member_private).oid}/readers", params: { data: { user: reference } }, headers: headers, as: :json
+        assert_response :not_found
+      end
+    end
+  end
+
+  test "creates a private skill without publishing it first" do
+    with_token(@member_proxy) do |headers|
+      post "/api/v1/sandbox/skills", params: { data: { name: "private-at-birth", description: "Private guidance", instructions: "Keep private.", visibility: "private" } }, headers: headers, as: :json
+    end
+    assert_response :created
+    assert_equal "private", json_body.dig("data", "visibility")
+  end
+
   private
 
   def with_token(proxy)

@@ -142,6 +142,40 @@ class SkillTest < ActiveSupport::TestCase
     assert_equal skill.name, replacement.name
   end
 
+  test "readers can discover private skills but cannot edit them" do
+    skill = skills(:other_private)
+    reader = users(:member_user)
+    skill.readers << reader
+
+    assert_includes Skill.catalog_visible_to(reader), skill
+    assert_not_includes Skill.editable_by(reader), skill
+    assert_not skill.editable_by?(reader)
+    assert_not_includes Skill.catalog_visible_to(nil), skill
+
+    skill.readers.delete(reader)
+    assert_not_includes Skill.catalog_visible_to(reader), skill
+  end
+
+  test "disabled readers and archived skills are excluded from the catalog" do
+    skill = skills(:other_private)
+    reader = users(:member_user)
+    skill.readers << reader
+    reader.update!(status: :disabled)
+    assert_not_includes Skill.catalog_visible_to(reader), skill
+
+    reader.update!(status: :active)
+    skill.archive!
+    assert_not_includes Skill.catalog_visible_to(reader), skill
+  end
+
+  test "reader assignments are unique and cannot name the owner" do
+    skill = skills(:other_private)
+    assignment = skill.skill_readers.new(user: skill.user)
+    assert_not assignment.valid?
+    skill.readers << users(:member_user)
+    assert_not skill.skill_readers.new(user: users(:member_user)).valid?
+  end
+
   private
 
   def attributes(name: "release-check")

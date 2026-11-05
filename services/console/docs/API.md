@@ -1494,7 +1494,7 @@ Console stores and validates `name`, `description`, and Markdown `instructions` 
 
 ### Sandbox Operations
 
-These endpoints use the existing sandbox entitlement JWT injected by `iron-proxy`. Principals linked to an active Console user can see that user's private skills, private skills they have been added to as an editor, and every public skill. Other principals can see public skills only. Mutations require an active Console user linked to the sandbox principal. Owners can perform every mutation on their skills, while editors can update skill content but cannot share, unshare, or archive the skill.
+These endpoints use the existing sandbox entitlement JWT injected by `iron-proxy`. Principals linked to an active Console user can see that user's private skills, private skills they have been added to as a reader or editor, and every public skill. Other principals can see public skills only. Mutations require an active Console user linked to the sandbox principal. Owners can perform every mutation on their skills, while editors can update skill content but cannot share, unshare, or archive the skill.
 
 | Method | Path | Notes |
 | ------ | ---- | ----- |
@@ -1509,8 +1509,18 @@ These endpoints use the existing sandbox entitlement JWT injected by `iron-proxy
 | `GET` | `/api/v1/sandbox/skills/:id/editors` | List editors for any visible skill by exact name or OID. |
 | `POST` | `/api/v1/sandbox/skills/:id/editors` | Add an editor to an owned skill OID using an exact email or `usr_...` OID in `data.user`. |
 | `DELETE` | `/api/v1/sandbox/skills/:id/editors` | Remove an editor from an owned skill OID using an exact email or `usr_...` OID in `data.user`. |
+| `GET` | `/api/v1/sandbox/skills/:id/readers` | Owner-only list of explicit readers, using a skill OID. |
+| `POST` | `/api/v1/sandbox/skills/:id/readers` | Owner-only, idempotent read grant for an active user; exact email or `usr_...` OID in `data.user`. |
+| `DELETE` | `/api/v1/sandbox/skills/:id/readers` | Owner-only, idempotent removal of a read grant using `data.user`; disabled users can also be removed. |
 
-Editor responses include each editor's OID, email, name, and account status, plus the skill's current `lock_version`. The editor list follows skill visibility: every principal that can read a shared skill can also read its editor list, while a private skill's list remains visible only to its owner and editors. Adding an editor is idempotent. Catalog responses include the skill ID and a checksum over the generated document. Read responses set `Cache-Control: no-store`.
+Readers can list, search, and read private skills, but cannot edit, archive,
+change visibility, or manage access. Read grants and editor assignments are
+additive; removing a reader grant does not remove edit access. Public skills
+remain globally readable. Reader membership is visible only to the owner.
+ACL changes take effect on the next catalog request; already-read content is
+not recalled. The same permissions apply to Console detail pages and My Skills.
+
+Editor responses include each editor's OID, email, name, and account status, plus the skill's current `lock_version`. The editor list follows skill visibility: every principal that can read a shared skill can also read its editor list, while a private skill's list remains visible only to its owner, readers, and editors. Adding an editor is idempotent. Catalog responses include the skill ID and a checksum over the generated document. Read responses set `Cache-Control: no-store`.
 
 ## Proxies
 
