@@ -528,6 +528,7 @@
     "slackbotv2": {
       "type": "object",
       "properties": {
+        "extraCaCertificates": { "type": "string" },
         "agentViewEnabled": { "type": "boolean" },
         "mcpPublicUrl": { "type": "string" },
         "responseMetadataMode": {

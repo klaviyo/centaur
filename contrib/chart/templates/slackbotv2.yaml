@@ -20,6 +20,7 @@ spec:
   template:
     metadata:
       annotations:
+        checksum/extra-ca-certificates: {{ .Values.slackbotv2.extraCaCertificates | default "" | sha256sum }}
         checksum/infra-secrets: {{ include "centaur.infraSecretsChecksum" . }}
 {{- with $slackbotV2MetricsAnnotations }}
 {{ toYaml . | nindent 8 }}
@@ -37,7 +38,17 @@ spec:
         - name: slackbotv2
           image: {{ printf "%s:%s" .Values.slackbotv2.image.repository .Values.slackbotv2.image.tag | quote }}
           imagePullPolicy: {{ .Values.slackbotv2.image.pullPolicy }}
+          {{- if .Values.slackbotv2.extraCaCertificates }}
+          volumeMounts:
+            - name: extra-ca-certificates
+              mountPath: /etc/centaur/ca
+              readOnly: true
+          {{- end }}
           env:
+            {{- if .Values.slackbotv2.extraCaCertificates }}
+            - name: NODE_EXTRA_CA_CERTS
+              value: /etc/centaur/ca/extra-ca-certificates.pem
+            {{- end }}
             - name: PORT
               value: "3001"
             - name: CENTAUR_API_URL
@@ -163,6 +174,24 @@ spec:
 {{ toYaml .Values.containerSecurityContext | nindent 12 }}
           resources:
 {{ toYaml .Values.slackbotv2.resources | nindent 12 }}
+      {{- if .Values.slackbotv2.extraCaCertificates }}
+      volumes:
+        - name: extra-ca-certificates
+          configMap:
+            name: {{ include "centaur.componentName" (dict "root" . "component" "slackbotv2-ca") }}
+      {{- end }}
+{{- if .Values.slackbotv2.extraCaCertificates }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "slackbotv2-ca") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "slackbotv2") | nindent 4 }}
+data:
+  extra-ca-certificates.pem: |
+{{ .Values.slackbotv2.extraCaCertificates | indent 4 }}
+{{- end }}
 ---
 apiVersion: v1
 kind: Service

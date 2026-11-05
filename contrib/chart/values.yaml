@@ -772,6 +772,9 @@ apiRs:
 # Chat SDK Slackbot v2. Forwards Slack events to the api-rs control plane
 # (:8080) and streams responses back. Listens on :3001.
 slackbotv2:
+  # Additional public PEM CA certificates trusted by the Bun runtime, including
+  # the state database connection. Never put private keys in this value.
+  extraCaCertificates: ""
   enabled: true
   replicaCount: 1
   image:
