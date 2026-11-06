@@ -3310,6 +3310,11 @@ fn verify_hmac_signature(
             "webhook auth secret {secret_ref} is not configured"
         ))
     })?;
+    if secret.trim().is_empty() {
+        return Err(ApiError::Internal(format!(
+            "webhook auth secret {secret_ref} is not configured"
+        )));
+    }
     let invalid = || ApiError::Unauthorized("invalid webhook signature".to_owned());
     let presented = signature
         .trim()
@@ -3497,6 +3502,77 @@ mod granola_sync_tests {
 #[cfg(test)]
 mod webhook_tests {
     use super::*;
+
+    fn github_webhook_spec(secret_ref: &str) -> WorkflowWebhookSpec {
+        WorkflowWebhookSpec {
+            slug: "github-unit".to_owned(),
+            provider: Some("github".to_owned()),
+            auth: WorkflowWebhookAuth::Github {
+                secret_ref: secret_ref.to_owned(),
+            },
+            trigger_key: None,
+            allowed_methods: vec!["POST".to_owned()],
+            allowed_content_types: vec!["application/json".to_owned()],
+            filter: None,
+        }
+    }
+
+    fn github_signature_headers(secret: &[u8], raw_body: &[u8]) -> HeaderMap {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+        mac.update(raw_body);
+        let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-hub-signature-256", signature.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn rejects_missing_or_blank_github_signing_secret() {
+        let secret_ref = "CENTAUR_TEST_GITHUB_SECRET_BLANK";
+        let spec = github_webhook_spec(secret_ref);
+        let body = br#"{"action":"opened"}"#;
+        for value in [None, Some(""), Some(" \t\r\n")] {
+            unsafe {
+                match value {
+                    Some(secret) => env::set_var(secret_ref, secret),
+                    None => env::remove_var(secret_ref),
+                }
+            }
+            let headers = github_signature_headers(value.unwrap_or_default().as_bytes(), body);
+            let error = verify_webhook_auth(&spec, &headers, body).unwrap_err();
+            assert!(matches!(error, ApiError::Internal(_)));
+        }
+        unsafe {
+            env::remove_var(secret_ref);
+        }
+    }
+
+    #[test]
+    fn github_signatures_preserve_nonblank_key_and_raw_body_bytes() {
+        let secret_ref = "CENTAUR_TEST_GITHUB_SECRET_BYTES";
+        let secret = " test-key-with-padding \n";
+        let body = b"{ \"action\": \"opened\" }\n";
+        let spec = github_webhook_spec(secret_ref);
+        unsafe {
+            env::set_var(secret_ref, secret);
+        }
+        let headers = github_signature_headers(secret.as_bytes(), body);
+        verify_webhook_auth(&spec, &headers, body).unwrap();
+
+        for invalid_headers in [
+            HeaderMap::new(),
+            github_signature_headers(secret.trim().as_bytes(), body),
+            github_signature_headers(b"wrong-key", body),
+        ] {
+            let error = verify_webhook_auth(&spec, &invalid_headers, body).unwrap_err();
+            assert!(matches!(error, ApiError::Unauthorized(_)));
+        }
+        let error = verify_webhook_auth(&spec, &headers, br#"{"action":"opened"}"#).unwrap_err();
+        assert!(matches!(error, ApiError::Unauthorized(_)));
+        unsafe {
+            env::remove_var(secret_ref);
+        }
+    }
 
     #[test]
     fn session_thread_key_from_path_decodes_session_routes() {
