@@ -3279,7 +3279,7 @@ describe('slackbotv2', () => {
     await Promise.all(waits)
   })
 
-  it('shows visible task progress by default when activity summary status is disabled', async () => {
+  it('hides task progress by default when activity summary status is disabled', async () => {
     bot = createProductionDefaultTestBot()
     codexApi.autoRespond = false
 
@@ -3324,10 +3324,10 @@ describe('slackbotv2', () => {
     expect(statusCalls.map(call => stringField(call.body.status))).toEqual(['Thinking...', ''])
     const transcripts = slackStreamTranscripts(slackApi.calls)
     expect(transcripts).toHaveLength(1)
-    expect(transcripts[0]!.start.body.task_display_mode).toBe('plan')
-    expect(transcripts[0]!.chunks.some(chunk => chunk.type === 'task_update')).toBe(true)
+    expect(transcripts[0]!.start.body.task_display_mode).toBeUndefined()
+    expect(transcripts[0]!.chunks.some(chunk => chunk.type === 'task_update')).toBe(false)
     const text = await threadText(parent.ts)
-    expect(text).toContain('Command execution')
+    expect(text).not.toContain('Command execution')
     expect(text).toContain('Default progress done.')
     expect(text).not.toContain(summary)
   })

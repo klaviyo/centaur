@@ -3073,7 +3073,9 @@ async function* slackSafeChatSdkStream(
 type SlackStreamTaskDisplayMode = NonNullable<SlackbotV2Options['streamTaskDisplayMode']>
 
 function slackStreamTaskDisplayMode(options: SlackbotV2Options): SlackStreamTaskDisplayMode {
-  return options.streamTaskDisplayMode ?? (options.activitySummaryStatusEnabled ? 'none' : 'plan')
+  // Default to no plan block: the Slack message posts with the first answer
+  // text, so its notification shows the answer instead of tool progress.
+  return options.streamTaskDisplayMode ?? 'none'
 }
 
 async function* slackVisibleChatSdkStream(
