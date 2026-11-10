@@ -1,0 +1,25 @@
+[project]
+name = "sanity"
+description = "Query, edit, publish, and upload Sanity content with operation audit logs"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["httpx>=0.27.0", "typer>=0.12.0"]
+
+[project.scripts]
+sanity = "centaur_tool_sanity.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[tool.hatch.build.targets.wheel.sources]
+"." = "centaur_tool_sanity"
+
+[tool.centaur]
+module = "client.py"
+# An administrator enrolls the shared placeholder and its dataset-scoped rules.
+# Do not auto-register a deployment-wide env source or grant it through infra.
+secrets = []
