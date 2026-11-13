@@ -49,6 +49,15 @@ class ToolHostTest(unittest.TestCase):
             "        print(json.dumps({'argv': args, 'principal': os.environ.get('CENTAUR_MCP_PRINCIPAL_ID')}))\n"
         )
         index = cls.bin_dir / ".centaur-tools.json"
+        native_script = cls.root / "native_cli.py"
+        native_script.write_text((package / "cli.py").read_text() + "\nraise SystemExit(main())\n")
+        native_project = cls.root / "native"
+        native_project.mkdir()
+        (native_project / "pyproject.toml").write_text(
+            '[project]\nname = "native"\n'
+            '[tool.centaur.commands]\nnative = '
+            + json.dumps([sys.executable, str(native_script)]) + "\n"
+        )
         index.write_text(
             json.dumps(
                 [
@@ -67,6 +76,11 @@ class ToolHostTest(unittest.TestCase):
             index,
             "",
         )
+        catalog = json.loads(index.read_text())
+        catalog.append(install_tool_shims._discover_scripts([cls.root])["native"])
+        catalog.append({**catalog[-1], "name": "missing", "command": [str(cls.root / "not-installed")]})
+        index.write_text(json.dumps(catalog))
+        install_tool_shims._write_tool_shim(cls.bin_dir / "native", catalog[-2], "")
         cls.env = {
             **os.environ,
             "PATH": f"{cls.bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
@@ -135,6 +149,37 @@ class ToolHostTest(unittest.TestCase):
         )
         self.assertFalse(response["timed_out"])
         self.assertFalse(sentinel.exists())
+
+    def test_native_command_preserves_arguments_failures_and_analytics(self) -> None:
+        sentinel = self.root / "native-shell-ran"
+        argv = ["search", "  café  ", "", f"$(touch {sentinel})", ";", "|"]
+        response, failure, recovery = self.requests(
+            self.run_request(argv, tool="native", principal_id="prn_native"),
+            self.run_request(["fail"], tool="native"),
+            self.run_request(["--help"], tool="native"),
+        )
+        self.assertEqual(response["status"], 0, response["stderr"])
+        self.assertEqual(json.loads(response["stdout"]), {"argv": argv, "principal": "prn_native"})
+        self.assertFalse(sentinel.exists())
+        self.assertEqual(failure["status"], 2)
+        self.assertEqual(failure["stdout"], "partial output\n")
+        self.assertEqual(failure["stderr"], "invalid arguments\n")
+        self.assertEqual(recovery["status"], 0)
+        events = [json.loads(line) for line in (self.root / "analytics.jsonl").read_text().splitlines()]
+        completed = [event for event in events if event.get("tool_name") == "native" and event["event"] == "tool_call_completed"]
+        self.assertEqual([event["exit_code"] for event in completed[-3:]], [0, 2, 0])
+
+    def test_native_command_workflow_bridge_and_missing_executable(self) -> None:
+        response, invalid = self.requests(
+            {"tool": "native", "method": "run", "arguments": {"argv": ["--help"]}},
+            {"tool": "native", "method": "arbitrary", "arguments": {}},
+        )
+        self.assertEqual(response["status"], 0, response["stderr"])
+        self.assertEqual(json.loads(response["stdout"])["stdout"], "Usage: demo [ARGS]\n")
+        self.assertNotEqual(invalid["status"], 0)
+        self.assertIn('external commands require method "run"', invalid["stderr"])
+        (missing,) = self.requests(self.run_request([], tool="missing"))
+        self.assertNotEqual(missing["status"], 0)
 
     def test_cli_help_no_args_failure_and_recovery(self) -> None:
         help_result, empty, failure, recovery = self.requests(

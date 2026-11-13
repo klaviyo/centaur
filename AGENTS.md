@@ -136,9 +136,10 @@ that accurately validates every service.
 
 Tool plugins under `tools/` are independently packaged CLIs. Keep secret access
 in the client through the SDK placeholder mechanism; do not load dotenv files
-in reusable clients. A tool visible to agents needs a `[project.scripts]` entry,
-and its CLI wrapper should remain thin. Validate catalog discovery, `<tool>
---help`, and one real command from a local sandbox.
+in reusable clients. A tool visible to agents needs a `[project.scripts]` or
+`[tool.centaur.commands]` entry, and its CLI wrapper should remain thin.
+Validate catalog discovery, `<tool> --help`, and one real command from a local
+sandbox.
 
 Workflow definitions under `workflows/` declare a unique `WORKFLOW_NAME` and an
 async handler. Use durable context primitives for side effects, sleeps, events,

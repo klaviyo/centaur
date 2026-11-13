@@ -22,8 +22,8 @@ from repository `AGENTS.md` files, which guide contributors editing this repo.
   state. Preserve permissions, symlink targets, prompt composition order, and
   configured overlay precedence.
 - Tool discovery comes from ordered `TOOL_DIRS` entries and each tool's
-  `[project.scripts]`. Keep `centaur-tools` catalog, direct CLI execution, and
-  workflow compatibility behavior aligned.
+  `[project.scripts]` or `[tool.centaur.commands]`. Keep `centaur-tools` catalog,
+  direct CLI execution, and workflow compatibility behavior aligned.
 - Repo-cache readiness must describe the exact repositories, refs, visibility,
   and completed sync. Never report ready for stale or partial content.
 - `crates/harness-server/` owns app-server protocol normalization and is built

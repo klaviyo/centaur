@@ -1,6 +1,6 @@
 # Tools
 
-Drop tool directories here. Each tool needs:
+Drop tool directories here. Python tools use this layout:
 
 ```
 tools/
@@ -42,6 +42,10 @@ Secrets are resolved in this order:
 Use `secret("KEY")` to access. Never use `os.environ` — tool secrets are scoped.
 
 ## Sandbox CLI shims
+
+For an installed external CLI, declare `[tool.centaur.commands]` instead of
+creating a Python adapter. See [Expose an installed CLI](../docs/pages/extend/tools.mdx#expose-an-installed-cli)
+for packaging, validation, workflow calls, and rollout requirements.
 
 Agent sandboxes install tool CLIs from `[project.scripts]` at startup through
 `services/sandbox/install_tool_shims.py`. To make a tool visible to agents,
