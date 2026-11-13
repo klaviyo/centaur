@@ -5,9 +5,10 @@ description: Add Centaur tool plugins with client.py, pyproject metadata, and ty
 
 # Creating Tools
 
-Tools are Python plugins that Centaur discovers from ordered tool directories.
+Tools are plugins that Centaur discovers from ordered tool directories.
 api-rs reads their metadata for secret grants, while agent sandboxes install
-their `[project.scripts]` entries as local CLI shims. Agents use
+their `[project.scripts]` or `[tool.centaur.commands]` entries as local CLI
+shims. Agents use
 `centaur-tools list`, `<tool> --help`, and the direct tool CLI; api-rs does not
 serve legacy HTTP tool-method routes as the current sandbox registry. Put
 organization-specific tools in an overlay repo under `tools/` so the base
@@ -146,6 +147,46 @@ def query(sql: str) -> None:
     print(json.dumps(_client().query(sql)))
 ```
 
+
+## Expose an installed CLI
+
+For an existing external CLI, declare its executable instead of writing a
+Python adapter. Package the executable and its runtime in the sandbox image;
+discovery does not install binaries or download dependencies.
+
+```toml
+[project]
+name = "formatter"
+version = "0.1.0"
+description = "Official formatter CLI"
+
+[tool.centaur]
+secrets = []
+
+[tool.centaur.commands]
+formatter = ["/opt/centaur-tools/bin/formatter", "--json"]
+```
+
+Each command is a nonempty array of strings starting with an absolute
+executable path. Remaining entries are fixed arguments; user arguments are
+appended literally, without a shell. A command name cannot also appear in
+`[project.scripts]`. Python tools continue to use their existing entry points.
+
+External commands use the same catalog, allowlist, blocklist, invocation logs,
+proxy environment, and secret grants as Python tools. Tool visibility is not a
+credential permission: configure grants separately. Keep real tokens out of
+arguments, manifests, and image layers. Command arguments are included in the
+existing usage logs, so pass sensitive input through stdin or files instead.
+
+Use `<command> --help`, `centaur-tools run <command> ...`, or the v2 CLI tool
+host. Python workflows can use
+`ctx.call_tool("formatter", "run", argv=["input.txt"])`; the result contains
+`stdout`, `stderr`, and `exit_code`, and a nonzero command exit fails the call.
+Other Python client methods are not supported for external commands.
+
+Deploy the API discovery support and matching sandbox runner before enabling
+external-command manifests. The executable must exist in the image used by
+each sandbox; an overlay refresh alone cannot install a new CLI.
 
 ## Verify
 

@@ -147,6 +147,30 @@ class CopyPublishedToolsTest(unittest.TestCase):
 
 
 class GeneratedShimTest(unittest.TestCase):
+    def test_external_command_discovery_validates_and_filters_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "native"
+            project.mkdir()
+            (project / "pyproject.toml").write_text(
+                '[project]\nname = "native"\n'
+                '[project.scripts]\ncollision = "native.cli:app"\n'
+                '[tool.centaur.commands]\n'
+                'native = ["/opt/tools/bin/native", "--json"]\n'
+                'relative = ["native"]\nempty = []\n'
+                'number = ["/bin/native", 1]\n'
+                '".." = ["/bin/native"]\n'
+                'collision = ["/bin/native"]\n'
+            )
+            with mock.patch.dict(os.environ, {"TOOL_ALLOWLIST": "native", "TOOL_BLOCKLIST": ""}):
+                scripts = install_tool_shims._discover_scripts([root])
+                self.assertEqual(list(scripts), ["native"])
+                self.assertEqual(scripts["native"]["command"], ["/opt/tools/bin/native", "--json"])
+            with mock.patch.dict(os.environ, {"TOOL_ALLOWLIST": "other"}):
+                self.assertEqual(install_tool_shims._discover_scripts([root]), {})
+            with mock.patch.dict(os.environ, {"TOOL_ALLOWLIST": "", "TOOL_BLOCKLIST": "native"}):
+                self.assertEqual(install_tool_shims._discover_scripts([root]), {})
+
     def test_tool_shim_delegates_to_centaur_tools_exec(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = Path(tmp)

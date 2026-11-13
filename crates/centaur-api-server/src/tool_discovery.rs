@@ -608,7 +608,7 @@ fn load_tool_meta(
         .filter(|value| !value.is_empty())
         .unwrap_or("client.py")
         .to_owned();
-    let script_names = project_conf
+    let mut script_names = project_conf
         .get("scripts")
         .and_then(TomlValue::as_table)
         .map(|scripts| {
@@ -620,8 +620,31 @@ fn load_tool_meta(
             names.sort();
             names
         })
-        .filter(|names| !names.is_empty())
-        .unwrap_or_else(|| vec![name.clone()]);
+        .unwrap_or_default();
+    if let Some(value) = tool_conf.get("commands") {
+        let Some(commands) = value.as_table() else {
+            warn!(tool = %name, "external commands must be a table");
+            return Ok(None);
+        };
+        for (command_name, command) in commands {
+            if command_name.is_empty()
+                || matches!(command_name.as_str(), "." | "..")
+                || command_name.contains('/')
+                || command_name.contains('\0')
+                || script_names.contains(command_name)
+                || !valid_external_command(command)
+            {
+                warn!(tool = %name, command = %command_name, "ignoring invalid external command");
+                script_names.retain(|script| script != command_name);
+                continue;
+            }
+            script_names.push(command_name.clone());
+        }
+    }
+    script_names.sort();
+    if script_names.is_empty() && tool_conf.get("commands").is_none() {
+        script_names.push(name.clone());
+    }
     let default_hosts = string_array(tool_conf.get("hosts"));
     let labels = tool_labels(&name, &overlay_name_for_root(source_root));
     let secrets = match parse_secret_list(tool_conf.get("secrets"), &default_hosts, &labels)
@@ -652,6 +675,19 @@ fn load_tool_meta(
         script_names,
         secrets,
     }))
+}
+
+fn valid_external_command(command: &TomlValue) -> bool {
+    let Some(arguments) = command.as_array() else {
+        return false;
+    };
+    let Some(executable) = arguments.first().and_then(TomlValue::as_str) else {
+        return false;
+    };
+    Path::new(executable).is_absolute()
+        && arguments
+            .iter()
+            .all(|argument| argument.as_str().is_some_and(|value| !value.contains('\0')))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1633,6 +1669,54 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn discovers_external_commands_without_a_python_package() {
+        let temp = temp_dir("api-rs-native-tools");
+        write_tool(
+            &temp.join("utilities"),
+            r#"
+[project]
+name = "utilities"
+[tool.centaur.commands]
+formatter = ["/opt/centaur-tools/bin/formatter", "--json"]
+query = ["/opt/centaur-tools/bin/query"]
+relative = ["query"]
+empty = []
+invalid = ["/bin/query", 1]
+"#,
+        );
+        let catalog = discover_tool_catalog(std::slice::from_ref(&temp)).unwrap();
+        let names: Vec<_> = catalog
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(names, ["formatter", "query"]);
+        assert!(catalog.tools.iter().all(|tool| tool.package == "utilities"));
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn external_commands_cannot_shadow_python_entry_points() {
+        let temp = temp_dir("api-rs-native-collision");
+        write_tool(
+            &temp.join("query"),
+            r#"
+[project.scripts]
+query = "query.cli:app"
+[tool.centaur.commands]
+query = ["/opt/centaur-tools/bin/query"]
+"#,
+        );
+        assert!(
+            discover_tool_catalog(std::slice::from_ref(&temp))
+                .unwrap()
+                .tools
+                .is_empty()
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
 
     #[test]
     fn resolves_tool_dirs_from_explicit_env_string() {
