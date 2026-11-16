@@ -24,7 +24,7 @@ excluded from the HTTP request metrics.
 - `CENTAUR_CONSOLE_URL` — Console URL used for sandbox-entitlement rules.
 - `CENTAUR_API_URL` / `CENTAUR_API_SERVER_PROXY_HOSTS` — API hosts used for generated API credentials.
 - `RUNLAYER_MCP_URL` — exact HTTPS MCP URL matching Console/sandboxes; unset disables Runlayer delivery.
-- `RUNLAYER_USER_AGENT` — optional printable ASCII User-Agent override for GET/POST/DELETE to that exact MCP host/path. The Helm chart sets `centaur/0.1.0`; set `proxySync.extraEnv.RUNLAYER_USER_AGENT: ""` to disable. Managed iron-proxy injects the value independently of the sandbox harness. Runlayer preserves the first product token in upstream requests ([reference](https://docs.runlayer.com/platform-deploy#client-user-agent)). This replaces the existing header; it does not append to it.
+- `RUNLAYER_USER_AGENT` — optional printable ASCII User-Agent override for GET/POST/DELETE to that exact MCP host/path. Unset or empty disables the override. Deployments can opt in through `proxySync.extraEnv.RUNLAYER_USER_AGENT` in their Helm values (for example, `centaur/0.1.0`). Managed iron-proxy injects the value independently of the sandbox harness. Runlayer preserves the first product token in upstream requests ([reference](https://docs.runlayer.com/platform-deploy#client-user-agent)). This replaces the existing header; it does not append to it.
 - `BIND_ADDR` — listen address; defaults to `0.0.0.0:8080`.
 - `DATABASE_MAX_CONNECTIONS` — SQLx pool limit; defaults to `5`.
 
