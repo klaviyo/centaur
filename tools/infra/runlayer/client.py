@@ -151,11 +151,7 @@ class RunlayerClient:
         return reply["result"]
 
     def _send(self, body: dict[str, Any] | None, request_id: int | None, method="POST") -> Any:
-        headers = {
-            "Accept": "application/json, text/event-stream",
-            "MCP-Protocol-Version": self._protocol,
-            "X-Step-Caller": "centaur",
-        }
+        headers = {"Accept": "application/json, text/event-stream", "MCP-Protocol-Version": self._protocol}
         if self._session:
             headers["Mcp-Session-Id"] = self._session
         try:

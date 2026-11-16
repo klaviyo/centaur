@@ -20,9 +20,7 @@ def test_configuration_lifecycle_pagination_and_schema(monkeypatch):
         seen.append(request)
         assert "Authorization" not in request.headers  # injected outside the sandbox
         if request.url.host == "console.local":
-            assert "X-Step-Caller" not in request.headers
             return httpx.Response(200, json={"data": [{"provider": "runlayer", "labels": {}, "start_url": "https://console.test/oauth/runlayer/start"}]})
-        assert request.headers["X-Step-Caller"] == "centaur"
         if request.method == "DELETE":
             return httpx.Response(204)
         body = json.loads(request.content)

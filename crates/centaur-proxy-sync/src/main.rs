@@ -140,6 +140,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         api_hosts,
         console_host,
         runlayer_resource_url: runlayer_resource_url()?,
+        runlayer_user_agent: config::parse_runlayer_user_agent(
+            &env::var("RUNLAYER_USER_AGENT").unwrap_or_default(),
+        )?,
         sync_cache: Arc::new(SyncCache::default()),
         metrics: metrics_handle,
     };

@@ -1,6 +1,6 @@
 use centaur_console_db::{SecretValues, Subject, models::Config, oid};
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -33,7 +33,40 @@ pub(crate) async fn build_config(
     .await?;
     append_api_jwt(state, proxy, &mut config, now).await?;
     append_sandbox_jwt(state, proxy, &mut config, now)?;
+    append_runlayer_user_agent(
+        &mut config,
+        state.runlayer_resource_url.as_deref(),
+        state.runlayer_user_agent.as_deref(),
+    );
     Ok(config)
+}
+
+pub(crate) fn parse_runlayer_user_agent(raw: &str) -> Result<Option<String>, &'static str> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if raw.trim().is_empty() || !raw.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
+        return Err("RUNLAYER_USER_AGENT must be a non-empty printable ASCII header value");
+    }
+    Ok(Some(raw.to_owned()))
+}
+
+fn append_runlayer_user_agent(config: &mut Config, resource: Option<&str>, value: Option<&str>) {
+    let (Some(resource), Some(value)) = (resource, value) else {
+        return;
+    };
+    // RUNLAYER_MCP_URL is validated at startup. Match only its HTTPS endpoint,
+    // leaving model-provider headers and other paths on the tenant untouched.
+    let url = url::Url::parse(resource).expect("validated Runlayer resource URL");
+    config.secrets.push(json!({
+        "source": {"type": "control_plane", "value": value},
+        "inject": {"header": "User-Agent"},
+        "rules": [{
+            "host": url.host_str().expect("validated Runlayer host"),
+            "methods": ["GET", "POST", "DELETE"],
+            "paths": [url.path()],
+        }],
+    }));
 }
 
 pub(crate) fn config_hash(proxy: &ProxyRecord, config: &Value) -> Result<String, ApiError> {
@@ -75,4 +108,50 @@ fn timestamp(value: Option<DateTime<Utc>>) -> Value {
     value
         .map(|value| Value::String(value.format("%Y-%m-%dT%H:%M:%SZ").to_string()))
         .unwrap_or(Value::Null)
+}
+
+#[cfg(test)]
+mod runlayer_tests {
+    use super::*;
+
+    #[test]
+    fn user_agent_is_optional_and_rejects_invalid_header_values() {
+        assert_eq!(parse_runlayer_user_agent(""), Ok(None));
+        assert_eq!(
+            parse_runlayer_user_agent("centaur/0.1.0"),
+            Ok(Some("centaur/0.1.0".into()))
+        );
+        for raw in [" ", "centaur\r\nX-Test: injected", "centaur\0", "centaur/é"] {
+            assert!(parse_runlayer_user_agent(raw).is_err());
+        }
+    }
+
+    #[test]
+    fn user_agent_injection_is_scoped_and_preserves_existing_credentials() {
+        let auth = json!({"inject": {"header": "Authorization"}});
+        let mut config = Config::default();
+        config.secrets.push(auth.clone());
+        append_runlayer_user_agent(
+            &mut config,
+            Some("https://tenant.example.test/plugins/one/mcp"),
+            Some("centaur/0.1.0"),
+        );
+        assert_eq!(config.secrets[0], auth);
+        assert_eq!(
+            config.secrets[1],
+            json!({
+                "source": {"type": "control_plane", "value": "centaur/0.1.0"},
+                "inject": {"header": "User-Agent"},
+                "rules": [{"host": "tenant.example.test", "methods": ["GET", "POST", "DELETE"], "paths": ["/plugins/one/mcp"]}],
+            })
+        );
+        for (resource, value) in [
+            (None, Some("centaur/0.1.0")),
+            (Some("https://tenant.example.test/mcp"), None),
+        ] {
+            let mut disabled = Config::default();
+            append_runlayer_user_agent(&mut disabled, resource, value);
+            assert!(disabled.secrets.is_empty());
+        }
+    }
 }

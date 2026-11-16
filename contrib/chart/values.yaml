@@ -442,7 +442,10 @@ proxySync:
   # Empty denies dynamic targets. Exact paths and TLS verification are mandatory.
   sshTargets: []
   # Additional non-secret environment settings.
-  extraEnv: {}
+  extraEnv:
+    # Replace User-Agent only on the configured Runlayer MCP endpoint.
+    # Empty disables the override. Runlayer preserves this first product token.
+    RUNLAYER_USER_AGENT: "centaur/0.1.0"
   # Two replicas keep sync available during pod restarts and rolling updates.
   replicaCount: 2
   nodeSelector: {}

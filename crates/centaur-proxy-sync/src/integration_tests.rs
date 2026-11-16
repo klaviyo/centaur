@@ -81,6 +81,7 @@ impl Fixture {
             },
             console_host: None,
             runlayer_resource_url: Some("https://tenant.runlayer.test/mcp".to_owned()),
+            runlayer_user_agent: None,
             sync_cache: Arc::new(SyncCache::default()),
             metrics: PrometheusBuilder::new().build_recorder().handle(),
         };
