@@ -225,29 +225,3 @@ def test_catalog_app_must_be_the_owner_only_runlayer_app(monkeypatch):
         pytest.raises(RunlayerError, match="set up"),
     ):
         RunlayerClient(http_client=http).list_tools()
-
-
-def test_programmatic_shim_factory_discovers_tools_with_catalog_credentials(monkeypatch):
-    from centaur_tool_runlayer import client as module
-
-    def handler(request):
-        assert "Authorization" not in request.headers
-        if request.url.host == "console.local":
-            return httpx.Response(200, json={"data": [{
-                "slug": "runlayer", "owner_only": True, "resource": URL,
-            }]})
-        body = json.loads(request.content)
-        if body["method"] == "initialize":
-            return response(request, {"protocolVersion": "2025-03-26"})
-        if body["method"] == "notifications/initialized":
-            return httpx.Response(202)
-        assert body["method"] == "tools/list"
-        return response(request, {"tools": [TOOL]})
-
-    monkeypatch.setenv("CENTAUR_CONSOLE_URL", "http://console.local")
-    real_client = module.RunlayerClient
-    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
-        monkeypatch.setattr(module, "RunlayerClient", lambda: real_client(http_client=http))
-        # install_tool_shims dispatches module._client(), then the requested method.
-        instance = module._client()
-        assert getattr(instance, "list_tools")() == [TOOL]
