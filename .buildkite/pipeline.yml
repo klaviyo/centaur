@@ -73,5 +73,4 @@ steps:
       - label: "Publish console (AMD64)"
         timeout_in_minutes: 120
         command: |
-          cd services/console
-          kbc docker-utils build-and-publish -f Dockerfile -i klaviyo-centaur-console -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
+          kbc docker-utils build-and-publish -f services/console/Dockerfile -i klaviyo-centaur-console -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
