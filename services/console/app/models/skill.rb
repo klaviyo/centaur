@@ -14,6 +14,8 @@ class Skill < ApplicationRecord
   belongs_to :user
   has_many :skill_editors, dependent: :destroy
   has_many :editors, through: :skill_editors, source: :user
+  has_many :skill_readers, dependent: :destroy
+  has_many :readers, through: :skill_readers, source: :user
 
   enum :visibility, { private: "private", shared: "shared" },
        default: :shared, validate: true, prefix: true
@@ -29,7 +31,11 @@ class Skill < ApplicationRecord
   }
   scope :catalog_visible_to, lambda { |user|
     shared_scope = active.shared
-    user ? shared_scope.or(editable_by(user)) : shared_scope
+    if user&.active?
+      shared_scope.or(editable_by(user)).or(active.where(id: SkillReader.where(user: user).select(:skill_id)))
+    else
+      shared_scope
+    end
   }
 
   normalizes :name, :description, with: ->(value) { value.to_s.strip }

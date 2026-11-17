@@ -20,6 +20,7 @@ const schema = z.object({
   description: z.string().trim().min(1, "can't be blank"),
   instructions: z.string().trim().min(1, "can't be blank"),
   editor_ids: z.array(z.string()),
+  reader_ids: z.array(z.string()),
 });
 
 type SkillFormValues = z.infer<typeof schema>;
@@ -33,6 +34,7 @@ function skillFormValues(skill: Skill): SkillFormValues {
     description: skill.description,
     instructions: skill.instructions,
     editor_ids: skill.editors.map((editor) => editor.id),
+    reader_ids: skill.readers.map((reader) => reader.id),
   };
 }
 
@@ -51,7 +53,7 @@ export function SkillForm({ skill, canManageEditors, onSubmit, cancelTo }: Skill
     resolver: zodResolver(schema),
     defaultValues: skill
       ? skillFormValues(skill)
-      : { name: "", description: "", instructions: NEW_SKILL_INSTRUCTIONS, editor_ids: [] },
+      : { name: "", description: "", instructions: NEW_SKILL_INSTRUCTIONS, editor_ids: [], reader_ids: [] },
   });
   const errors = form.formState.errors;
   const serverError = errors.root?.server?.message;
@@ -63,7 +65,10 @@ export function SkillForm({ skill, canManageEditors, onSubmit, cancelTo }: Skill
       instructions: values.instructions,
     };
     if (skill) input.lock_version = skill.lock_version;
-    if (canManageEditors) input.editor_ids = values.editor_ids;
+    if (canManageEditors) {
+      input.editor_ids = values.editor_ids;
+      input.reader_ids = values.reader_ids;
+    }
     try {
       await onSubmit(input);
     } catch (error) {
@@ -126,6 +131,16 @@ export function SkillForm({ skill, canManageEditors, onSubmit, cancelTo }: Skill
         </div>
       )}
 
+      {canManageEditors && (
+        <Controller
+          control={form.control}
+          name="reader_ids"
+          render={({ field }) => (
+            <EditorPicker value={field.value} onChange={field.onChange} current={skill?.readers ?? []} readers />
+          )}
+        />
+      )}
+
       <Controller
         control={form.control}
         name="instructions"
@@ -164,10 +179,12 @@ function EditorPicker({
   value,
   onChange,
   current,
+  readers = false,
 }: {
   value: string[];
   onChange: (ids: string[]) => void;
   current: SkillUser[];
+  readers?: boolean;
 }) {
   const candidates = useEditorCandidates(true);
   const options = useMemo<UserOption[]>(() => {
@@ -180,7 +197,7 @@ function EditorPicker({
 
   return (
     <div>
-      <p className="mb-2 block text-sm font-medium">Editors</p>
+      <p className="mb-2 block text-sm font-medium">{readers ? "Readers" : "Editors"}</p>
       {candidates.isError && (
         <ErrorAlert className="mb-2 max-w-xl">Could not load console users: {errorMessage(candidates.error)}</ErrorAlert>
       )}
@@ -189,14 +206,15 @@ function EditorPicker({
           options={options}
           value={value}
           onChange={onChange}
-          label="Editors"
+          label={readers ? "Readers" : "Editors"}
           placeholder="Search console users by name or email"
-          emptyText="No additional editors."
+          emptyText={readers ? "No additional readers." : "No additional editors."}
         />
       </div>
       <p className="mt-2 text-xs text-muted-foreground">
-        Editors can read and update this skill. Their names and emails are visible to anyone who can view the skill.
-        Only you can manage editors, visibility, or archiving.
+        {readers
+          ? "Readers can view private skills but cannot edit them. Only you can see and manage the reader list."
+          : "Editors can read and update this skill. Their names and emails are visible to anyone who can view the skill. Only you can manage editors, visibility, or archiving."}
       </p>
     </div>
   );

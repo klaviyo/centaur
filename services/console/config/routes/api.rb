@@ -122,6 +122,9 @@ namespace :api do
           get :editors
           post :add_editor, path: "editors"
           delete :remove_editor, path: "editors"
+          get :readers
+          post :add_reader, path: "readers"
+          delete :remove_reader, path: "readers"
         end
       end
       # Permission management from an active Console admin's Slack DM.

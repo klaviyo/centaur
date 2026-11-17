@@ -34,6 +34,7 @@ export interface Skill extends Omit<SkillSummary, "viewer"> {
   checksum: string;
   created_at: string | null;
   editors: SkillUser[];
+  readers: SkillUser[];
   viewer: { owner: boolean; can_edit: boolean; can_manage: boolean; can_unshare: boolean };
 }
 
@@ -44,6 +45,8 @@ export interface SkillInput {
   lock_version?: number;
   /** Omit to keep the current editors (only owners may send it). */
   editor_ids?: string[];
+  /** Owner-only reader grants; omitted leaves current access unchanged. */
+  reader_ids?: string[];
 }
 
 export function userLabel(user: SkillUser): string {

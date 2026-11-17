@@ -4,8 +4,8 @@ module Api
       # Console skill authoring for any active user (the SPA's Skills pages).
       #
       # Visibility follows the catalog: shared skills, the caller's own skills,
-      # and skills the caller edits. Anything else is a 404. Owners and editors
-      # update content; only the owner manages editors, visibility, and
+      # and skills the caller reads or edits. Anything else is a 404. Owners and editors
+      # update content; only the owner manages readers, editors, visibility, and
       # archiving. An admin may additionally make any shared skill
       # private (moderation). Admins otherwise get no extra access here.
       class SkillsController < BaseController
@@ -15,7 +15,7 @@ module Api
 
         def index
           tab = params[:tab].to_s == "mine" ? "mine" : "directory"
-          skills = tab == "mine" ? Skill.editable_by(current_user) : Skill.active.shared
+          skills = tab == "mine" ? Skill.editable_by(current_user).or(Skill.active.where(id: SkillReader.where(user: current_user).select(:skill_id))) : Skill.active.shared
           query = params[:q].to_s.strip
           skills = skills.search(query) if query.present?
           skills = skills.includes(:user).order(updated_at: :desc, id: :asc)
@@ -28,7 +28,7 @@ module Api
 
         def create
           skill = current_user.skills.new(skill_attributes.except(:lock_version))
-          authoring = SkillAuthoring.new(skill, editor_ids: submitted_editor_ids || [])
+          authoring = SkillAuthoring.new(skill, editor_ids: submitted_editor_ids || [], reader_ids: submitted_reader_ids || [])
           return render_skill_errors(skill) unless authoring.save
 
           render json: { data: detail_payload(skill) }, status: :created
@@ -38,7 +38,7 @@ module Api
           skill = Skill.editable_by(current_user).find_by_oid!(params[:id])
           skill.assign_attributes(skill_attributes)
           editor_ids = owner?(skill) ? submitted_editor_ids : nil
-          return render_skill_errors(skill) unless SkillAuthoring.new(skill, editor_ids: editor_ids).save
+          return render_skill_errors(skill) unless SkillAuthoring.new(skill, editor_ids: editor_ids, reader_ids: owner?(skill) ? submitted_reader_ids : nil).save
 
           render json: { data: detail_payload(skill) }
         rescue ActiveRecord::StaleObjectError
@@ -100,6 +100,13 @@ module Api
           Array(data.permit(editor_ids: [])[:editor_ids])
         end
 
+        def submitted_reader_ids
+          data = params.require(:data)
+          return nil unless data.key?(:reader_ids)
+
+          Array(data.permit(reader_ids: [])[:reader_ids])
+        end
+
         def render_skill_errors(skill)
           details = skill.errors.as_json
           details[:instructions] = details.delete(:content) if details.key?(:content)
@@ -129,6 +136,7 @@ module Api
             checksum: skill.checksum,
             created_at: skill.created_at.iso8601,
             editors: editors.map { |editor| user_payload(editor) },
+            readers: owner ? skill.readers.order(:email).map { |reader| user_payload(reader) } : [],
             viewer: {
               owner: owner,
               can_edit: owner || skill.editors.exists?(current_user.id),

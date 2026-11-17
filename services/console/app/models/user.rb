@@ -16,6 +16,8 @@ class User < ApplicationRecord
   has_many :scheduled_tasks, foreign_key: :author_id, dependent: :restrict_with_error
   has_many :skill_editor_assignments, class_name: "SkillEditor", dependent: :destroy
   has_many :edited_skills, through: :skill_editor_assignments, source: :skill
+  has_many :skill_reader_assignments, class_name: "SkillReader", dependent: :destroy
+  has_many :readable_skills, through: :skill_reader_assignments, source: :skill
   belongs_to :approved_by, class_name: "User", optional: true
 
   after_update :revoke_mcp_oauth_refresh_tokens_when_disabled,
