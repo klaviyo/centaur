@@ -476,6 +476,16 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_10_220120) do
     t.index ["user_id"], name: "index_skill_editors_on_user_id"
   end
 
+  create_table "skill_readers", force: :cascade do |t|
+    t.bigint "skill_id", null: false
+    t.bigint "user_id", null: false
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["skill_id", "user_id"], name: "index_skill_readers_on_skill_id_and_user_id", unique: true
+    t.index ["skill_id"], name: "index_skill_readers_on_skill_id"
+    t.index ["user_id"], name: "index_skill_readers_on_user_id"
+  end
+
   create_table "skills", force: :cascade do |t|
     t.datetime "archived_at"
     t.text "content", null: false
@@ -537,6 +547,22 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_10_220120) do
     t.string "oauth_app_slug", null: false
     t.datetime "updated_at", null: false
     t.index ["oauth_app_slug"], name: "index_slack_dm_sync_cursors_on_oauth_app_slug", unique: true
+  end
+
+  create_table "ssh_connections", force: :cascade do |t|
+    t.bigint "user_id", null: false
+    t.string "name", null: false
+    t.string "destination"
+    t.string "username"
+    t.text "host_key"
+    t.text "public_key", null: false
+    t.text "private_key"
+    t.string "generation", null: false
+    t.datetime "expires_at"
+    t.datetime "revoked_at"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["user_id"], name: "index_ssh_connections_on_user_id", unique: true
   end
 
   create_table "ssh_key_secrets", force: :cascade do |t|
@@ -679,9 +705,12 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_10_220120) do
   add_foreign_key "secret_sources", "static_secrets"
   add_foreign_key "skill_editors", "skills", on_delete: :cascade
   add_foreign_key "skill_editors", "users", on_delete: :cascade
+  add_foreign_key "skill_readers", "skills", on_delete: :cascade
+  add_foreign_key "skill_readers", "users", on_delete: :cascade
   add_foreign_key "skills", "users", on_delete: :cascade
   add_foreign_key "slack_channel_permissions", "principals"
   add_foreign_key "slack_channel_permissions", "roles"
+  add_foreign_key "ssh_connections", "users"
   add_foreign_key "ssh_key_secrets", "users", column: "created_by_id"
   add_foreign_key "ssh_key_secrets", "users", column: "owner_id"
   add_foreign_key "static_secrets", "broker_credentials"
