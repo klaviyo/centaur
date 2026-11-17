@@ -284,3 +284,8 @@ class RunlayerClient:
 
     def __exit__(self, *_):
         self.close()
+
+
+def _client() -> RunlayerClient:
+    """Factory used by centaur-tools to dispatch programmatic instance methods."""
+    return RunlayerClient()

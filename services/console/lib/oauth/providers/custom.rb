@@ -71,7 +71,8 @@ module Oauth
       def credential_request_rules
         resource = URI.parse(@config["resource"])
         path = resource.path
-        [ { host: resource.host, http_methods: [], paths: path.blank? || path == "/" ? [] : [ path ] } ]
+        methods = @app&.labels&.fetch("centaur-tool", nil) == "runlayer" ? %w[GET POST DELETE] : []
+        [ { host: resource.host, http_methods: methods, paths: path.blank? || path == "/" ? [] : [ path ] } ]
       end
 
       def identity_from(result, client_id:, http_client: HttpClient.new)
