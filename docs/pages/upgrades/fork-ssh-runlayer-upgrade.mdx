@@ -1,0 +1,294 @@
+---
+title: Upgrade a fork with legacy personal credentials
+description: Preserve migration history and convert legacy SSH and Runlayer records.
+---
+
+This procedure is for forks with the legacy `ssh_connections` table and
+`provider="runlayer"` OAuth apps. It accompanies the upstream Console, SSH,
+custom OAuth provider and owner-only credential implementations. It does not
+deploy anything or change migration history automatically.
+
+## Source and artifact contract
+
+Keep `main` an exact mirror of the selected upstream commit. This candidate
+starts at upstream `d452355fcd8868ffefb11407e52cd1458c75495a`; only
+`klaviyo-main` carries the reviewed, still-required deployment and non-upstream
+feature patches. The previous deployed fork
+`f9fce21786a17a09e50567626502ec061511336c` is an upgrade input for database and
+runtime compatibility, not a Git ancestor of this candidate. Do not merge the
+old fork into it or merge these patches into the upstream mirror.
+
+For future updates, synchronize the mirror to the selected upstream commit,
+create a candidate from that commit, and reapply required patches individually.
+Review against the exact upstream baseline, retain applied migration files
+unchanged, and rerun fresh-install, upgrade and credential-isolation checks.
+Drop patches when upstream supplies their behavior. A temporary pure-upstream
+review base can expose the patch-only diff; that review PR is not an instruction
+to merge the candidate into `main` or the old fork branch.
+
+After review, promote the candidate as the patched `klaviyo-main` lineage.
+Merging it into the old fork would retain the old ancestry. Replacing an
+existing protected branch, changing the default branch, or updating deployment
+pins requires a separate explicit review and approval. This procedure performs
+none of those operations; `main` must remain an exact upstream mirror.
+
+Publish a coherent release of all 13 images in `publish-images.yml`:
+`centaur-api-rs`, `centaur-company-context`, `centaur-proxy-sync`,
+`centaur-codemode`, `centaur-token-broker`, `centaur-slackbotv2`,
+`centaur-linearbot`, `centaur-discordbot`, `centaur-githubbot`,
+`centaur-teamsbot`, `centaur-agent`, `centaur-iron-proxy` and `centaur-console`.
+Record immutable digests, including agent and CodeMode images created dynamically
+by API workloads. Building an ingress image does not authorize enabling that
+ingress. Retain the canonical upstream Ironproxy dependency pin.
+
+Compare rendered configuration before rollout. The Console image now serves the
+React UI; retain its login/session and Active Record encryption configuration.
+CodeMode requires the matching `codemode.image` when `apiRs.mcpV2Enabled` is on.
+The token broker needs the Console database and the same
+`IRON_CONTROL_AR_ENCRYPTION_PRIMARY_KEY` and
+`IRON_CONTROL_AR_ENCRYPTION_KEY_DERIVATION_SALT`; keep these values out of logs.
+Do not generate replacement encryption keys during this upgrade.
+`apiClients.enabled` defaults false; enable it only with an explicit consumer
+bootstrap and principal-binding review. Compare the target chart's environment
+and secret references rather than copying an old deployment's variables blindly.
+
+The candidate uses canonical upstream SSH configuration and derivation without
+legacy environment aliases or the fork's derivation label. Follow the SSH
+transition below before starting new SSH workloads. Upstream personal-key grants
+deliberately replace requester key delegation: a shared channel does not inherit
+the requester's personal key. Any channel/workflow access requires a separate
+explicit grant reviewed for that principal; the conversion below creates none.
+
+## Canonical SSH deployment transition
+
+Rename the API environment variable `CENTAUR_EE_SSH_SEED` to
+`CENTAUR_SSH_SEED`. Reference the same existing Secret and key, preserving its
+bytes; do not create a new seed as part of the rename. For example, adapt the
+existing environment entry without displaying its value:
+
+```yaml
+- name: CENTAUR_SSH_SEED
+  valueFrom:
+    secretKeyRef:
+      name: existing-ssh-secret
+      key: existing-seed-key
+```
+
+This is a deployment configuration change, not a database update. No SQL is
+needed for the rename. The new API has no fallback for the old variable name;
+its configured seed must satisfy the upstream minimum of 32 bytes.
+
+Preserving seed bytes alone does not preserve the fork's disposable sandbox
+identities: upstream uses derivation label `centaur-ssh-v1` instead of
+`centaur-ee-ssh-v1`. Keys derive from the label, seed, per-sandbox proxy service
+name (`iron_proxy_service_name(id)`) and client/host purpose. Consequently both
+the sandbox client identity and its paired proxy host identity change.
+The API delivers the client private key and pinned proxy host public key to the
+sandbox through `CENTAUR_SSH`; it delivers the host private key and authorized
+client public key to the proxy through `IRON_SSH_CONFIG_JSON`.
+
+Before enabling the new API and sandbox/proxy images:
+
+1. Quiesce SSH sessions and session execution that could create or reconnect
+   sandbox/proxy pairs. Record which retained pairs use the old derivation.
+2. Through the reviewed deployment lifecycle, drain and recreate each old
+   sandbox together with its paired proxy using the coherent new images and
+   configurations. Do not leave an old sandbox pin/client key paired with a new
+   proxy identity, or a new sandbox paired with an old proxy. A control-plane
+   image update alone does not establish that retained pairs were recreated.
+3. Verify the new paired fingerprints through a trusted control-plane channel
+   and test a permitted connection with strict host verification before
+   resuming sessions. Do not disable `StrictHostKeyChecking`, accept an
+   unexplained changed fingerprint, or print private keys/configuration JSON.
+
+These disposable paired identities are separate from enrolled user SSH keys in
+Console. Their rotation does not rotate stored user key material. The guarded
+converter below preserves each eligible user's private/public key material and
+legacy row, records the old-row mapping, and grants the new key only to verified
+owner principals. Do not rewrite keys or migration history with ad-hoc SQL.
+
+## Minimum deployment overrides
+
+An older values file can pass the new chart schema while still omitting new
+runtime images. Do not treat a successful render as a deployable release.
+Explicitly pin these additional images alongside the existing service pins:
+
+```yaml
+codemode:
+  image:
+    repository: registry.example.com/centaur-codemode
+    tag: "<upgrade-commit>"
+tokenBroker:
+  enabled: false # Keep refresh writers stopped until conversion is verified.
+  image:
+    repository: registry.example.com/centaur-token-broker
+    tag: "<upgrade-commit>"
+apiClients:
+  enabled: false
+```
+
+`tokenBroker.enabled` otherwise defaults true, with an unqualified `latest`
+image. Add the deployment's appropriate `nodeSelector`, tolerations and resource
+settings for this new workload, and verify its database/DNS/HTTPS connectivity.
+Its database and encryption secret references must resolve to the same Console
+store and existing encryption keys; it must not use the session database.
+After conversion and verification, enable the reviewed broker configuration.
+The Code Mode image is also used for dynamically created sandboxes when
+`apiRs.mcpV2Enabled` is enabled; its registry access and sandbox/proxy network
+policy must be verified separately from the API Deployment's image pull.
+
+## Automation before branch promotion
+
+The patched deployment branch's image publisher is its Buildkite ECR pipeline.
+Upstream GitHub image jobs target another registry namespace and Depot project.
+Keep fork-specific publishing guards and runner/deployment settings in the
+`klaviyo-main` patch series or repository settings; do not patch the exact
+upstream `main` mirror to configure the fork.
+
+Before enabling GitHub Actions or changing the default branch, review runner
+availability, branch triggers, publication namespaces, Depot projects,
+credentials, overlay notifications, chart-version auto-merge, chart releases and
+documentation deployment. Disabled Actions and absent runners are not evidence
+that these workflows are configured safely for later activation. Review the
+patched branch's guards before enabling automation; do not enable upstream jobs
+against foreign namespaces or supply upstream credentials merely to make a
+check run. Branch promotion and automation enablement are separate reviewed
+operations.
+
+## Preflight and backup
+
+1. Pin the old and new source commits and image digests for Console, API,
+   proxy-sync, token broker, sandbox and chat ingress. Record their configuration,
+   including the chosen text-search backend. Review the complete upstream sync:
+   React Console, API clients and scheduled-task ownership are part of that sync.
+2. Take recoverable encrypted backups of the API and all Console databases.
+   Separately verify access to the existing Rails encryption configuration.
+   Test restoring backups into an isolated database before proceeding. Never
+   print connection URLs, encryption keys, SSH keys or OAuth tokens.
+3. Record `_sqlx_migrations` versions/checksums and Console `schema_migrations`.
+   Compare them with the exact target binary's migration list. Keep applied
+   migrations immutable: do not renumber files, delete history rows, rebaseline
+   SQLx, or replace existing checksums just to pass startup validation.
+4. Keep the applied fork migrations `20261027183903_create_skill_readers.rb`
+   and `20261029162508_create_ssh_connections.rb`. Some fork databases also have
+   older history rows `20261016150807`, `20261029211259` and `20261029221757` whose
+   files were removed or folded into later fork source. These records predate
+   this upgrade. Leave them intact; blindly restoring the folded SSH migrations
+   can repeat column operations already included in the final creation migration.
+5. Compare the API core and selected search-backend migrations byte for byte,
+   including SQLx's documented legacy checksum overrides. In the matching
+   baseline no API migration or API data rewrite is needed for these credential
+   changes. If your baseline differs, stop and reconcile the exact mismatch;
+   do not assume another installation's index rollback or migration state.
+
+All examples run inside the Console application directory, using an explicitly
+selected database and deployment identity. Commands below can change that
+database when marked apply. Replace placeholders and use your normal reviewed
+deployment workflow; do not point local tests at a deployed database.
+
+## Quiesce writers and install additive schema
+
+Pause old Console credential/key edits, scheduled refresh workers, the new
+token broker and any other credential writers. Keep both old and new refresh
+processes stopped until conversion and verification are complete. Retain the old
+tables and credentials through the rollback window. After quiescing, capture a
+final consistent restore point and baseline migration, row and ownership counts
+before applying schema or credential changes.
+
+Run the target Console's normal database migration workflow. The full upstream
+sync adds these primary-database migrations:
+
+| Version | Effect | Upgrade invariant |
+| --- | --- | --- |
+| `20261104232304` | API clients and client/principal bindings | Existing MCP OAuth clients and operator API keys are separate; do not reinterpret their secrets as API-client secrets. |
+| `20261106204641` | Scheduled tasks gain optional principal ownership | Existing author-owned tasks keep `author_id`; every task must have exactly one of author/principal. |
+| `20261106212027` | OAuth apps gain `provider_config` | Existing apps initially receive an empty object; this alone does not convert Runlayer. |
+| `20261109021725` | SSH key secrets, owned secret sources and grants | Keep legacy SSH rows until conversion and rollback validation finish. |
+| `20261110220120` | OAuth apps gain `owner_only` | Existing apps default false; legacy Runlayer must be explicitly converted. |
+
+Use `bin/rails db:migrate` through the intended deployment migration job. Do not
+load `schema.rb` into an existing database. Confirm migrations have completed
+before starting any runtime expecting the new columns. Cache, queue and cable
+schemas must also be checked against the selected target; do not reset them.
+
+For scheduled tasks, verify the owner XOR constraint and existing author/task
+counts before resuming the scheduler. Channel-owned tasks require an explicit
+principal assignment; this upgrade does not infer owners from names or labels.
+For API clients, follow [API clients](/operate/api-clients) to create a new,
+scoped client and explicit principal binding only when a consumer needs one.
+Capture its one-time secret using the approved secret-delivery path. Creation
+is a separate authorized bootstrap action, not part of this converter.
+
+## Preview both credential conversions
+
+With writers still stopped, run both previews against the upgraded schema:
+
+```sh
+bin/rails legacy_ssh_keys:upgrade
+RESOURCE_URL=https://tenant.example.com/mcp bin/rails runlayer:migrate_legacy
+```
+
+The SSH preview reports counts only and writes nothing. A prior count of active
+keys does not prove convertibility: finite future expiry and destination-policy
+compatibility must still be checked by this preview and the deployment review.
+Review the eligible count and the deployment's new SSH target policy before applying. The new model
+does not carry legacy per-key destination, username, host pin, generation or
+expiry fields. Review how the deployment's gateway allowlist replaces those
+settings; acknowledging that review is an explicit apply prerequisite.
+Active keys with a finite future expiry fail closed because conversion would
+otherwise turn them into unbounded credentials. Revoked, expired and inactive
+owners' records are skipped rather than reactivated. Resolve blocking policies
+or conflicts explicitly; do not clear their fields to make the task pass.
+
+Runlayer's `RESOURCE_URL` must be the original exact HTTPS MCP resource. The
+preview validates existing resource, endpoints, ownership, scope and proxy
+rules before changing an app to the upstream custom provider. It does not
+register another OAuth client or rotate tokens. A missing or inconsistent
+resource binding is a stop condition, not a reason to infer a tenant URL.
+
+## Apply and verify
+
+After both previews succeed and their counts are reviewed, set
+`REVIEWED_ACTIVE_KEYS` to that reviewed nonnegative count:
+
+```sh
+EXPECTED_ACTIVE_KEYS="$REVIEWED_ACTIVE_KEYS" SSH_DEPLOYMENT_POLICY_REVIEWED=true APPLY=true bin/rails legacy_ssh_keys:upgrade
+RESOURCE_URL=https://tenant.example.com/mcp APPLY=true bin/rails runlayer:migrate_legacy
+```
+
+Each converter has its own transaction. A successful first conversion is not
+rolled back by failure of the second: leave writers paused, fix the reported
+precondition, and rerun previews. Repeated SSH applies verify the same migration
+marker, owner and public key instead of replacing existing keys. A conflicting
+upstream personal key is never overwritten. Private keys are decrypted only
+inside the process and saved through the new encrypted secret-source attribute;
+neither keys nor tokens appear in command output.
+
+Verify old SSH row counts are unchanged, eligible owners map one-to-one to the
+expected upstream keys, and public-key fingerprints match. Grants may reach
+only each active owner's Console principal and unambiguously verified Slack DM
+principal. Shared/channel/workflow principals and roles must not receive an
+implicit personal-key grant. Verify Runlayer app/credential IDs, owners,
+encrypted client fields, token records, wrappers, rules and grants are preserved.
+
+Complete the paired SSH identity transition above and roll out the matching
+API, Console, proxy-sync, token broker, sandbox CLI and ingress artifacts and
+configuration together. The old CLI's provider lookup is not
+compatible after the Runlayer app is converted. Resume only the canonical token
+broker after checking its custom-provider refresh configuration; do not run the
+retired Console refresh loop beside it. Validate two-user separation, refresh,
+reconnect/disconnect, catalog discovery, path/verb restrictions and a controlled
+SSH connection through an allowed deployment target. Do not treat process
+readiness or unit tests as proof of credential delivery.
+
+## Rollback boundary
+
+The converters retain legacy rows, but do not dual-write them. Before allowing
+new keys, reconnects or new upstream grants, rehearse rollback on the restored
+copy and record the exact old app metadata needed to restore provider behavior.
+After new writes, reverting binaries alone can lose visibility of new
+credentials or use stale keys. Reverting the SSH derivation also requires a
+coherent paired sandbox/proxy identity transition; old and new pins cannot be
+mixed. Quiesce writers again and perform a reviewed
+reverse reconciliation or restore the backup before rolling back. Never drop
+old tables or migration history as part of the initial cutover.
