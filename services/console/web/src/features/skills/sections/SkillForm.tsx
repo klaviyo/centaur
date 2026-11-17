@@ -67,7 +67,12 @@ export function SkillForm({ skill, canManageEditors, onSubmit, cancelTo }: Skill
     if (skill) input.lock_version = skill.lock_version;
     if (canManageEditors) {
       input.editor_ids = values.editor_ids;
-      input.reader_ids = values.reader_ids;
+      const currentReaderIds = new Set(skill?.readers.map((reader) => reader.id) ?? []);
+      const readersChanged = values.reader_ids.length !== currentReaderIds.size
+        || values.reader_ids.some((id) => !currentReaderIds.has(id));
+      // An unchanged grant may now belong to a disabled account. Leaving the
+      // field out preserves it without treating a content edit as a new grant.
+      if (!skill || readersChanged) input.reader_ids = values.reader_ids;
     }
     try {
       await onSubmit(input);

@@ -20,12 +20,22 @@ const skill: Skill = {
 };
 
 describe("skill reader controls", () => {
-  it("preserves the owner's explicit reader grants when saving content", async () => {
+  it("omits unchanged reader grants when saving content", async () => {
     const save = vi.fn().mockResolvedValue(undefined);
     render(<MemoryRouter><SkillForm skill={skill} canManageEditors onSubmit={save} cancelTo="/" /></MemoryRouter>);
     expect(screen.getByRole("combobox", { name: "Readers" })).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), { target: { value: "# Updated guide" } });
     fireEvent.click(screen.getByRole("button", { name: "Save skill" }));
-    await waitFor(() => expect(save).toHaveBeenCalledWith(expect.objectContaining({ reader_ids: [reader.id], lock_version: 3 })));
+    await waitFor(() => expect(save).toHaveBeenCalledWith(expect.objectContaining({ instructions: "# Updated guide", lock_version: 3 })));
+    expect(save.mock.calls.at(0)?.[0]).not.toHaveProperty("reader_ids");
+  });
+
+  it("submits changed reader grants, including explicit removal", async () => {
+    const save = vi.fn().mockResolvedValue(undefined);
+    render(<MemoryRouter><SkillForm skill={skill} canManageEditors onSubmit={save} cancelTo="/" /></MemoryRouter>);
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save skill" }));
+    await waitFor(() => expect(save).toHaveBeenCalledWith(expect.objectContaining({ reader_ids: [] })));
   });
 
   it("does not expose reader management or submit reader grants for an editor", async () => {

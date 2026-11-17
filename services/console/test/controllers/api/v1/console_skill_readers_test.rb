@@ -50,6 +50,25 @@ module Api
         assert_response :not_found
       end
 
+      test "omitted reader grants preserve disabled readers during content edits" do
+        @reader.update!(status: :disabled)
+        sign_in_console(@owner)
+        get api_v1_console_skill_path(@skill.oid)
+        assert_equal [ @reader.oid ], json_body.dig("data", "readers").map { |reader| reader["id"] }
+        patch api_v1_console_skill_path(@skill.oid),
+              params: { data: { instructions: "Updated without changing readers" } },
+              headers: csrf_headers, as: :json
+        assert_response :ok
+        assert_equal "Updated without changing readers", @skill.reload.content
+        assert_equal [ @reader.id ], @skill.reader_ids
+
+        patch api_v1_console_skill_path(@skill.oid),
+              params: { data: { instructions: "Rejected reader selection", reader_ids: [ @reader.oid ] } },
+              headers: csrf_headers, as: :json
+        assert_response :unprocessable_entity
+        assert_equal "Updated without changing readers", @skill.reload.content
+      end
+
       test "invalid reader grants reject the entire content update" do
         sign_in_console(@owner)
         original = @skill.content
