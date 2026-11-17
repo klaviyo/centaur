@@ -109,4 +109,3 @@ export async function check_plagiarism(
 ): Promise<PlagiarismReport> {
   return request(ctx, PLAGIARISM_BASE, { method: "POST", body: { text: args.text } });
 }
-
