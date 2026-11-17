@@ -1,0 +1,76 @@
+env:
+  AWS_ECR_LOGIN_REGISTRY_IDS: "340433579684,439508887365"
+  DOCKER_BUILDKIT: "1"
+
+# centaur-dev uses x86 nodes.
+agents:
+  queue: default-large-amd
+
+steps:
+  - group: "Publish images to eng and dev ECR"
+    steps:
+      - label: "Publish api-rs (AMD64)"
+        timeout_in_minutes: 120
+        command: |
+          kbc docker-utils build-and-publish -f services/api-rs/Dockerfile -i klaviyo-centaur-api-rs -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
+
+      - label: "Publish company-context (AMD64)"
+        timeout_in_minutes: 120
+        command: |
+          kbc docker-utils build-and-publish -f services/company-context/Dockerfile -i klaviyo-centaur-company-context -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
+
+      - label: "Publish proxy-sync (AMD64)"
+        timeout_in_minutes: 120
+        command: |
+          kbc docker-utils build-and-publish -f services/proxy-sync/Dockerfile -i klaviyo-centaur-proxy-sync -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
+
+      - label: "Publish slackbotv2 (AMD64)"
+        timeout_in_minutes: 120
+        command: |
+          kbc docker-utils build-and-publish -f services/slackbotv2/Dockerfile -i klaviyo-centaur-slackbotv2 -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
+
+      - label: "Publish githubbot (AMD64)"
+        timeout_in_minutes: 120
+        command: |
+          kbc docker-utils build-and-publish -f services/githubbot/Dockerfile -i klaviyo-centaur-githubbot -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
+
+      - label: "Publish codemode (AMD64)"
+        timeout_in_minutes: 120
+        command: |
+          kbc docker-utils build-and-publish -f services/codemode/Dockerfile -i klaviyo-centaur-codemode -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
+
+      - label: "Publish token-broker (AMD64)"
+        timeout_in_minutes: 120
+        command: |
+          kbc docker-utils build-and-publish -f services/token-broker/Dockerfile -i klaviyo-centaur-token-broker -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
+
+      - label: "Publish linearbot (AMD64)"
+        timeout_in_minutes: 120
+        command: |
+          kbc docker-utils build-and-publish -f services/linearbot/Dockerfile -i klaviyo-centaur-linearbot -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
+
+      - label: "Publish discordbot (AMD64)"
+        timeout_in_minutes: 120
+        command: |
+          kbc docker-utils build-and-publish -f services/discordbot/Dockerfile -i klaviyo-centaur-discordbot -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
+
+      - label: "Publish teamsbot (AMD64)"
+        timeout_in_minutes: 120
+        command: |
+          kbc docker-utils build-and-publish -f services/teamsbot/Dockerfile -i klaviyo-centaur-teamsbot -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
+
+      - label: "Publish agent (AMD64)"
+        timeout_in_minutes: 120
+        command: |
+          set -euo pipefail
+          kbc docker-utils build-and-publish -f services/sandbox/Dockerfile --target sandbox -i klaviyo-centaur-agent -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
+
+      - label: "Publish iron-proxy (AMD64)"
+        timeout_in_minutes: 120
+        command: |
+          kbc docker-utils build-and-publish -f services/iron-proxy/Dockerfile -i klaviyo-centaur-iron-proxy -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev
+
+      - label: "Publish console (AMD64)"
+        timeout_in_minutes: 120
+        command: |
+          kbc docker-utils build-and-publish -f services/console/Dockerfile -i klaviyo-centaur-console -t ${BUILDKITE_COMMIT} -b RUST_BUILD_PROFILE=release -a eng -a dev

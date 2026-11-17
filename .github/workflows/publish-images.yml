@@ -47,10 +47,12 @@ jobs:
   # Build each image with Depot's hosted builders, push by digest, and hand
   # the digests to the merge job below which assembles the multi-arch manifest.
   # arm64 is only built on pushes to main and release tags — PR and manual
+  # The fork publishes through Buildkite ECR; these hosted builders and the
+  # registry/overlay below belong to the upstream repository.
   # dispatch builds stay amd64-only to keep iteration fast. Fork PRs skip both
   # jobs so untrusted changes do not run on the hosted image builders.
   build:
-    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+    if: ${{ github.repository == 'paradigmxyz/centaur' && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) }}
     runs-on: ${{ matrix.platform == 'linux/arm64' && 'depot-ubuntu-24.04-arm-16' || 'depot-ubuntu-24.04-16' }}
     # Warm builds finish in a few minutes and a cold agent build in well under
     # this. A stalled remote build step otherwise holds the run (and, on main,
@@ -196,7 +198,7 @@ jobs:
   merge:
     runs-on: depot-ubuntu-24.04
     needs: build
-    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+    if: ${{ github.repository == 'paradigmxyz/centaur' && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) }}
     strategy:
       fail-fast: false
       matrix:
@@ -268,7 +270,7 @@ jobs:
   # Runs the e2e scenarios against the images just published.
   e2e:
     needs: merge
-    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
+    if: ${{ github.repository == 'paradigmxyz/centaur' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') }}
     permissions:
       contents: read
     uses: ./.github/workflows/e2e.yml
@@ -276,7 +278,7 @@ jobs:
   notify-centaur-paradigm:
     name: Notify Paradigm Overlay
     needs: merge
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.repository == 'paradigmxyz/centaur' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: depot-ubuntu-24.04
     environment: centaur-paradigm-dispatch
     permissions: {}
