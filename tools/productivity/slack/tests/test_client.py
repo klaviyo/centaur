@@ -1,7 +1,9 @@
 import base64
 import datetime as dt
 import email.message
+import io
 import json
+from pathlib import Path
 
 import pytest
 import slack.client as slack_client
@@ -146,7 +148,6 @@ def _make_client() -> tuple[SlackClient, _FakeWebClient]:
     client = SlackClient.__new__(SlackClient)
     fake_web_client = _FakeWebClient()
     client._client = fake_web_client
-    client._search_client = fake_web_client
     client._user_cache = {}
     client._ratelimit_deadlines = {}
     client._resolve_channel = lambda channel: "C123"  # type: ignore[method-assign]
@@ -501,10 +502,8 @@ def test_get_channel_history_page_surfaces_structured_auth_failure() -> None:
     }
 
 
-def test_get_user_profile_reads_labeled_custom_fields_with_direct_client() -> None:
-    client, fake_bot_client = _make_client()
-    fake_web_client = _FakeWebClient()
-    client._search_client = fake_web_client
+def test_get_user_profile_reads_labeled_custom_fields() -> None:
+    client, fake_web_client = _make_client()
     fake_web_client.user_info_response = {
         "user": {
             "id": "U123",
@@ -534,8 +533,6 @@ def test_get_user_profile_reads_labeled_custom_fields_with_direct_client() -> No
 
     assert fake_web_client.users_calls == [{"user": "U123"}]
     assert fake_web_client.user_profile_calls == [{"user": "U123", "include_labels": True}]
-    assert fake_bot_client.users_calls == []
-    assert fake_bot_client.user_profile_calls == []
     assert profile["custom_fields"] == {"Affiliations": "GitHub: test-user"}
     assert profile["raw_custom_fields"] == {
         "Xf123": {"label": "Affiliations", "value": "GitHub: test-user", "alt": ""}
@@ -896,38 +893,42 @@ def test_upload_file_proxy_posts_file_bytes_to_centaur_api(
     }
 
 
-def test_download_file_proxy_returns_base64_file(
-    monkeypatch: pytest.MonkeyPatch,
+def test_download_file_proxy_streams_file_to_disk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     import urllib.parse
     import urllib.request
 
     client, _ = _make_client()
     request_info: dict[str, str | None] = {}
+    body = b"%PDF" + b"x" * (3 * 64 * 1024)
 
     def fake_urlopen(req, *args, **kwargs):
         request_info["url"] = req.full_url
         request_info["authorization"] = req.get_header("Authorization")
         return _FakeHTTPResponse(
-            b"%PDF",
+            body,
             "application/pdf",
-            {"Content-Disposition": 'attachment; filename="report.pdf"'},
+            {"Content-Disposition": 'attachment; filename="../report.pdf"'},
         )
 
     monkeypatch.setenv("CENTAUR_API_URL", "http://api.internal:8080")
     monkeypatch.setenv("CENTAUR_API_BEARER_TOKEN", "test-jwt")
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
-    result = client.download_file_proxy(file_id="F123456789", channel_id="C123456789")
+    result = client.download_file_proxy(
+        file_id="F123456789", channel_id="C123456789", output_dir=tmp_path
+    )
 
     assert result == {
         "file_id": "F123456789",
         "channel_id": "C123456789",
         "filename": "report.pdf",
         "content_type": "application/pdf",
-        "size_bytes": 4,
-        "content_base64": base64.b64encode(b"%PDF").decode(),
+        "size_bytes": len(body),
+        "output_path": str((tmp_path / "report.pdf").absolute()),
     }
+    assert (tmp_path / "report.pdf").read_bytes() == body
     assert request_info["authorization"] == "Bearer test-jwt"
     parsed = urllib.parse.urlparse(request_info["url"])
     assert parsed.path == "/api/slack/files/F123456789/download"
@@ -967,6 +968,22 @@ def test_file_info_proxy_calls_centaur_api(
     parsed = urllib.parse.urlparse(request_info["url"])
     assert parsed.path == "/api/slack/files/F123456789/info"
     assert urllib.parse.parse_qs(parsed.query) == {"channel_id": ["C123456789"]}
+
+
+def test_get_user_email_proxy_calls_centaur_api() -> None:
+    client, _ = _make_client()
+    calls: list[tuple[str, dict]] = []
+
+    def fake_get_json(path, params):
+        calls.append((path, params))
+        return {"ok": True, "user_id": "U123456789", "email": "person@example.com"}
+
+    client._centaur_api_get_json = fake_get_json  # type: ignore[method-assign]
+
+    assert client.get_user_email_proxy(" u123456789 ") == "person@example.com"
+    assert calls == [("/api/slack/users/U123456789/email", {})]
+    with pytest.raises(ValueError, match="user_id"):
+        client.get_user_email_proxy("C123456789")
 
 
 def test_get_channel_members_proxy_paginates_and_resolves_names() -> None:
@@ -1138,10 +1155,8 @@ def test_search_files_paginates_proxy_until_enough_matches() -> None:
     assert [result["id"] for result in results] == ["F123456789"]
 
 
-def test_search_files_direct_uses_user_token_client() -> None:
-    client, fake_bot_client = _make_client()
-    fake_web_client = _FakeWebClient()
-    client._search_client = fake_web_client
+def test_search_files_direct_lists_files_with_sdk_client() -> None:
+    client, fake_web_client = _make_client()
     client._get_user_cache = lambda **_: {"U123456789": "alice"}  # type: ignore[method-assign]
     client.list_files_proxy = pytest.fail  # type: ignore[method-assign]
     fake_web_client.files_list_pages = [
@@ -1167,25 +1182,22 @@ def test_search_files_direct_uses_user_token_client() -> None:
     results = client.search_files_direct("report", max_results=10)
 
     assert fake_web_client.files_list_calls == [{"count": 200, "page": 1}]
-    assert fake_bot_client.files_list_calls == []
     assert results[0]["user"] == "alice"
 
 
-def test_search_files_direct_reports_user_token_auth_failure() -> None:
-    client, _ = _make_client()
-    fake_search_client = _FakeWebClient()
-    client._search_client = fake_search_client
+def test_search_files_direct_reports_auth_failure() -> None:
+    client, fake_web_client = _make_client()
     client._get_user_cache = lambda **_: {}  # type: ignore[method-assign]
 
     def fail_files_list(**kwargs):
         raise _make_slack_error(error="missing_scope", status_code=200)
 
-    fake_search_client.files_list = fail_files_list  # type: ignore[method-assign]
+    fake_web_client.files_list = fail_files_list  # type: ignore[method-assign]
 
     with pytest.raises(SlackAuthError) as excinfo:
         client.search_files_direct("report")
 
-    assert excinfo.value.payload["access_path"] == "search_token"
+    assert excinfo.value.payload["access_path"] == "bot_token"
     assert excinfo.value.payload["slack_method"] == "files.list"
 
 
@@ -1289,24 +1301,22 @@ def test_search_messages_direct_uses_native_filters_without_scanning_history() -
 
 
 def test_unscoped_search_surfaces_missing_user_scope_without_scanning_history() -> None:
-    client, _ = _make_client()
-    search_client = _FakeWebClient()
+    client, search_client = _make_client()
 
     def fail_native_search(method: str, *, params: dict) -> None:
         assert method == "search.messages"
         raise _make_slack_error(error="missing_scope", status_code=200)
 
     search_client.api_call = fail_native_search  # type: ignore[method-assign]
-    client._search_client = search_client
 
     with pytest.raises(SlackAuthError) as exc_info:
         client.search_messages_direct("fire-drill after:2026-08-10")
 
     assert exc_info.value.payload == {
         "error": "slack_auth_failed",
-        "message": "Slack authentication failed for search.messages via search_token",
+        "message": "Slack authentication failed for search.messages via bot_token",
         "slack_method": "search.messages",
-        "access_path": "search_token",
+        "access_path": "bot_token",
         "error_code": "missing_scope",
         "status_code": 200,
         "requested_channel": None,
@@ -1678,7 +1688,7 @@ class _FakeHTTPResponse:
     def __init__(
         self, body: bytes, content_type: str, headers: dict[str, str] | None = None
     ) -> None:
-        self._body = body
+        self._body = io.BytesIO(body)
         self._content_type = content_type
         self._headers = headers or {}
 
@@ -1688,8 +1698,8 @@ class _FakeHTTPResponse:
     def __exit__(self, *exc: object) -> bool:
         return False
 
-    def read(self, _amt: int = -1) -> bytes:
-        return self._body
+    def read(self, amt: int = -1) -> bytes:
+        return self._body.read(amt)
 
     @property
     def headers(self) -> "email.message.Message":
@@ -1700,60 +1710,82 @@ class _FakeHTTPResponse:
         return msg
 
 
-def test_fetch_slack_file_rejects_non_files_host() -> None:
+def test_fetch_slack_file_rejects_non_files_host(tmp_path: Path) -> None:
     client, _ = _make_client()
     client.token = "SLACK_BOT_TOKEN"
 
     with pytest.raises(ValueError, match=r"files\.slack\.com"):
-        client._fetch_slack_file("https://slack.com/api/api.test?x=SLACK_BOT_TOKEN")
+        client._fetch_slack_file("https://slack.com/api/api.test?x=SLACK_BOT_TOKEN", tmp_path)
 
     with pytest.raises(ValueError, match=r"files\.slack\.com"):
-        client._fetch_slack_file("http://files.slack.com/files-pri/T1-F1/report.pdf")
+        client._fetch_slack_file("http://files.slack.com/files-pri/T1-F1/report.pdf", tmp_path)
 
 
-def test_fetch_slack_file_returns_file_metadata_and_bytes(
-    monkeypatch: pytest.MonkeyPatch,
+def test_fetch_slack_file_streams_file_to_disk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     import urllib.request
 
     client, _ = _make_client()
     client.token = "SLACK_BOT_TOKEN"
-    client.search_token = "SLACK_SEARCH_TOKEN"
 
     def fake_urlopen(req, *args, **kwargs):
         if "files.slack.com" in req.full_url:
-            assert req.get_header("Authorization") == "Bearer SLACK_SEARCH_TOKEN"
+            assert req.get_header("Authorization") == "Bearer SLACK_BOT_TOKEN"
             return _FakeHTTPResponse(b"%PDF-1.4 report", "application/pdf")
         raise AssertionError(f"unexpected url {req.full_url}")
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
-    filename, mime_type, body = client._fetch_slack_file(
-        "https://files.slack.com/files-pri/T1-F1/report.pdf"
+    out_path, size = client._fetch_slack_file(
+        "https://files.slack.com/files-pri/T1-F1/report.pdf", tmp_path
     )
 
-    assert filename == "report.pdf"
-    assert mime_type == "application/pdf"
-    assert body == b"%PDF-1.4 report"
+    assert out_path == tmp_path / "report.pdf"
+    assert size == len(b"%PDF-1.4 report")
+    assert out_path.read_bytes() == b"%PDF-1.4 report"
 
 
-def test_get_file_info_direct_uses_user_token_client() -> None:
-    client, fake_bot_client = _make_client()
-    fake_search_client = _FakeWebClient()
-    fake_search_client._shares_by_file["F123"] = {}
-    client._search_client = fake_search_client
+def test_fetch_slack_file_interrupted_download_leaves_no_partial_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import urllib.request
+
+    client, _ = _make_client()
+    client.token = "SLACK_BOT_TOKEN"
+
+    class _InterruptedResponse(_FakeHTTPResponse):
+        def read(self, amt: int = -1) -> bytes:
+            chunk = super().read(amt)
+            if not chunk:
+                raise ConnectionResetError("connection reset")
+            return chunk
+
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: _InterruptedResponse(b"partial", "application/pdf"),
+    )
+
+    with pytest.raises(ConnectionResetError):
+        client._fetch_slack_file("https://files.slack.com/files-pri/T1-F1/report.pdf", tmp_path)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_get_file_info_direct_fetches_file_metadata() -> None:
+    client, fake_web_client = _make_client()
+    fake_web_client._shares_by_file["F123"] = {}
 
     result = client.get_file_info_direct("f123")
 
     assert result["id"] == "F123"
-    assert fake_search_client.files_info_calls == [{"file": "F123"}]
-    assert fake_bot_client.files_info_calls == []
+    assert fake_web_client.files_info_calls == [{"file": "F123"}]
 
 
-def test_native_search_uses_dedicated_search_client() -> None:
-    client, fake_bot_client = _make_client()
-    fake_search_client = _FakeWebClient()
-    fake_search_client.api_call = lambda method, *, params: {  # type: ignore[method-assign]
+def test_native_search_formats_matches() -> None:
+    client, fake_web_client = _make_client()
+    fake_web_client.api_call = lambda method, *, params: {  # type: ignore[method-assign]
         "ok": True,
         "messages": {
             "matches": [
@@ -1769,7 +1801,6 @@ def test_native_search_uses_dedicated_search_client() -> None:
             ]
         },
     }
-    client._search_client = fake_search_client
     client._get_user_cache = lambda: {"U1": "alice", "U2": "bob"}  # type: ignore[method-assign]
 
     result = client._search_messages_native("deploy", max_results=5)
@@ -1787,7 +1818,6 @@ def test_native_search_uses_dedicated_search_client() -> None:
             "reply_count": 2,
         }
     ]
-    assert fake_bot_client.api_calls == []
 
 
 def test_sync_channel_history_uses_watermark_lookback() -> None:

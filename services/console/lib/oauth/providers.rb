@@ -13,13 +13,13 @@ module Oauth
     def self.registry
       @registry ||= {
         Attio::KEY => Attio.new,
+        Custom::KEY => Custom.new,
         Github::KEY => Github.new,
         Google::KEY => Google.new,
         Granola::KEY => Granola.new,
         Linear::KEY => Linear.new,
         Mercator::KEY => Mercator.new,
         Microsoft::KEY => Microsoft.new,
-        Runlayer::KEY => Runlayer.new,
         Slack::KEY => Slack.new,
         Zoom::KEY => Zoom.new
       }.freeze

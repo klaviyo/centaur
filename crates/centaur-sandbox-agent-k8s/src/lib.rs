@@ -23,15 +23,18 @@ use kube::api::{
 };
 use kube::{Api, Client, Error, Resource};
 use serde_json::{Map, Value, json};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep};
 
+pub use crd_migration::{CrdMigrationError, DeploymentRef, install_agent_sandbox_crds};
 pub use generated::agents_x_k8s_io as crd;
 pub use iron_proxy::IronProxyConfig;
-pub use k8s_openapi::api::core::v1::Toleration;
+pub use k8s_openapi::api::core::v1::{SecurityContext, Toleration};
+pub use ssh::SshProxyConfig;
 pub use tools::{GitHubTokenRef, ToolSource, ToolsConfig};
 
+mod crd_migration;
 pub mod generated;
 mod iron_proxy;
 mod ssh;
@@ -44,8 +47,6 @@ const SANDBOX_ID_LABEL: &str = "centaur.ai/sandbox-id";
 const OBSERVABILITY_ENABLED_LABEL: &str = "centaur.ai/observability-enabled";
 const MANAGED_BY_VALUE: &str = "api-rs";
 const SANDBOX_FILES_VOLUME: &str = "sandbox-files";
-const ARTIFACT_GET_COMMAND: &str = "/usr/local/bin/centaur-artifact-get";
-const ARTIFACT_ERROR_MAX_BYTES: usize = 64 * 1024;
 /// Capacity of each attach stdin/stdout pipe. kube-rs services an attach
 /// connection from one loop that blocks while a pipe is full, so its 1 KiB
 /// default lets a modest burst of output in one direction stall the other.
@@ -76,6 +77,12 @@ pub struct AgentSandboxConfig {
     pub annotations: BTreeMap<String, String>,
     /// Operator metadata applied only to sandbox and iron-proxy pods.
     pub pod_annotations: BTreeMap<String, String>,
+    /// Pod user namespace selection for sandbox pods only. `None` keeps the
+    /// Kubernetes default; `Some(false)` requests an isolated user namespace.
+    pub host_users: Option<bool>,
+    /// Security context applied only to the agent container, not bootstrap
+    /// init containers or the paired iron-proxy pod.
+    pub container_security_context: Option<SecurityContext>,
     pub image_pull_policy: Option<String>,
     pub image_pull_secrets: Vec<String>,
     /// Node steering for every sandbox pod **and** its paired iron-proxy pod.
@@ -154,6 +161,8 @@ impl AgentSandboxConfig {
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
             pod_annotations: BTreeMap::new(),
+            host_users: None,
+            container_security_context: None,
             image_pull_policy: None,
             image_pull_secrets: Vec::new(),
             node_selector: BTreeMap::new(),
@@ -168,6 +177,22 @@ impl AgentSandboxConfig {
             otlp_egress: None,
             ready_timeout: Duration::from_secs(60),
         }
+    }
+
+    /// Reject combinations Kubernetes cannot admit before creating resources.
+    pub fn validate(&self) -> SandboxResult<()> {
+        if self
+            .container_security_context
+            .as_ref()
+            .and_then(|context| context.proc_mount.as_deref())
+            == Some("Unmasked")
+            && self.host_users != Some(false)
+        {
+            return Err(SandboxError::InvalidSpec(
+                "sandbox container procMount Unmasked requires hostUsers false".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn state_volume(mut self, state_volume: StateVolumeConfig) -> Self {
@@ -284,23 +309,21 @@ impl AgentSandboxBackend {
         }
     }
 
-    /// Stop every retained sandbox whose immutable pod service account does
-    /// not match the current backend configuration. This runs before api-rs
-    /// enables session reuse or warm-pool claims, so a rollout cannot keep an
-    /// old workload identity alive or assign it to a new session.
-    pub async fn drain_service_account_mismatches(&self) -> SandboxResult<Vec<SandboxId>> {
+    /// Stop every retained sandbox whose immutable pod identity or agent
+    /// security context does not match the backend configuration. This runs
+    /// before api-rs enables session reuse or warm-pool claims, so a rollout
+    /// cannot keep an old security profile alive or assign it to a new session.
+    pub async fn drain_pod_config_mismatches(&self) -> SandboxResult<Vec<SandboxId>> {
+        self.config.validate()?;
         let params =
             ListParams::default().labels(&format!("{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}"));
         let sandboxes = self.sandboxes().list(&params).await.map_err(|err| {
-            map_kube_error("list sandboxes for service account reconciliation", err)
+            map_kube_error("list sandboxes for pod configuration reconciliation", err)
         })?;
         let mut stopped = Vec::new();
 
         for sandbox in sandboxes.items {
-            if sandbox_service_account_matches(
-                &sandbox,
-                self.config.service_account_name.as_deref(),
-            ) {
+            if sandbox_pod_config_matches(&sandbox, &self.config)? {
                 continue;
             }
             let Some(name) = sandbox.metadata.name.as_deref() else {
@@ -313,7 +336,7 @@ impl AgentSandboxBackend {
                 existing_service_account = ?normalized_name(
                     sandbox.spec.pod_template.spec.service_account_name.as_deref()
                 ),
-                "stopping sandbox whose service account does not match configuration"
+                "stopping sandbox whose pod identity or agent security context does not match configuration"
             );
             SandboxBackend::stop(self, &id).await?;
             stopped.push(id);
@@ -327,9 +350,8 @@ impl AgentSandboxBackend {
         id: &SandboxId,
         sandbox: &crd::Sandbox,
     ) -> SandboxResult<ObservedSandbox> {
-        let replicas = sandbox.spec.replicas.unwrap_or(1);
         let pod = self.get_pod(id).await?;
-        let status = sandbox_status_from_pod(replicas, pod.as_ref());
+        let status = sandbox_status_from_pod(sandbox_suspended(sandbox), pod.as_ref());
         Ok(ObservedSandbox::new(id.clone(), BACKEND_NAME, status)
             .with_labels(sandbox.metadata.labels.clone().unwrap_or_default())
             .with_created_at(sandbox_creation_time(sandbox))
@@ -371,7 +393,7 @@ impl AgentSandboxBackend {
         // `resume` also repairs Created sandboxes, whose old Pod can already
         // exist. Recreate that Pod after updating the durable template so the
         // running container cannot retain the previous resources.
-        self.recreate_existing_pod(id, sandbox.spec.replicas.unwrap_or(1) == 0)
+        self.recreate_existing_pod(id, sandbox_suspended(sandbox))
             .await
     }
 
@@ -539,7 +561,7 @@ impl AgentSandboxBackend {
 
     async fn quiesce_sandbox(&self, id: &SandboxId) -> SandboxResult<()> {
         match self
-            .patch_sandbox_merge(id, json!({ "spec": { "replicas": 0 } }))
+            .patch_sandbox_merge(id, json!({ "spec": { "operatingMode": "Suspended" } }))
             .await
         {
             Ok(()) => self.wait_until_pod_gone(id).await,
@@ -601,8 +623,12 @@ impl SandboxBackend for AgentSandboxBackend {
         if let Some(resolved) = &resolved_iron_proxy {
             iron_proxy::apply_proxy_env(&mut spec, resolved);
         }
+        // Start the proxy but create the Sandbox before waiting for it, so the
+        // proxy boot overlaps volume provisioning and scheduling. The egress
+        // policies still exist before the sandbox pod; tools-bootstrap retries
+        // until the proxy accepts connections.
         if let Err(err) = self
-            .create_iron_proxy_resources(&id, resolved_iron_proxy.as_ref())
+            .start_iron_proxy_resources(&id, resolved_iron_proxy.as_ref())
             .await
         {
             self.unwind_iron_proxy_resources(&id).await;
@@ -649,6 +675,13 @@ impl SandboxBackend for AgentSandboxBackend {
                 "failed to set ownerReference on sandbox files config map"
             );
         }
+        if let Err(err) = self
+            .wait_for_iron_proxy(&id, resolved_iron_proxy.as_ref())
+            .await
+        {
+            let _ = self.stop(&id).await;
+            return Err(err);
+        }
         if let Err(err) = self.wait_until_running(&id).await {
             let _ = self.stop(&id).await;
             return Err(err);
@@ -686,13 +719,26 @@ impl SandboxBackend for AgentSandboxBackend {
         Ok(text.lines().map(str::to_owned).collect())
     }
 
+    /// Report the pod IP a sandbox workload listens on. The sandbox NetworkPolicy
+    /// keeps that address reachable only from inside the cluster.
+    async fn workload_address(&self, id: &SandboxId) -> SandboxResult<String> {
+        let pod = self.get_pod(id).await?.ok_or_else(|| {
+            SandboxError::NotReady(format!("sandbox {} has no pod yet", id.as_str()))
+        })?;
+        pod_workload_address(&pod).ok_or_else(|| {
+            SandboxError::NotReady(format!("sandbox {} pod has no address yet", id.as_str()))
+        })
+    }
+
     async fn status(&self, id: &SandboxId) -> SandboxResult<SandboxStatus> {
         let Some(sandbox) = self.get_sandbox(id).await? else {
             return Ok(SandboxStatus::Gone);
         };
-        let replicas = sandbox.spec.replicas.unwrap_or(1);
         let pod = self.get_pod(id).await?;
-        Ok(sandbox_status_from_pod(replicas, pod.as_ref()))
+        Ok(sandbox_status_from_pod(
+            sandbox_suspended(&sandbox),
+            pod.as_ref(),
+        ))
     }
 
     async fn observe(&self, id: &SandboxId) -> SandboxResult<ObservedSandbox> {
@@ -777,6 +823,27 @@ impl SandboxBackend for AgentSandboxBackend {
             .await
     }
 
+    async fn enable_observability(&self, id: &SandboxId) -> SandboxResult<()> {
+        // The Sandbox label is the durable record resume and proxy repair
+        // rebuild from; the pod template label covers a recreated pod. Label
+        // changes never restart the running pod.
+        let labels = BTreeMap::from([(OBSERVABILITY_ENABLED_LABEL, true)]);
+        self.patch_sandbox_merge(id, sandbox_capability_labels_patch(&labels))
+            .await?;
+        // Live pod labels are what the observability egress policies select.
+        self.pods()
+            .patch(
+                id.as_str(),
+                &PatchParams::default(),
+                &Patch::Merge(json!({
+                    "metadata": { "labels": { OBSERVABILITY_ENABLED_LABEL: "true" } },
+                })),
+            )
+            .await
+            .map_err(|err| map_kube_error("label sandbox pod for observability", err))?;
+        self.label_iron_proxy_for_observability(id).await
+    }
+
     async fn pause(&self, id: &SandboxId) -> SandboxResult<()> {
         self.patch_sandbox_merge(id, sandbox_pause_patch(jiff::Timestamp::now()))
             .await?;
@@ -821,17 +888,12 @@ impl SandboxBackend for AgentSandboxBackend {
         }
         // A pod that was deleted out from under a `Suspended`/`Created`
         // sandbox (janitor, node pressure, manual reap) comes back through
-        // this same resume path. Re-derive the capability labels from the
-        // sandbox's own recorded env (the durable source of truth `resolve_
-        // iron_proxy_for_resume` already reads for the same purpose) and
-        // reassert them on both the Sandbox and its pod template, so the
-        // recreated agent pod keeps the observability label the create path
-        // applied.
+        // this same resume path. Reassert the capability labels recorded on
+        // the Sandbox onto its pod template, so the recreated agent pod keeps
+        // the observability label.
         let capability_labels = sandbox
             .as_ref()
-            .map(|sandbox| {
-                sandbox_capability_labels(sandbox, &self.config.container_name, id.as_str())
-            })
+            .map(sandbox_capability_labels)
             .unwrap_or_default();
         // Do not scale up with stale fleet policy. The container-name test
         // makes the replacement atomic against a reordered pod template.
@@ -844,105 +906,23 @@ impl SandboxBackend for AgentSandboxBackend {
     }
 }
 
-impl AgentSandboxBackend {
-    /// Read an artifact through a one-shot pod exec whose stdout is the file body.
-    pub async fn read_artifact(
-        &self,
-        id: &SandboxId,
-        path: &str,
-        max_bytes: usize,
-    ) -> SandboxResult<Vec<u8>> {
-        let params = AttachParams::default()
-            .container(self.config.container_name.clone())
-            .stdin(false)
-            .stdout(true)
-            .stderr(true)
-            .tty(false);
-        let mut process = self
-            .pods()
-            .exec(id.as_str(), [ARTIFACT_GET_COMMAND, path], &params)
-            .await
-            .map_err(|error| map_kube_error("exec sandbox artifact reader", error))?;
-        let mut stdout = process
-            .stdout()
-            .ok_or_else(|| SandboxError::io("artifact reader stdout was not attached"))?;
-        let mut stderr = process
-            .stderr()
-            .ok_or_else(|| SandboxError::io("artifact reader stderr was not attached"))?;
-        let status = process
-            .take_status()
-            .ok_or_else(|| SandboxError::io("artifact reader status was not attached"))?;
-
-        let mut contents = Vec::new();
-        let mut error_output = Vec::new();
-        let (stdout_result, stderr_result, status) = tokio::join!(
-            read_stream_bounded(&mut stdout, &mut contents, max_bytes),
-            read_stream_bounded(&mut stderr, &mut error_output, ARTIFACT_ERROR_MAX_BYTES),
-            status,
-        );
-        let contents_exceeded = stdout_result.map_err(|error| {
-            SandboxError::io_source("read sandbox artifact command stdout", error)
-        })?;
-        let error_output_exceeded = stderr_result.map_err(|error| {
-            SandboxError::io_source("read sandbox artifact command stderr", error)
-        })?;
-        process.join().await.map_err(|error| {
-            SandboxError::backend_source("join sandbox artifact command", error)
-        })?;
-
-        if status.as_ref().and_then(|status| status.status.as_deref()) != Some("Success") {
-            return Err(artifact_command_rejection(
-                &error_output,
-                error_output_exceeded,
-            ));
-        }
-        if contents_exceeded {
-            return Err(SandboxError::ArtifactRejected(format!(
-                "artifact exceeds the {max_bytes}-byte size limit"
-            )));
-        }
-
-        Ok(contents)
-    }
-}
-
-fn artifact_command_rejection(error_output: &[u8], truncated: bool) -> SandboxError {
-    if !truncated {
-        let stderr = String::from_utf8_lossy(error_output);
-        if let Some(detail) = stderr.trim().strip_prefix("centaur-artifact-get: ")
-            && !detail.is_empty()
-        {
-            return SandboxError::ArtifactRejected(detail.to_owned());
-        }
-    }
-    SandboxError::ArtifactRejected(
-        "artifact retrieval is unavailable in the current sandbox".to_owned(),
-    )
-}
-
-async fn read_stream_bounded(
-    reader: &mut (impl AsyncRead + Unpin),
-    retained: &mut Vec<u8>,
-    max_bytes: usize,
-) -> std::io::Result<bool> {
-    let retained_limit = max_bytes.saturating_add(1) as u64;
-    reader.take(retained_limit).read_to_end(retained).await?;
-    let exceeded = retained.len() > max_bytes;
-    if exceeded {
-        retained.truncate(max_bytes);
-    }
-    tokio::io::copy(reader, &mut tokio::io::sink()).await?;
-    Ok(exceeded)
-}
-
 fn sandbox_pause_patch(paused_at: jiff::Timestamp) -> Value {
     json!({
-        "spec": { "replicas": 0 },
+        "spec": { "operatingMode": "Suspended" },
         "metadata": { "annotations": { PAUSED_AT_ANNOTATION: paused_at.to_string() } },
     })
 }
 
-fn sandbox_resume_patch(capability_labels: &BTreeMap<&'static str, bool>) -> Value {
+/// Set capability labels on the Sandbox and its pod template.
+fn sandbox_capability_labels_patch(capability_labels: &BTreeMap<&'static str, bool>) -> Value {
+    let labels = capability_labels_json(capability_labels);
+    json!({
+        "spec": { "podTemplate": { "metadata": { "labels": labels } } },
+        "metadata": { "labels": labels },
+    })
+}
+
+fn capability_labels_json(capability_labels: &BTreeMap<&'static str, bool>) -> Value {
     // A JSON merge patch null removes a key, so a disabled capability clears
     // its label rather than writing "false" — matching `build_agent_sandbox`,
     // which only ever inserts these labels, never sets them false.
@@ -955,9 +935,14 @@ fn sandbox_resume_patch(capability_labels: &BTreeMap<&'static str, bool>) -> Val
             )
         })
         .collect();
+    Value::Object(labels)
+}
+
+fn sandbox_resume_patch(capability_labels: &BTreeMap<&'static str, bool>) -> Value {
+    let labels = capability_labels_json(capability_labels);
     json!({
         "spec": {
-            "replicas": 1,
+            "operatingMode": "Running",
             "podTemplate": { "metadata": { "labels": labels } },
         },
         "metadata": {
@@ -967,31 +952,15 @@ fn sandbox_resume_patch(capability_labels: &BTreeMap<&'static str, bool>) -> Val
     })
 }
 
-/// Re-derive the capability labels `build_agent_sandbox` would apply for this
-/// sandbox's recorded capabilities, reading them back from the durable env
-/// vars `apply_sandbox_capabilities` stamped on the container at create time.
-/// Missing or invalid env values use the same fail-closed CR-label fallback as
-/// `resolve_iron_proxy_for_resume`. Used to reassert the labels on resume,
-/// since a pod recreated after external deletion (janitor, node pressure,
-/// manual reap) only inherits whatever the Sandbox's `podTemplate` currently
-/// carries.
-fn sandbox_capability_labels(
-    sandbox: &crd::Sandbox,
-    container_name: &str,
-    sandbox_id: &str,
-) -> BTreeMap<&'static str, bool> {
-    let mut labels = BTreeMap::new();
-    labels.insert(
+/// The capability labels recorded on the Sandbox. Used to reassert them on
+/// resume, since a pod recreated after external deletion (janitor, node
+/// pressure, manual reap) only inherits whatever the Sandbox's `podTemplate`
+/// currently carries.
+fn sandbox_capability_labels(sandbox: &crd::Sandbox) -> BTreeMap<&'static str, bool> {
+    BTreeMap::from([(
         OBSERVABILITY_ENABLED_LABEL,
-        iron_proxy::resolve_resume_capability(
-            iron_proxy::sandbox_observability_enabled(sandbox, container_name),
-            sandbox.metadata.labels.as_ref(),
-            OBSERVABILITY_ENABLED_LABEL,
-            "observability",
-            sandbox_id,
-        ),
-    );
-    labels
+        iron_proxy::sandbox_observability_enabled(sandbox),
+    )])
 }
 
 fn sandbox_creation_time(sandbox: &crd::Sandbox) -> Option<SystemTime> {
@@ -1023,8 +992,13 @@ fn sandbox_attach_params(container_name: &str) -> AttachParams {
         .max_stdout_buf_size(ATTACH_STREAM_BUF_SIZE)
 }
 
-fn sandbox_status_from_pod(replicas: i32, pod: Option<&Pod>) -> SandboxStatus {
-    if replicas == 0 {
+/// An unset operating mode is the CRD default, `Running`.
+fn sandbox_suspended(sandbox: &crd::Sandbox) -> bool {
+    sandbox.spec.operating_mode == Some(crd::SandboxOperatingMode::Suspended)
+}
+
+fn sandbox_status_from_pod(suspended: bool, pod: Option<&Pod>) -> SandboxStatus {
+    if suspended {
         return SandboxStatus::Suspended;
     }
     // The backing Pod Ready condition is the attach boundary; phase alone can be Running while
@@ -1102,6 +1076,8 @@ fn build_agent_sandbox(
     spec: &SandboxSpec,
     config: &AgentSandboxConfig,
 ) -> SandboxResult<crd::Sandbox> {
+    config.validate()?;
+    let codemode = centaur_sandbox_core::is_codemode_workload(&spec.labels);
     let mut labels = config.labels.clone();
     labels.extend(spec.labels.clone());
     labels.insert(MANAGED_BY_LABEL.to_owned(), MANAGED_BY_VALUE.to_owned());
@@ -1145,10 +1121,10 @@ fn build_agent_sandbox(
     let scoped_tools = config
         .tools
         .as_ref()
-        .filter(|_| repo_cache_enabled)
+        .filter(|_| repo_cache_enabled && !codemode)
         .map(|tools| tools.scoped_for_repo_cache_access(&spec.capabilities.repo_cache));
     let repo_cache_tools = scoped_tools.as_ref().filter(|tools| tools.has_sources());
-    let baked_base_tools = config.tools.is_some() && repo_cache_tools.is_none();
+    let baked_base_tools = !codemode && config.tools.is_some() && repo_cache_tools.is_none();
 
     if repo_cache_tools.is_some() {
         for (name, value) in tools::agent_env(repo_cache_tools) {
@@ -1158,6 +1134,22 @@ fn build_agent_sandbox(
         for (name, value) in tools::baked_base_agent_env() {
             upsert_env(&mut agent_env, &name, value);
         }
+    }
+    if codemode {
+        // Code Mode verifies the proxy's CA itself rather than relying on
+        // tool-level env in the image; every proxy-enabled sandbox already
+        // mounts that CA.
+        if config.iron_proxy.is_some() {
+            upsert_env(
+                &mut agent_env,
+                "CENTAUR_CODEMODE_CA_FILE",
+                iron_proxy::FIREWALL_CA_CERT_PATH.to_owned(),
+            );
+        }
+        // The Code Mode server reports readiness on `/healthz`, so the pod's
+        // Ready condition -- and therefore `SandboxStatus::Running` -- means the
+        // process is accepting requests.
+        container["readinessProbe"] = codemode_readiness_probe();
     }
     insert_optional(
         &mut container,
@@ -1171,6 +1163,11 @@ fn build_agent_sandbox(
     );
     insert_optional(&mut container, "workingDir", spec.working_dir.clone());
     insert_optional(&mut container, "resources", resources_json(spec));
+    insert_optional(
+        &mut container,
+        "securityContext",
+        config.container_security_context.as_ref(),
+    );
 
     let (mut volumes, mut volume_mounts) = mount_json(spec);
     if !spec.files.is_empty() {
@@ -1192,7 +1189,10 @@ fn build_agent_sandbox(
         }
     }
     let mut init_containers = Vec::new();
-    if let Some(state_volume) = &config.state_volume {
+    // Code Mode sandboxes are self-contained: no persistent state to keep and no
+    // tool shims to bootstrap.
+    let state_volume = config.state_volume.as_ref().filter(|_| !codemode);
+    if let Some(state_volume) = state_volume {
         volume_mounts.push(json!({
             "name": "state",
             "mountPath": state_volume.mount_path,
@@ -1243,8 +1243,10 @@ fn build_agent_sandbox(
         "automountServiceAccountToken": false,
         "enableServiceLinks": false,
     });
-    // fsGroup makes bootstrap emptyDirs and the state PVC writable by the agent UID.
-    if repo_cache_tools.is_some() || config.state_volume.is_some() {
+    insert_optional(&mut pod_spec, "hostUsers", config.host_users);
+    // fsGroup makes bootstrap emptyDirs and the state PVC writable by the agent
+    // UID; Code Mode keeps it for its read-only repo-cache mounts.
+    if repo_cache_tools.is_some() || state_volume.is_some() || codemode {
         pod_spec["securityContext"] = tools::pod_security_context_json();
     }
     insert_optional(
@@ -1311,7 +1313,7 @@ fn build_agent_sandbox(
     let mut pod_annotations = config.annotations.clone();
     pod_annotations.extend(config.pod_annotations.clone());
     let mut agent_spec = json!({
-        "replicas": 1,
+        "operatingMode": "Running",
         "service": false,
         "shutdownPolicy": "Retain",
         "podTemplate": {
@@ -1325,7 +1327,7 @@ fn build_agent_sandbox(
     insert_optional(
         &mut agent_spec,
         "volumeClaimTemplates",
-        config.state_volume.as_ref().map(state_volume_claim_json),
+        state_volume.map(state_volume_claim_json),
     );
 
     let mut annotations = config.annotations.clone();
@@ -1553,6 +1555,46 @@ fn sandbox_service_account_matches(
     ) == normalized_name(configured_service_account)
 }
 
+fn sandbox_pod_config_matches(
+    sandbox: &crd::Sandbox,
+    config: &AgentSandboxConfig,
+) -> SandboxResult<bool> {
+    let pod = &sandbox.spec.pod_template.spec;
+    if !sandbox_service_account_matches(sandbox, config.service_account_name.as_deref())
+        || pod.host_users.unwrap_or(true) != config.host_users.unwrap_or(true)
+    {
+        return Ok(false);
+    }
+    let Some(agent) = pod
+        .containers
+        .iter()
+        .find(|container| container.name == config.container_name)
+    else {
+        return Ok(false);
+    };
+    // The CRD and Kubernetes client use different generated Rust types for
+    // the same SecurityContext. Compare their wire representation, treating
+    // an omitted context and an empty context identically.
+    let existing = agent
+        .security_context
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose();
+    let expected = config
+        .container_security_context
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose();
+    match (existing, expected) {
+        (Ok(existing), Ok(expected)) => {
+            Ok(existing.unwrap_or_else(|| json!({})) == expected.unwrap_or_else(|| json!({})))
+        }
+        (Err(error), _) | (_, Err(error)) => Err(SandboxError::InvalidSpec(format!(
+            "cannot compare sandbox security contexts: {error}"
+        ))),
+    }
+}
+
 /// Override-or-append an env entry, so the agent container never emits a
 /// duplicate env name when we layer tools/overlay wiring over `spec.env`.
 fn upsert_env(env: &mut Vec<(String, String)>, name: &str, value: String) {
@@ -1576,6 +1618,38 @@ fn is_not_found(err: &Error) -> bool {
     matches!(err, Error::Api(api_error) if api_error.code == 404)
 }
 
+/// Host part of a pod's address, with IPv6 literals bracketed so it can be
+/// embedded in a URL authority. `None` until the pod is assigned an IP.
+fn pod_workload_address(pod: &Pod) -> Option<String> {
+    let ip = pod
+        .status
+        .as_ref()
+        .and_then(|status| status.pod_ip.as_deref())
+        .map(str::trim)
+        .filter(|ip| !ip.is_empty())?;
+    Some(if ip.contains(':') {
+        format!("[{ip}]")
+    } else {
+        ip.to_owned()
+    })
+}
+
+/// Readiness probe for the Code Mode HTTP server. `SandboxStatus::Running` is
+/// this backend's serving signal, so the probe is what makes it mean the
+/// process accepts requests.
+fn codemode_readiness_probe() -> Value {
+    json!({
+        "httpGet": {
+            "path": "/healthz",
+            "port": centaur_sandbox_core::CODEMODE_PORT,
+        },
+        "periodSeconds": 2,
+        // Tolerate a minute of failed probes so a connector reload cannot
+        // flap a live sandbox out of `Running`.
+        "failureThreshold": 30,
+    })
+}
+
 fn map_kube_error(operation: &str, err: Error) -> SandboxError {
     if is_not_found(&err) {
         SandboxError::NotFound(operation.to_owned())
@@ -1591,7 +1665,6 @@ mod tests {
     };
     use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
     use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-    use tokio::io::AsyncWriteExt;
 
     use super::*;
 
@@ -1602,45 +1675,6 @@ mod tests {
         assert!(params.stdin && params.stdout && params.stderr && !params.tty);
         assert_eq!(params.max_stdin_buf_size, Some(ATTACH_STREAM_BUF_SIZE));
         assert_eq!(params.max_stdout_buf_size, Some(ATTACH_STREAM_BUF_SIZE));
-    }
-
-    #[test]
-    fn artifact_command_failures_are_safe_tool_rejections() {
-        let expected =
-            artifact_command_rejection(b"centaur-artifact-get: artifact does not exist\n", false);
-        assert!(matches!(
-            expected,
-            SandboxError::ArtifactRejected(message) if message == "artifact does not exist"
-        ));
-
-        for (stderr, truncated) in [
-            (b"executable file not found".as_slice(), false),
-            (b"centaur-artifact-get: partial".as_slice(), true),
-        ] {
-            let error = artifact_command_rejection(stderr, truncated);
-            assert!(matches!(
-                error,
-                SandboxError::ArtifactRejected(message)
-                    if message == "artifact retrieval is unavailable in the current sandbox"
-            ));
-        }
-    }
-
-    #[tokio::test]
-    async fn bounded_stream_read_caps_retained_bytes_and_drains_the_stream() {
-        let (mut writer, mut reader) = tokio::io::duplex(4);
-        let write = tokio::spawn(async move {
-            writer.write_all(b"abcdef").await.unwrap();
-        });
-        let mut retained = Vec::new();
-
-        let exceeded = read_stream_bounded(&mut reader, &mut retained, 3)
-            .await
-            .unwrap();
-        write.await.unwrap();
-
-        assert!(exceeded);
-        assert_eq!(retained, b"abc");
     }
 
     #[test]
@@ -1668,7 +1702,10 @@ mod tests {
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
 
         assert_eq!(sandbox.metadata.name.as_deref(), Some("asbx-test"));
-        assert_eq!(sandbox.spec.replicas, Some(1));
+        assert_eq!(
+            sandbox.spec.operating_mode,
+            Some(crd::SandboxOperatingMode::Running)
+        );
         assert_eq!(
             sandbox.spec.shutdown_policy,
             Some(crd::SandboxShutdownPolicy::Retain)
@@ -1929,6 +1966,83 @@ mod tests {
         assert!(pod_spec.runtime_class_name.is_none());
         assert!(pod_spec.service_account_name.is_none());
         assert!(pod_spec.priority_class_name.is_none());
+        assert!(pod_spec.host_users.is_none());
+        assert!(pod_spec.containers[0].security_context.is_none());
+    }
+
+    #[test]
+    fn sandbox_security_options_reach_the_agent_pod_template() {
+        let spec = SandboxSpec::new("centaur-agent:latest");
+        let mut config = AgentSandboxConfig::new("centaur", test_iron_control_settings())
+            .tools(ToolsConfig::new("example/tools", "agent:test"));
+        config.host_users = Some(false);
+        config.container_security_context = Some(
+            serde_json::from_value(json!({
+                "runAsUser": 1001,
+                "procMount": "Unmasked",
+                "appArmorProfile": {"type": "Unconfined"},
+            }))
+            .unwrap(),
+        );
+
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        let pod = serde_json::to_value(&sandbox.spec.pod_template.spec).unwrap();
+        assert_eq!(pod["hostUsers"], false);
+        assert_eq!(pod["containers"][0]["securityContext"]["runAsUser"], 1001);
+        assert_eq!(
+            pod["containers"][0]["securityContext"]["procMount"],
+            "Unmasked"
+        );
+        assert_eq!(
+            pod["containers"][0]["securityContext"]["appArmorProfile"]["type"],
+            "Unconfined"
+        );
+        assert_eq!(pod["automountServiceAccountToken"], false);
+        // Bootstrap permissions belong to its own configuration, even when
+        // the operator changes the agent container's security profile.
+        assert!(pod["initContainers"][0]["securityContext"]["procMount"].is_null());
+        assert!(pod["initContainers"][0]["securityContext"]["appArmorProfile"].is_null());
+
+        config.host_users = Some(true);
+        assert!(build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).is_err());
+        config.host_users = None;
+        assert!(build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).is_err());
+
+        config.container_security_context = None;
+        config.host_users = Some(true);
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        assert_eq!(sandbox.spec.pod_template.spec.host_users, Some(true));
+    }
+
+    #[test]
+    fn pod_config_reconciliation_detects_security_changes_and_rollback() {
+        let spec = SandboxSpec::new("centaur-agent:latest");
+        let mut config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
+        let defaults = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        assert!(sandbox_pod_config_matches(&defaults, &config).unwrap());
+
+        config.host_users = Some(true);
+        config.container_security_context = Some(SecurityContext::default());
+        assert!(sandbox_pod_config_matches(&defaults, &config).unwrap());
+
+        config.host_users = Some(false);
+        assert!(!sandbox_pod_config_matches(&defaults, &config).unwrap());
+        let isolated = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        assert!(sandbox_pod_config_matches(&isolated, &config).unwrap());
+
+        config.container_security_context = Some(SecurityContext {
+            proc_mount: Some("Unmasked".to_owned()),
+            ..Default::default()
+        });
+        assert!(!sandbox_pod_config_matches(&isolated, &config).unwrap());
+        let unmasked = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        assert!(sandbox_pod_config_matches(&unmasked, &config).unwrap());
+
+        config.container_security_context = None;
+        assert!(!sandbox_pod_config_matches(&unmasked, &config).unwrap());
+        config.host_users = None;
+        assert!(!sandbox_pod_config_matches(&isolated, &config).unwrap());
+        assert!(sandbox_pod_config_matches(&defaults, &config).unwrap());
     }
 
     #[test]
@@ -2085,31 +2199,19 @@ mod tests {
     }
 
     /// A pod deleted out from under a sandbox (janitor, node pressure, manual
-    /// reap) comes back through `resume`, which only has the sandbox id, not
-    /// the original `SandboxSpec`. Regression test for the recreated agent
-    /// pod losing `centaur.ai/observability-enabled`: the resume patch must
-    /// restore the label (derived from the sandbox's own recorded capability
-    /// env, the same durable source `resolve_iron_proxy_for_resume` already trusts)
-    /// on the Sandbox and its pod template, matching what `build_agent_sandbox`
-    /// would have applied for these capabilities.
+    /// reap) comes back through `resume`, which only has the sandbox id.
+    /// Regression test for the recreated agent pod losing
+    /// `centaur.ai/observability-enabled`: the resume patch must restore the
+    /// label recorded on the Sandbox onto its pod template.
     #[test]
-    fn resume_reasserts_capability_labels_from_recorded_env() {
-        // Mirrors what `apply_sandbox_capabilities` (centaur-session-runtime)
-        // stamps onto the spec env alongside `.capabilities(..)`, since that's
-        // the durable record `sandbox_capability_labels` reads back on resume.
-        let spec = SandboxSpec::new("centaur-agent:latest")
-            .capabilities(SandboxCapabilities {
-                repo_cache: RepoCacheAccess::All,
-                observability_enabled: true,
-            })
-            .env("CENTAUR_SANDBOX_OBSERVABILITY_ENABLED", "true");
+    fn resume_reasserts_recorded_capability_labels_on_the_pod_template() {
+        let spec = SandboxSpec::new("centaur-agent:latest").capabilities(SandboxCapabilities {
+            repo_cache: RepoCacheAccess::All,
+            observability_enabled: true,
+        });
         let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
         let mut sandbox =
             build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
-
-        // Simulate the observed production bug: the recreated pod's template
-        // lost the capability labels even though the container's capability
-        // env (the create path's durable record) is untouched.
         if let Some(labels) = sandbox
             .spec
             .pod_template
@@ -2119,11 +2221,8 @@ mod tests {
         {
             labels.remove(OBSERVABILITY_ENABLED_LABEL);
         }
-        if let Some(labels) = sandbox.metadata.labels.as_mut() {
-            labels.remove(OBSERVABILITY_ENABLED_LABEL);
-        }
 
-        let labels = sandbox_capability_labels(&sandbox, DEFAULT_CONTAINER_NAME, "asbx-test");
+        let labels = sandbox_capability_labels(&sandbox);
         assert_eq!(labels.get(OBSERVABILITY_ENABLED_LABEL), Some(&true));
 
         let patch = sandbox_resume_patch(&labels);
@@ -2139,8 +2238,6 @@ mod tests {
 
     #[test]
     fn resume_patch_clears_labels_for_restricted_capabilities() {
-        // Exercise the fail-closed fallback for callers that set the backend
-        // capabilities without duplicating them into the container env.
         let spec = SandboxSpec::new("centaur-agent:latest").capabilities(SandboxCapabilities {
             repo_cache: RepoCacheAccess::All,
             observability_enabled: false,
@@ -2148,7 +2245,7 @@ mod tests {
         let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
 
-        let labels = sandbox_capability_labels(&sandbox, DEFAULT_CONTAINER_NAME, "asbx-test");
+        let labels = sandbox_capability_labels(&sandbox);
         assert_eq!(labels.get(OBSERVABILITY_ENABLED_LABEL), Some(&false));
 
         // A JSON merge patch null removes the key rather than writing
@@ -2271,27 +2368,27 @@ mod tests {
     }
 
     #[test]
-    fn maps_agent_sandbox_replicas_and_pod_readiness_to_status() {
+    fn maps_agent_sandbox_operating_mode_and_pod_readiness_to_status() {
         let ready_pod = pod_with_phase_and_ready("Running", true);
         assert_eq!(
-            sandbox_status_from_pod(0, Some(&ready_pod)),
+            sandbox_status_from_pod(true, Some(&ready_pod)),
             SandboxStatus::Suspended
         );
         assert_eq!(
-            sandbox_status_from_pod(1, Some(&ready_pod)),
+            sandbox_status_from_pod(false, Some(&ready_pod)),
             SandboxStatus::Running
         );
 
         let unready_pod = pod_with_phase_and_ready("Running", false);
         assert_eq!(
-            sandbox_status_from_pod(1, Some(&unready_pod)),
+            sandbox_status_from_pod(false, Some(&unready_pod)),
             SandboxStatus::Created
         );
-        assert_eq!(sandbox_status_from_pod(1, None), SandboxStatus::Created);
+        assert_eq!(sandbox_status_from_pod(false, None), SandboxStatus::Created);
 
         let failed_pod = pod_with_phase_and_ready("Failed", false);
         assert_eq!(
-            sandbox_status_from_pod(1, Some(&failed_pod)),
+            sandbox_status_from_pod(false, Some(&failed_pod)),
             SandboxStatus::Stopped
         );
     }
@@ -2387,6 +2484,169 @@ mod tests {
         assert_eq!(
             pod_termination_reason(&pod_with_phase_and_ready("Running", true)),
             None
+        );
+    }
+
+    fn pod_json(name: &str, phase: &str, ready: bool, pod_ip: Option<&str>) -> serde_json::Value {
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": name, "namespace": "test-ns" },
+            "status": {
+                "phase": phase,
+                "podIP": pod_ip,
+                "conditions": [{ "type": "Ready", "status": if ready { "True" } else { "False" } }],
+            },
+        })
+    }
+
+    #[test]
+    fn pod_workload_address_brackets_ipv6_and_requires_an_ip() {
+        let pod = |json: serde_json::Value| serde_json::from_value::<Pod>(json).unwrap();
+
+        assert_eq!(
+            pod_workload_address(&pod(pod_json("sbx", "Running", true, Some("10.1.2.3")))),
+            Some("10.1.2.3".to_owned())
+        );
+        assert_eq!(
+            pod_workload_address(&pod(pod_json("sbx", "Running", true, Some("fd00::12")))),
+            Some("[fd00::12]".to_owned()),
+            "IPv6 literals must be bracketed to form a valid URL authority"
+        );
+        assert_eq!(
+            pod_workload_address(&pod(pod_json("sbx", "Pending", false, None))),
+            None
+        );
+    }
+
+    #[test]
+    fn codemode_sandbox_is_probed_and_skips_tools_and_state_wiring() {
+        let mut tools = ToolsConfig::new("acme/tools", "agent:test");
+        tools.github_token = Some(GitHubTokenRef {
+            secret_name: "gh-token".to_owned(),
+            secret_key: "token".to_owned(),
+        });
+        let config = AgentSandboxConfig::new("test-ns", test_iron_control_settings())
+            .iron_proxy(IronProxyConfig::new("proxy:test", "ca-cert", "ca-key"))
+            .state_volume(StateVolumeConfig::new("/home/agent/state", "10Gi"))
+            .tools(tools);
+        let spec = |codemode: bool| {
+            let mut spec = SandboxSpec::new("image:test").mount(centaur_sandbox_core::Mount::new(
+                MountKind::EmptyDir,
+                "/workspace",
+            ));
+            if codemode {
+                spec = spec.label(
+                    centaur_sandbox_core::WORKLOAD_LABEL,
+                    centaur_sandbox_core::CODEMODE_WORKLOAD,
+                );
+            }
+            spec
+        };
+        let build = |codemode: bool| {
+            let sandbox = build_agent_sandbox(
+                &SandboxId::new("sbx-test-0123456789"),
+                &spec(codemode),
+                &config,
+            )
+            .unwrap();
+            serde_json::to_value(&sandbox).unwrap()
+        };
+
+        let codemode = build(true);
+        let pod = &codemode["spec"]["podTemplate"]["spec"];
+        assert!(
+            pod.get("initContainers").is_none(),
+            "Code Mode needs no tools-bootstrap init container: {pod}"
+        );
+        assert!(
+            codemode["spec"].get("volumeClaimTemplates").is_none(),
+            "Code Mode keeps no state PVC"
+        );
+        assert_eq!(
+            pod["securityContext"]["fsGroup"],
+            json!(1001),
+            "Code Mode keeps the pod security context"
+        );
+        let container = &pod["containers"][0];
+        assert_eq!(
+            container["readinessProbe"]["httpGet"],
+            json!({ "path": "/healthz", "port": centaur_sandbox_core::CODEMODE_PORT }),
+            "Ready must mean the Code Mode server is serving"
+        );
+        let env = container["env"].as_array().expect("container env");
+        for name in [
+            "TOOL_DIRS",
+            "CENTAUR_TOOLS_AUTO_RELOAD",
+            "CENTAUR_TOOLS_GITHUB_TOKEN_FILE",
+        ] {
+            assert!(
+                !env.iter().any(|entry| entry["name"] == name),
+                "Code Mode must not receive tools env {name}: {env:?}"
+            );
+        }
+        assert!(
+            env.iter().any(|entry| {
+                entry["name"] == "CENTAUR_CODEMODE_CA_FILE"
+                    && entry["value"] == iron_proxy::FIREWALL_CA_CERT_PATH
+            }),
+            "Code Mode keeps the firewall CA env: {env:?}"
+        );
+        let mounts = container["volumeMounts"].as_array().expect("mounts");
+        for path in ["/app/tools", "/tools-github-token", "/home/agent/state"] {
+            assert!(
+                !mounts.iter().any(|mount| mount["mountPath"] == path),
+                "Code Mode must not mount {path}: {mounts:?}"
+            );
+        }
+        assert!(
+            mounts
+                .iter()
+                .any(|mount| mount["mountPath"] == "/workspace")
+        );
+        assert!(
+            mounts
+                .iter()
+                .any(|mount| mount["mountPath"] == "/firewall-certs")
+        );
+        let volumes = pod["volumes"].as_array().expect("volumes");
+        for name in ["tools-root", "tools-github-token", "state"] {
+            assert!(
+                !volumes.iter().any(|volume| volume["name"] == name),
+                "Code Mode must not get the {name} volume: {volumes:?}"
+            );
+        }
+
+        // Session sandboxes keep the tools bootstrap, state PVC, and tools env.
+        let session = build(false);
+        let pod = &session["spec"]["podTemplate"]["spec"];
+        assert!(
+            pod["initContainers"]
+                .as_array()
+                .is_some_and(|init| !init.is_empty())
+        );
+        assert_eq!(
+            session["spec"]["volumeClaimTemplates"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        let container = &pod["containers"][0];
+        assert!(
+            container["env"]
+                .as_array()
+                .is_some_and(|env| env.iter().any(|entry| entry["name"] == "TOOL_DIRS"))
+        );
+        let mounts = container["volumeMounts"].as_array().expect("mounts");
+        assert!(
+            mounts
+                .iter()
+                .any(|mount| mount["mountPath"] == "/app/tools")
+        );
+        assert!(
+            mounts
+                .iter()
+                .any(|mount| mount["mountPath"] == "/home/agent/state")
         );
     }
 }

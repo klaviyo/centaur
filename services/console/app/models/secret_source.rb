@@ -23,7 +23,9 @@ class SecretSource < ApplicationRecord
   # one oauth_token entry's credential fields and token-endpoint headers;
   # gcp_id_token_secret is a gcp_id_token keyfile;
   # pg_dsn_secret is a Postgres upstream's connection string; hmac_secret holds
-  # one hmac_sign entry's HMAC key and any additional named credentials.
+  # one hmac_sign entry's HMAC key and any additional named credentials;
+  # ssh_key_secret is an SSH private key, and touching it on change lets
+  # proxy-sync end connections that still use the previous key.
   belongs_to :static_secret, optional: true
   belongs_to :gcp_auth_secret, optional: true
   belongs_to :gcp_id_token_secret, optional: true
@@ -31,6 +33,7 @@ class SecretSource < ApplicationRecord
   belongs_to :oauth_token_secret, optional: true
   belongs_to :pg_dsn_secret, optional: true
   belongs_to :hmac_secret, optional: true
+  belongs_to :ssh_key_secret, optional: true, touch: true
   belongs_to :broker_credential, optional: true
 
   # Only set for oauth_token_secret- and hmac_secret-owned sources: whether
@@ -96,6 +99,7 @@ class SecretSource < ApplicationRecord
 
   OWNER_ASSOCIATIONS = %i[
     static_secret gcp_auth_secret gcp_id_token_secret aws_auth_secret oauth_token_secret pg_dsn_secret hmac_secret
+    ssh_key_secret
   ].freeze
 
   # Owners whose sources fill a named role (credential field or endpoint header).
@@ -113,16 +117,15 @@ class SecretSource < ApplicationRecord
 
   private
 
-  # Only current, eligible tokens may be delivered in a proxy configuration.
+  # An owner-only token is delivered only while it is live, its app is
+  # enabled, its owner is active, and this source belongs to the credential's
+  # own wrapper. Other apps keep their existing delivery behavior.
   def brokered_access_token
     credential = brokered_credential
-    return nil unless credential && !credential.dead?
-    return nil if credential.expires_at && credential.expires_at <= Time.current
-    if credential.oauth_app&.provider == "runlayer"
-      return nil unless credential.oauth_app.enabled?
-      return nil unless static_secret&.broker_credential_id == credential.id
-      return nil unless credential.created_by&.active? && credential.oauth_app.provider_strategy.credential_resource_matches?(credential)
-    end
+    return credential&.access_token unless credential&.oauth_app&.owner_only?
+    return nil if credential.dead? || (credential.expires_at && credential.expires_at <= Time.current)
+    return nil unless credential.oauth_app.enabled? && credential.created_by&.active?
+    return nil unless static_secret&.broker_credential_id == credential.id
 
     credential.access_token
   end

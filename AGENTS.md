@@ -28,6 +28,8 @@ product-specific defaults solely to make them neutral unless the user asks.
   a parallel one.
 - Keep clients thin and changes focused. If a contract changes, update every
   producer, consumer, test fixture, and chart value affected by it.
+- Do not bump `version` in `contrib/chart/Chart.yaml`; a bot PR bumps it after
+  chart changes merge to `main`.
 - Never expose credentials in output, logs, fixtures, commits, or command-line
   arguments. Use placeholders and configured secret paths.
 - Do not mutate a remote environment unless the user explicitly asks. Local
@@ -75,8 +77,17 @@ Ownership by tree:
 - `services/iron-proxy/`: credential-injecting proxy image and startup config.
 - `services/workflow-python/`: Python workflow compatibility host; durability
   remains in `api-rs`.
-- `services/console/`: operator UI and credential-control API.
+- `services/console/`: credential-control API (Rails) and the operator UI, a
+  React SPA in `services/console/web/`.
 - `tools/`: independently packaged agent-facing CLI plugins.
+- `connectors/`: experimental Code Mode connectors, run by
+  `crates/centaur-codemode` and not yet deployed. Each is a
+  `connector.toml` (description and secrets, in the `[tool.centaur]` schema)
+  plus an `index.ts` whose exported async functions are tools; helpers shared
+  by connectors live in `connectors/_lib/`. Return upstream data as the API
+  sends it. Check with `pnpm --filter @centaur/connectors typecheck` and
+  `cargo test -p centaur-codemode`; the runtime's security invariants are in
+  `crates/centaur-codemode/README.md`.
 - `workflows/`: discoverable workflow definitions.
 - `contrib/chart/`: Helm wiring, policies, probes, and service configuration.
 - `packages/`: shared TypeScript event and rendering contracts used by ingress

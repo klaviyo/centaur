@@ -8,9 +8,9 @@ use std::env;
 
 use active_record_encryption::ActiveRecordEncryption;
 use centaur_console_db::{
-    REDACTED, SecretValues, SlackChannelPermission, Subject, build_config,
-    find_direct_slack_channel_permission, find_principal, find_principal_by_foreign_id,
-    find_user_id_by_email, models::Config,
+    ApiClient, ApiClientPrincipal, REDACTED, SecretValues, SlackChannelPermission, Subject,
+    api_client_principals, build_config, find_api_client, find_direct_slack_channel_permission,
+    find_principal, find_principal_by_foreign_id, find_user_id_by_email, models::Config,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -283,11 +283,10 @@ async fn redacted_config_is_the_live_config_without_secret_values() {
         SecretValues::Live(&encryption),
         &subject,
         None,
-        None,
     )
     .await
     .unwrap();
-    let redacted = build_config(&fixture.pool, SecretValues::Redacted, &subject, None, None)
+    let redacted = build_config(&fixture.pool, SecretValues::Redacted, &subject, None)
         .await
         .unwrap();
 
@@ -307,7 +306,7 @@ async fn effective_config_is_redacted_and_absent_for_missing_principals() {
     let principal = fixture.principal("principal").await;
     fixture.grant_secret_values(principal).await;
 
-    let config = centaur_console_db::effective_config(&fixture.pool, principal, None)
+    let config = centaur_console_db::effective_config(&fixture.pool, principal)
         .await
         .unwrap()
         .expect("principal exists");
@@ -324,7 +323,7 @@ async fn effective_config_is_redacted_and_absent_for_missing_principals() {
     );
 
     assert!(
-        centaur_console_db::effective_config(&fixture.pool, i64::MAX, None)
+        centaur_console_db::effective_config(&fixture.pool, i64::MAX)
             .await
             .unwrap()
             .is_none()
@@ -397,5 +396,66 @@ async fn reads_principals_users_and_direct_slack_permissions() {
             .await
             .unwrap(),
         None
+    );
+}
+
+#[tokio::test]
+async fn reads_api_clients_and_their_principals() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let default = fixture.principal("default").await;
+    let other = fixture.principal("other").await;
+    let client: i64 = sqlx::query_scalar(
+        "INSERT INTO api_clients (name, secret_digest, scopes, disabled_at, created_by_id, created_at, updated_at) \
+         VALUES ($1, $2, '[\"sessions:read\", \"sessions:write\"]', now(), $3, now(), now()) RETURNING id",
+    )
+    .bind(fixture.name("client"))
+    .bind(fixture.name("digest"))
+    .bind(fixture.admin)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    for (principal, is_default) in [(default, true), (other, false)] {
+        sqlx::query(
+            "INSERT INTO api_client_principals (api_client_id, principal_id, \"default\", created_at, updated_at) \
+             VALUES ($1, $2, $3, now(), now())",
+        )
+        .bind(client)
+        .bind(principal)
+        .bind(is_default)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        find_api_client(&fixture.pool, client).await.unwrap(),
+        Some(ApiClient {
+            id: client,
+            name: fixture.name("client"),
+            secret_digest: fixture.name("digest"),
+            scopes: vec!["sessions:read".to_owned(), "sessions:write".to_owned()],
+            disabled: true,
+        })
+    );
+    assert_eq!(
+        find_api_client(&fixture.pool, i64::MAX).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        api_client_principals(&fixture.pool, client).await.unwrap(),
+        vec![
+            ApiClientPrincipal {
+                principal_id: default,
+                foreign_id: Some(fixture.name("default")),
+                default: true,
+            },
+            ApiClientPrincipal {
+                principal_id: other,
+                foreign_id: Some(fixture.name("other")),
+                default: false,
+            },
+        ]
     );
 }

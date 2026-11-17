@@ -10,8 +10,7 @@ module Broker
   # token endpoint from the provider strategy.
   #
   # SECURITY: this class never logs the code, tokens, client_secret, or the
-  # response body. Callers must keep the same discipline. Mirrors RefreshClient's
-  # injectable-HTTP design and 64 KiB body cap.
+  # response body. Callers must keep the same discipline.
   class AuthorizationCodeClient
     # Normalized success result. scope is the granted-scope string in the
     # provider's native format (nil if omitted); id_token is the raw JWT (nil if
@@ -37,9 +36,12 @@ module Broker
     # access_type=offline + prompt=consent always return one and its absence means
     # the app is misconfigured. The console-login flow passes false: it requests no
     # offline access and only needs the id_token to identify the operator.
+    #
+    # extra_params adds provider-specific form fields, such as an RFC 8707
+    # resource indicator; they never replace the standard fields.
     def exchange(token_endpoint:, client_id:, client_secret:, code:, redirect_uri:,
                  code_verifier:, client_auth_method: "client_secret_post",
-                 timeout: DEFAULT_TIMEOUT, require_refresh_token: true, resource: nil)
+                 timeout: DEFAULT_TIMEOUT, require_refresh_token: true, extra_params: {})
       raise ArgumentError, "token endpoint is required" if token_endpoint.blank?
       raise ArgumentError, "client_id is required" if client_id.blank?
       raise ArgumentError, "code is required" if code.blank?
@@ -51,7 +53,7 @@ module Broker
       }
       headers = client_auth(client_auth_method, client_id, client_secret, form)
       form["code_verifier"] = code_verifier if code_verifier.present?
-      form["resource"] = resource if resource.present?
+      form.merge!(extra_params.stringify_keys.except(*form.keys))
 
       response = perform(token_endpoint, form, headers, timeout)
 

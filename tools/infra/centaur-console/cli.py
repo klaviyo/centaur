@@ -12,13 +12,13 @@ load_dotenv()
 
 app = typer.Typer(
     name="centaur-console",
-    help="Inspect Console permissions and manage the current user's scheduled tasks",
+    help="Inspect Console permissions and manage the current user's or channel's scheduled tasks",
 )
 console = Console()
 admin_app = typer.Typer(
     help=(
-        "Create Slack and workflow principals and static or pg_dsn secrets, and manage roles, "
-        "secret grants, Slack permissions, sandbox access, "
+        "Create Slack and workflow principals and static, pg_dsn, or gcp_id_token secrets, "
+        "and manage roles, principal and role secret grants, Slack permissions, sandbox access, "
         "and allowed Slack Connect workspaces. "
         "Works only in an active Console admin's Slack DM."
     )
@@ -85,7 +85,7 @@ def scheduled_tasks(
         envvar="CENTAUR_CONSOLE_BEARER_TOKEN",
     ),
 ) -> None:
-    """List scheduled tasks owned by the current Console user."""
+    """List scheduled tasks owned by the current user, or by the channel in a Slack channel thread."""
     with get_client(url=url, bearer_token=bearer_token) as client:
         result = client.scheduled_tasks()
     console.print_json(json.dumps({"data": result}, default=str))
@@ -102,7 +102,7 @@ def scheduled_task(
         envvar="CENTAUR_CONSOLE_BEARER_TOKEN",
     ),
 ) -> None:
-    """Read one scheduled task owned by the current Console user."""
+    """Read one scheduled task owned by the current user, or by the channel in a Slack channel thread."""
     with get_client(url=url, bearer_token=bearer_token) as client:
         result = client.scheduled_task(task_id)
     console.print_json(json.dumps({"data": result}, default=str))
@@ -117,10 +117,10 @@ def create_scheduled_task(
         "--cron",
         help="Optional five-field cron expression in Pacific Time",
     ),
-    delivery_channel: str = typer.Option(
-        "dm",
+    delivery_channel: str | None = typer.Option(
+        None,
         "--delivery-channel",
-        help="dm or a permitted Slack channel ID",
+        help="dm (default) or a permitted Slack channel ID; omit in a Slack channel thread",
     ),
     enabled: bool = typer.Option(True, "--enabled/--disabled"),
     url: str | None = typer.Option(None, "--url", help="centaur-console base URL"),
@@ -131,7 +131,7 @@ def create_scheduled_task(
         envvar="CENTAUR_CONSOLE_BEARER_TOKEN",
     ),
 ) -> None:
-    """Create an ad-hoc or scheduled task owned by the current Console user."""
+    """Create an ad-hoc or scheduled task owned by the current user, or by the channel in a Slack channel thread."""
     with get_client(url=url, bearer_token=bearer_token) as client:
         result = client.create_scheduled_task(
             name=name,
@@ -156,7 +156,7 @@ def update_scheduled_task(
     delivery_channel: str | None = typer.Option(
         None,
         "--delivery-channel",
-        help="dm or a permitted Slack channel ID",
+        help="dm or a permitted Slack channel ID; channel tasks keep their channel",
     ),
     enabled: bool | None = typer.Option(None, "--enabled/--disabled"),
     url: str | None = typer.Option(None, "--url", help="centaur-console base URL"),
@@ -194,7 +194,7 @@ def delete_scheduled_task(
         envvar="CENTAUR_CONSOLE_BEARER_TOKEN",
     ),
 ) -> None:
-    """Delete a scheduled task owned by the current Console user."""
+    """Delete a scheduled task owned by the current user, or by the channel in a Slack channel thread."""
     with get_client(url=url, bearer_token=bearer_token) as client:
         client.delete_scheduled_task(task_id)
     console.print_json(json.dumps({"data": {"id": task_id, "deleted": True}}))
@@ -350,11 +350,13 @@ def _json_object(value: str) -> dict:
 
 @admin_app.command("secret")
 def admin_secret(
-    secret: str = typer.Argument(..., help="Static or pg_dsn secret OID, foreign ID, or name"),
+    secret: str = typer.Argument(
+        ..., help="Static, pg_dsn, or gcp_id_token secret OID, foreign ID, or name"
+    ),
     url: str | None = URL_OPTION,
     bearer_token: str | None = BEARER_TOKEN_OPTION,
 ) -> None:
-    """Show a static or pg_dsn secret's document, including its source reference (never its value)."""
+    """Show a static, pg_dsn, or gcp_id_token secret's document, including its source reference (never its value)."""
     with get_client(url=url, bearer_token=bearer_token) as client:
         result = client.admin_secret_document(secret)
     console.print_json(json.dumps({"data": result}, default=str))
@@ -362,12 +364,12 @@ def admin_secret(
 
 @admin_app.command("create-secret")
 def admin_create_secret(
-    kind: str = typer.Option("static", "--kind", help="static or pg_dsn"),
+    kind: str = typer.Option("static", "--kind", help="static, pg_dsn, or gcp_id_token"),
     data: str = typer.Option(..., "--data", help="JSON Console API document for the secret"),
     url: str | None = URL_OPTION,
     bearer_token: str | None = BEARER_TOKEN_OPTION,
 ) -> None:
-    """Create a static or pg_dsn secret. Sources must reference an external store."""
+    """Create a static, pg_dsn, or gcp_id_token secret. Sources must reference an external store."""
     with get_client(url=url, bearer_token=bearer_token) as client:
         result = client.admin_create_secret(kind, _json_object(data))
     console.print_json(json.dumps({"data": result}, default=str))
@@ -375,7 +377,9 @@ def admin_create_secret(
 
 @admin_app.command("update-secret")
 def admin_update_secret(
-    secret: str = typer.Argument(..., help="Static or pg_dsn secret OID, foreign ID, or name"),
+    secret: str = typer.Argument(
+        ..., help="Static, pg_dsn, or gcp_id_token secret OID, foreign ID, or name"
+    ),
     data: str = typer.Option(..., "--data", help="JSON object of fields to replace"),
     url: str | None = URL_OPTION,
     bearer_token: str | None = BEARER_TOKEN_OPTION,
@@ -412,6 +416,32 @@ def admin_revoke_secret(
     console.print_json(
         json.dumps({"data": {"principal": principal, "secret": secret, "revoked": True}})
     )
+
+
+@admin_app.command("grant-role-secret")
+def admin_grant_role_secret(
+    role: str = typer.Argument(..., help="Role OID or foreign ID, such as tool-github"),
+    secret: str = typer.Argument(..., help="Secret OID, foreign ID, or name"),
+    url: str | None = URL_OPTION,
+    bearer_token: str | None = BEARER_TOKEN_OPTION,
+) -> None:
+    """Grant a secret to a role, and so to every principal that holds the role."""
+    with get_client(url=url, bearer_token=bearer_token) as client:
+        result = client.admin_grant_role_secret(role, secret)
+    console.print_json(json.dumps({"data": result}, default=str))
+
+
+@admin_app.command("revoke-role-secret")
+def admin_revoke_role_secret(
+    role: str = typer.Argument(..., help="Role OID or foreign ID"),
+    secret: str = typer.Argument(..., help="Secret OID, foreign ID, or name"),
+    url: str | None = URL_OPTION,
+    bearer_token: str | None = BEARER_TOKEN_OPTION,
+) -> None:
+    """Revoke a secret granted to a role."""
+    with get_client(url=url, bearer_token=bearer_token) as client:
+        client.admin_revoke_role_secret(role, secret)
+    console.print_json(json.dumps({"data": {"role": role, "secret": secret, "revoked": True}}))
 
 
 @admin_app.command("set-slack-permission")

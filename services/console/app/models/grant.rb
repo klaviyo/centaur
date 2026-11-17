@@ -6,6 +6,7 @@ class Grant < ApplicationRecord
   GRANTEE_ASSOCIATIONS = %i[principal role].freeze
   GRANTABLE_ASSOCIATIONS = %i[
     static_secret gcp_auth_secret gcp_id_token_secret aws_auth_secret oauth_token_secret pg_dsn_secret hmac_secret
+    ssh_key_secret
   ].freeze
 
   # Higher priority wins. When two granted secrets collide at the proxy (iron-proxy
@@ -18,7 +19,7 @@ class Grant < ApplicationRecord
 
   attr_readonly :principal_id, :role_id, :static_secret_id, :gcp_auth_secret_id,
                 :gcp_id_token_secret_id, :aws_auth_secret_id, :oauth_token_secret_id,
-                :pg_dsn_secret_id, :hmac_secret_id
+                :pg_dsn_secret_id, :hmac_secret_id, :ssh_key_secret_id
 
   belongs_to :principal, optional: true
   belongs_to :role, optional: true
@@ -29,13 +30,18 @@ class Grant < ApplicationRecord
   belongs_to :oauth_token_secret, optional: true
   belongs_to :pg_dsn_secret, optional: true
   belongs_to :hmac_secret, optional: true
+  belongs_to :ssh_key_secret, optional: true
   belongs_to :created_by, class_name: "User"
 
   before_validation :apply_default_priority, on: :create
 
   validate :exactly_one_grantee
   validate :exactly_one_grantable
-  validate :runlayer_personal_owner
+  # Checked when a grant is created or retargeted; disabling the owner later
+  # withholds delivery without making existing grants unsaveable.
+  validate :owner_only_grantee, if: -> {
+    new_record? || will_save_change_to_principal_id? || will_save_change_to_role_id? || will_save_change_to_static_secret_id?
+  }
   validates :priority, presence: true, numericality: { only_integer: true }
 
   # The grantee this grant attaches the secret to: a principal or a role.
@@ -50,12 +56,12 @@ class Grant < ApplicationRecord
 
   private
 
-  def runlayer_personal_owner
+  def owner_only_grantee
     credential = static_secret&.broker_credential
-    return unless credential&.oauth_app&.provider == "runlayer"
-    return if role.nil? && PrincipalCredentialReconciliation.new.runlayer_owner?(principal, credential)
+    return unless credential&.oauth_app&.owner_only?
+    return if role.nil? && PrincipalCredentialReconciliation.new.connection_owner?(principal, credential)
 
-    errors.add(:principal, "must be the owner of this personal Runlayer connection")
+    errors.add(:principal, "must be the owner of this owner-only connection")
   end
 
   def sync_config_affected_principals

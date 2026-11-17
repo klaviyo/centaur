@@ -39,6 +39,18 @@ pub trait SandboxBackend: Send + Sync {
         })
     }
 
+    /// Return the network address (`<host>`, with IPv6 literals bracketed)
+    /// where a running sandbox's workload accepts TCP connections.
+    ///
+    /// Backends that do not expose workload networking return
+    /// [`crate::SandboxError::Unsupported`]. Callers add the port.
+    async fn workload_address(&self, _id: &SandboxId) -> SandboxResult<String> {
+        Err(crate::SandboxError::Unsupported {
+            backend: self.name(),
+            operation: "workload_address",
+        })
+    }
+
     /// Return the portable, cheap lifecycle status for a sandbox.
     async fn status(&self, id: &SandboxId) -> SandboxResult<SandboxStatus>;
 
@@ -81,6 +93,17 @@ pub trait SandboxBackend: Send + Sync {
         _labels: &BTreeMap<String, String>,
     ) -> SandboxResult<()> {
         Ok(())
+    }
+
+    /// Open the observability network path for a running sandbox that was
+    /// created without it, without restarting the workload. Warm sandboxes
+    /// boot without observability so one pool serves sessions with and
+    /// without it.
+    async fn enable_observability(&self, _id: &SandboxId) -> SandboxResult<()> {
+        Err(crate::SandboxError::Unsupported {
+            backend: self.name(),
+            operation: "enable_observability",
+        })
     }
 
     /// Suspend the sandbox while preserving any backend-supported runtime state.

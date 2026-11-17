@@ -31,9 +31,9 @@ These are broadly useful across most deployments and are good candidates to conf
 |---|---|---|
 | `linear` | Search, create, update, and comment on Linear issues, projects, cycles, teams, and labels | `LINEAR_API_KEY` |
 | `notion` | Search and update Notion pages, databases, blocks, and comments | `NOTION_API_KEY` |
-| `slack` | Search Slack, read threads, inspect channels/users, and send or upload messages | None; optional: `SLACK_SEARCH_TOKEN`, `SLACK_ETL_TOKEN` |
+| `slack` | Search Slack, read threads, inspect channels/users, and send or upload messages | None; optional: `SLACK_ETL_TOKEN` |
 | `gsuite` | Use Gmail, Calendar, Drive, Docs, Sheets, Slides, and Google Analytics | `GOOGLE_TOKEN_JSON` |
-| `websearch` | Free web search via Parallel and deep research | None; `PARALLEL_API_KEY` for `deep_research`; `ANTHROPIC_API_KEY` for search synthesis |
+| `websearch` | Web search via Parallel (free tier), Exa, or Tako | None for Parallel; optional `PARALLEL_API_KEY`; `EXA_API_KEY` or `TAKO_API_KEY` for those backends |
 | `company_context` | Search indexed company history, private Slack conversations, and Google Docs | None |
 | `grafana` | Query dashboards, alerts, VictoriaMetrics, VictoriaLogs, and annotations | `GRAFANA_URL`, `GRAFANA_API_KEY` |
 | `posthog` | Query product analytics, events, pageviews, breakdowns, and user agents | `POSTHOG_API_KEY`, `POSTHOG_PROJECT_ID` |
@@ -83,7 +83,7 @@ These are broadly useful across most deployments and are good candidates to conf
 | `linear` | Linear issues, projects, cycles, teams, workflow states, and labels | `LINEAR_API_KEY` |
 | `notion` | Notion pages, databases, blocks, comments, and users | `NOTION_API_KEY` |
 | `opentable` | Search OpenTable restaurant reservations | None |
-| `slack` | Slack messages, files, channels, threads, users, and usergroups | None; optional: `SLACK_SEARCH_TOKEN`, `SLACK_ETL_TOKEN` |
+| `slack` | Slack messages, files, channels, threads, users, and usergroups | None; optional: `SLACK_ETL_TOKEN` |
 
 ## Research
 
@@ -93,6 +93,8 @@ These are broadly useful across most deployments and are good candidates to conf
 | `congress` | Congress.gov bills, members, committees, hearings, and votes | `DATAGOV_API_KEY` |
 | `crunchbase` | Company, person, funding, acquisition, IPO, and search data | `CRUNCHBASE_API_KEY` |
 | `docsend` | Download DocSend documents through browser automation | `BROWSERBASE_API_KEY` |
+| `edgar` | SEC EDGAR company lookup, filings, full-text search, documents, and XBRL financials | None; optional env: `EDGAR_USER_AGENT` |
+| `fred` | FRED economic data series, observations, categories, releases, release calendar, and tags | `FRED_API_KEY` |
 | `fedreg` | Federal Register agencies, articles, public inspection, and open comments | None |
 | `googlenews` | Google News headlines, topics, and search | None |
 | `harmonic` | Startup discovery, company enrichment, people search, and saved searches | `HARMONIC_API_KEY` |
@@ -104,7 +106,7 @@ These are broadly useful across most deployments and are good candidates to conf
 | `plural` | State legislation, legislators, committees, events, and jurisdictions | `PLURAL_API_KEY` |
 | `sensortower` | Mobile app analytics, publisher data, charts, and sales estimates | `SENSOR_TOWER_AUTH_TOKEN` |
 | `similarweb` | Web traffic, rankings, referrals, keywords, geography, and app data | `SIMILARWEB_API_KEY` |
-| `websearch` | Free web search via Parallel and deep research | None; `PARALLEL_API_KEY` for `deep_research`; `ANTHROPIC_API_KEY` for search synthesis |
+| `websearch` | Web search via Parallel (free tier), Exa, or Tako | None for Parallel; optional `PARALLEL_API_KEY`; `EXA_API_KEY` or `TAKO_API_KEY` for those backends |
 | `youtube` | YouTube video, channel, transcript, and search data | `YOUTUBE_API_KEY`, `GOOGLE_API_KEY` |
 
 ## Media

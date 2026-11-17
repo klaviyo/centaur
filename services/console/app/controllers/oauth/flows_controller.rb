@@ -18,8 +18,13 @@ module Oauth
   #
   # SECURITY: never logs the code, tokens, client_secret, or response bodies --
   # only oids and error codes, like the rest of the Broker/Oauth subsystem.
+  #
+  # The failure page is intentionally server-rendered (layouts/oauth), like the
+  # MCP OAuth consent page: the IdP redirects straight back here, and the
+  # outcome is rendered in the same response instead of being handed to the SPA.
   class FlowsController < ApplicationController
-    layout "auth"
+    layout "oauth"
+    include ServerRenderedPagePolicy
 
     # The message_verifier purpose binding the signed state to this flow, the
     # state/cookie lifetime, and the encrypted cookie that ties a callback back to
@@ -29,7 +34,7 @@ module Oauth
     FLOW_COOKIE = :oauth_flow
 
     # Tests replace the token-exchange and identity-lookup clients with HTTP
-    # doubles, mirroring BrokerCredential#refresh_client.
+    # doubles.
     class_attribute :exchange_client_factory, default: -> { Broker::AuthorizationCodeClient.new }
     class_attribute :identity_http_client_factory, default: -> { HttpClient.new }
 
@@ -38,15 +43,11 @@ module Oauth
 
     # GET /oauth/:slug/start?scopes=
     def start
-      return render_result(:error, status: :unprocessable_entity, message: "This integration is disabled.") unless @app.enabled?
-
-      if @provider.respond_to?(:configured?) && !@provider.configured?
-        return render_result(:error, status: :unprocessable_entity, message: "This integration needs administrator configuration.")
-      end
+      return render_result(:error, status: :unprocessable_content, message: "This integration is disabled.") unless @app.enabled?
 
       requested_scopes = parse_scopes(params[:scopes]) || Array(@app.allowed_scopes)
       unless @app.scopes_allowed?(requested_scopes)
-        return render_result(:error, status: :unprocessable_entity, message: "One or more requested scopes are not allowed for this integration.")
+        return render_result(:error, status: :unprocessable_content, message: "One or more requested scopes are not allowed for this integration.")
       end
       consent_scopes = requested_scopes | provider_required_scopes
 
@@ -55,7 +56,7 @@ module Oauth
 
       state = Rails.application.message_verifier(STATE_PURPOSE).generate(
         { "app" => @app.oid, "scopes" => consent_scopes, "nonce" => nonce,
-          "user_id" => current_user.id, "context" => provider_consent_context },
+          "user_id" => current_user.id, "config" => provider_config_digest },
         purpose: STATE_PURPOSE, expires_in: FLOW_TTL
       )
 
@@ -76,8 +77,10 @@ module Oauth
 
       # The signed state must belong to this slug's app and the app must still be
       # active.
+      # It must also be finished by the user who started it, against the same
+      # endpoints and resource.
       if state["app"] != @app.oid || !@app.enabled? || state["user_id"] != current_user.id ||
-          state["context"] != provider_consent_context
+          state["config"] != provider_config_digest
         return render_result(:error, status: :bad_request, message: "This integration is no longer available.")
       end
 
@@ -93,8 +96,8 @@ module Oauth
 
       result = exchange_code(params[:code], flow["code_verifier"])
       validate_provider_result!(result)
-      identity = if @provider.respond_to?(:identity_for_user)
-        @provider.identity_for_user(current_user)
+      identity = if @app.owner_only?
+        owner_identity
       else
         @provider.identity_from(result, client_id: @app.client_id, http_client: identity_http_client_factory.call)
       end
@@ -159,12 +162,19 @@ module Oauth
       Array(@provider.required_scopes)
     end
 
-    def provider_consent_context
-      @provider.consent_context if @provider.respond_to?(:consent_context)
+    def provider_config_digest
+      Digest::SHA256.hexdigest(JSON.generate(@app.provider_config.to_h.sort.to_h))
+    end
+
+    # Owner-only credentials belong to the connecting Console user rather than
+    # a provider account, so servers without OIDC or userinfo need no identity.
+    # Reconnecting replaces that user's grant. No provider email is recorded,
+    # so nothing can match the credential by email.
+    def owner_identity
+      { subject: "owner-#{current_user.oid}", name: current_user.email }
     end
 
     def exchange_code(code, code_verifier)
-      options = @provider.respond_to?(:resource_url) ? { resource: @provider.resource_url } : {}
       exchange_client_factory.call.exchange(
         token_endpoint: @provider.token_endpoint,
         client_id: @app.client_id,
@@ -174,8 +184,14 @@ module Oauth
         code_verifier: code_verifier.to_s,
         require_refresh_token: provider_requires_refresh_token?,
         client_auth_method: provider_token_endpoint_auth_method,
-        **options
+        extra_params: provider_extra_token_params
       )
+    end
+
+    def provider_extra_token_params
+      return @provider.extra_token_params if @provider.respond_to?(:extra_token_params)
+
+      {}
     end
 
     def provider_token_endpoint_auth_method
@@ -201,16 +217,16 @@ module Oauth
         credential = BrokerCredential.find_or_initialize_by(oauth_app: @app, provider_subject: identity[:subject])
         # Reload under the same row lock used by disconnect/refresh before dirty
         # tracking compares the new tokens and live state with the stored values.
-        credential.lock! if credential.persisted? && @provider.respond_to?(:identity_for_user)
+        credential.lock! if credential.persisted?
         # Remember which user connected this account. The Integrations page
         # matches on it, so the card flips to "Connected" even when the provider
         # account's email differs from the console login email. Never
         # overwritten: the first linked user keeps the credential.
-        if @provider.respond_to?(:identity_for_user) && credential.persisted? && credential.created_by_id != current_user.id
+        if @app.owner_only? && credential.persisted? && credential.created_by_id != current_user.id
           raise Broker::ExchangeError.new("Connection belongs to another user", stage: "oauth", code: "account_mismatch")
         end
         credential.created_by ||= current_user
-        credential.token_endpoint = @provider.token_endpoint if @provider.respond_to?(:identity_for_user)
+        credential.token_endpoint = @provider.token_endpoint if @app.owner_only?
         if credential.new_record?
           credential.foreign_id = "#{@app.provider}-#{@app.slug}-#{foreign_id_subject(identity[:subject])}"
           credential.name = "#{@provider.display_name} – #{identity_display_name(identity)}"
@@ -306,10 +322,14 @@ module Oauth
     # would risk colliding with an operator-created secret.
     def ensure_wrapping_secret(credential)
       secret = StaticSecret.find_or_initialize_by(broker_credential: credential)
-      return secret unless secret.new_record? || @provider.respond_to?(:identity_for_user)
+      # Owner-only wrappers are rebuilt on reconnect, restoring their source and
+      # rules if they were edited.
+      return secret unless secret.new_record? || @app.owner_only?
 
       secret.name = "#{credential.name} token"
-      secret.labels = @provider.wrapping_secret_labels if @provider.respond_to?(:wrapping_secret_labels)
+      # An app's centaur-tool label makes its tool visible wherever the token is.
+      tool_label = (@app.labels || {}).slice("centaur-tool")
+      secret.labels = (secret.labels || {}).merge(tool_label) if tool_label.present?
       secret.kind = wrapping_secret_kind
       secret.assign_attributes(wrapping_secret_config) if secret.kind == CredentialProfiles::Registry::CUSTOM_KIND
       secret.source = SecretSource.new(source_type: "token_broker", config: { "credential_id" => credential.oid })
@@ -353,7 +373,7 @@ module Oauth
     # status defaults to 422 but callers override it for the 4xx pre-consent
     # rejections. Success does not come through here -- the happy path
     # redirects back to the console Integrations page.
-    def render_result(kind, status: :unprocessable_entity, message: nil)
+    def render_result(kind, status: :unprocessable_content, message: nil)
       @kind = kind
       @message = message
       render :result, status: status

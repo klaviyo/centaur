@@ -4,15 +4,10 @@ module Oauth
   class ProvidersTest < ActiveSupport::TestCase
     # token-broker refreshes flow-minted credentials with its own table of
     # providers; one missing there would never refresh.
-    #
-    # Runlayer refreshes must carry the RFC 8707 resource and defer or die when
-    # RUNLAYER_MCP_URL changes (Providers::Runlayer#refresh_resource), which
-    # token-broker does not implement, so Runlayer stays on Console's refresh.
-    CONSOLE_REFRESHED = [ Providers::Runlayer::KEY ].freeze
 
     test "token-broker knows how to refresh every provider's credentials" do
       table = JSON.parse(Rails.root.join("../../crates/centaur-token-broker/providers.json").read)
-      registry = Providers.registry.except(*CONSOLE_REFRESHED)
+      registry = Providers.registry
 
       assert_equal registry.keys.sort, table.keys.sort
       registry.each do |key, provider|

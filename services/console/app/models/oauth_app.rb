@@ -8,8 +8,8 @@
 # unauthenticated /oauth/:slug/start + /callback endpoints resolve an OauthApp by
 # slug, run the provider's consent flow, and on success upsert a BrokerCredential
 # linked back to this app (see BrokerCredential#oauth_app). The app is the
-# durable config; its minted credentials are refreshed by the normal
-# Broker::PollRefreshJob loop and delegate their client_id/client_secret back to
+# durable config; its minted credentials are refreshed by
+# centaur-token-broker and delegate their client_id/client_secret back to
 # the app, so rotating the app's secret fixes every credential it minted.
 #
 # Provider-generic by design: one model with a `provider` column and a small
@@ -30,9 +30,13 @@ class OauthApp < ApplicationRecord
 
   encrypts :client_secret
 
-  # Runlayer always follows the requester, including channel turns. This is
-  # fixed provider behavior, rather than an operator-selectable flow policy.
-  before_validation :set_runlayer_availability
+  # owner_only: each Console user connects their own account (the credential is
+  # keyed by that user, not by a provider identity), and its token is delivered
+  # only to that user's own principals through a direct grant -- never through
+  # roles, other principals, or email matching -- and only while the token is
+  # live, the app enabled, and the user active. Enforced in Console
+  # (PrincipalCredentialReconciliation#connection_owner?, Grant, SecretSource)
+  # and in proxy-sync (crates/centaur-console-db/sql/effective_credentials.sql).
 
   # The slug is the app's whole identity: globally unique and URL-safe. It both
   # addresses the app in the API (oid or slug) and names the consent links, so it
@@ -46,11 +50,17 @@ class OauthApp < ApplicationRecord
   validate :labels_is_a_hash
   validate :allowed_scopes_valid
   validate :shared_configuration_valid
-  validate :runlayer_configuration_valid
+  validate :owner_only_configuration_valid
+  validate :provider_config_valid
 
   # The provider strategy backing this app, or nil if the provider column somehow
-  # holds an unknown key (the inclusion validation normally prevents that).
-  def provider_strategy = Oauth::Providers.fetch(provider)
+  # holds an unknown key (the inclusion validation normally prevents that). The
+  # custom provider is configured per app from provider_config.
+  def provider_strategy
+    return Oauth::Providers::Custom.new(self) if provider == Oauth::Providers::Custom::KEY
+
+    Oauth::Providers.fetch(provider)
+  end
 
   # True when every requested scope is within the allowlist.
   def scopes_allowed?(requested) = (Array(requested) - Array(allowed_scopes)).empty?
@@ -64,29 +74,30 @@ class OauthApp < ApplicationRecord
   end
 
   def credential_needs_reconnect?(credential)
-    if provider == "runlayer" && !provider_strategy.credential_resource_matches?(credential)
-      return true
-    end
-
     credential.dead? || (required_scopes - Array(credential.scopes)).any?
   end
 
   private
 
-  def set_runlayer_availability
-    self.always_available = true if provider == Oauth::Providers::Runlayer::KEY
-  end
-
-  def runlayer_configuration_valid
-    return unless provider == Oauth::Providers::Runlayer::KEY
-
-    errors.add(:shared, "must be false for personal Runlayer connections") if shared?
-    errors.add(:base, "Set RUNLAYER_MCP_URL to an exact HTTPS Runlayer MCP URL") if enabled? && !provider_strategy.configured?
-  end
-
   def shared_configuration_valid
     errors.add(:shared, "cannot be changed after creation") if persisted? && will_save_change_to_shared?
     errors.add(:shared, "cannot be always available to the connecting user") if shared? && always_available?
+  end
+
+  def owner_only_configuration_valid
+    # Credentials are keyed differently with and without owner_only.
+    errors.add(:owner_only, "cannot be changed after creation") if persisted? && will_save_change_to_owner_only?
+    errors.add(:owner_only, "cannot be combined with a shared app") if owner_only? && shared?
+  end
+
+  def provider_config_valid
+    if !provider_config.is_a?(Hash)
+      errors.add(:provider_config, "must be a hash")
+    elsif provider == Oauth::Providers::Custom::KEY
+      Oauth::Providers::Custom.config_errors(provider_config).each { |message| errors.add(:provider_config, message) }
+    elsif provider_config.present?
+      errors.add(:provider_config, "is only supported by the custom provider")
+    end
   end
 
   def slug_does_not_shadow_oid

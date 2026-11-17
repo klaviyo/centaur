@@ -134,6 +134,12 @@ impl SandboxManager {
         self.backend.read_output_since(id, since).await
     }
 
+    /// Address a running sandbox's workload accepts TCP connections on.
+    /// Backends without workload networking return `SandboxError::Unsupported`.
+    pub async fn workload_address(&self, id: &SandboxId) -> SandboxResult<String> {
+        self.backend.workload_address(id).await
+    }
+
     pub async fn observe(&self, id: &SandboxId) -> SandboxResult<ObservedSandbox> {
         self.backend.observe(id).await
     }
@@ -214,6 +220,10 @@ impl SandboxManager {
         self.backend
             .assign_iron_control_proxy_principal(id, principal_id, requester_principal_id, labels)
             .await
+    }
+
+    pub async fn enable_observability(&self, id: &SandboxId) -> SandboxResult<()> {
+        self.backend.enable_observability(id).await
     }
 
     pub async fn ensure_iron_control_proxy_resources(

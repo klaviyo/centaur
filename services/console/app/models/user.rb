@@ -11,13 +11,13 @@ class User < ApplicationRecord
   has_many :api_keys, dependent: :destroy
   has_many :mcp_oauth_refresh_tokens, dependent: :destroy
   has_many :user_identities, dependent: :destroy
-  has_one :ssh_connection, dependent: :destroy
+  has_one :personal_ssh_key, class_name: "SshKeySecret", foreign_key: :owner_id, dependent: :destroy, inverse_of: :owner
   has_many :skills, dependent: :destroy
-  has_many :skill_reader_assignments, class_name: "SkillReader", dependent: :destroy
-  has_many :readable_skills, through: :skill_reader_assignments, source: :skill
   has_many :scheduled_tasks, foreign_key: :author_id, dependent: :restrict_with_error
   has_many :skill_editor_assignments, class_name: "SkillEditor", dependent: :destroy
   has_many :edited_skills, through: :skill_editor_assignments, source: :skill
+  has_many :skill_reader_assignments, class_name: "SkillReader", dependent: :destroy
+  has_many :readable_skills, through: :skill_reader_assignments, source: :skill
   belongs_to :approved_by, class_name: "User", optional: true
 
   after_update :revoke_mcp_oauth_refresh_tokens_when_disabled,

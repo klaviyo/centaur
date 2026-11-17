@@ -100,8 +100,6 @@ toolServer:
 # on top of these `console` defaults (see the `centaur.consoleValues` helper), so
 # existing values files keep working. Prefer `console` for new configuration.
 console:
-  # Non-secret environment settings, applied to both web and worker processes.
-  extraEnv: {}
   replicaCount: 1
   # Node steering for the Console web pods. Use tolerations with a matching
   # nodeSelector to schedule onto a dedicated tainted node pool. Empty values
@@ -252,10 +250,11 @@ overlay:
 # toolServer.extraSources are mapped into this shape for compatibility.
 #
 # Subdirs default to the conventional layout — toolsSubdir: tools,
-# workflowsSubdir: workflows, skillsSubdir: .agents/skills — so most sources
-# only need `repo`; set `ref` to a branch, tag, or commit when you do not want
-# the repo's default branch. Directories missing from a repo are skipped at
-# runtime. Set a subdir to "" to explicitly disable that surface for a source.
+# workflowsSubdir: workflows, skillsSubdir: .agents/skills,
+# connectorsSubdir: connectors — so most sources only need `repo`; set `ref` to
+# a branch, tag, or commit when you do not want the repo's default branch.
+# Directories missing from a repo are skipped at runtime. Set a subdir to ""
+# to explicitly disable that surface for a source.
 # Repo visibility defaults to private; set visibility: public only for repos
 # safe to expose to principals with sandbox_repo_cache=public.
 overlays:
@@ -271,6 +270,7 @@ overlays:
   #   visibility: private
   #   toolsSubdir: ""
   #   skillsSubdir: ""
+  #   connectorsSubdir: ""
 
 codex:
   # Operator-defined OpenAI-compatible Responses providers. Each provider is
@@ -285,7 +285,30 @@ codex:
   #       apiKeyEnv: PRIVATE_RESPONSES_API_KEY
   #       # Optional; callers must pass --model when omitted.
   #       defaultModel: example-model
+  #       # Optional (default true); false stops Codex from sending its hosted
+  #       # web_search tool to this provider, for endpoints that reject it.
+  #       webSearch: false
+  #       # Optional metadata for natural-language selection and display.
+  #       models:
+  #         example-model:
+  #           displayName: Example Model
+  #           aliases: [example]
+  #           description: General-purpose reasoning model
+  #           contextWindow: 1000000
+  #           inputModalities: [text]
+  #           reasoningEfforts: [low, high]
+  #           defaultReasoning: high
+  #           reasoningAliases: {max: high}
   customProviders: {}
+
+# Code Mode runtime image. api-rs builds one sandbox per principal from this
+# slim image when `apiRs.mcpV2Enabled` is true; it must be set then. Pull policy
+# and pull secrets reuse `sandbox.image.pullPolicy` and
+# `global.imagePullSecrets`. Rendered as CENTAUR_CODEMODE_IMAGE.
+codemode:
+  image:
+    repository: centaur-codemode
+    tag: latest
 
 sandbox:
   image:
@@ -310,6 +333,14 @@ sandbox:
   # `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"`). Empty adds none.
   podAnnotations: {}
   #   karpenter.sh/do-not-disrupt: "true"
+  # Sandbox pods only: false enables Pod user namespaces on supported nodes.
+  # null omits hostUsers and preserves the Kubernetes default.
+  hostUsers: null
+  # Kubernetes SecurityContext for the agent container only. Bootstrap init
+  # containers and iron-proxy are unaffected. procMount: Unmasked requires
+  # hostUsers: false. Changing either option drains incompatible retained
+  # sandbox pods at api-rs startup, including warm and active pods.
+  containerSecurityContext: {}
   tolerations: []
   # - key: centaur.ai/sandbox
   #   operator: Exists
@@ -352,11 +383,14 @@ sandbox:
   # model/thinking footer aligned with the policy the sandbox actually runs.
   extraEnv: {}
   telemetry:
-    # Include user prompts, assistant responses, and bounded shell commands on
-    # harness spans.
+    # Include user prompts and assistant responses on harness LLM spans.
     # Token usage, cost, status, session, and tool telemetry remain available
     # when this is disabled.
     captureTranscripts: false
+    # Include bounded shell commands and workspace-relative working directories
+    # on harness tool spans, independently of captureTranscripts. Tool names,
+    # executables, and status remain available when this is disabled.
+    captureToolTraces: false
   # New agent-k8s sandboxes get a ReadWriteOnce PVC at /home/agent/state. The
   # entrypoint keeps the session's workspace clone, uploads, branches, and native
   # Codex/Claude files there, so they survive idle pause and pod replacement, but
@@ -428,7 +462,7 @@ agentSandbox:
     name: agent-sandbox-system
   image:
     repository: registry.k8s.io/agent-sandbox/agent-sandbox-controller
-    tag: v0.4.6
+    tag: v1.0.9
     pullPolicy: IfNotPresent
   controller:
     extensions: false
@@ -437,12 +471,10 @@ agentSandbox:
 # for POST /api/v1/proxy/sync while all operator/admin traffic continues to use
 # Console. The service reads Console's database directly.
 proxySync:
-  # Deployment-owned WSS destinations for reusable personal SSH keys.
+  # Deployment-owned WSS destinations that granted SSH keys may reach.
   # Example: [{host: "*.dev.example.com", path: /events/events, username: dev}]
   # Empty denies dynamic targets. Exact paths and TLS verification are mandatory.
   sshTargets: []
-  # Additional non-secret environment settings.
-  extraEnv: {}
   # Two replicas keep sync available during pod restarts and rolling updates.
   replicaCount: 2
   nodeSelector: {}
@@ -465,11 +497,11 @@ proxySync:
 # Refreshes the console's broker credentials (OAuth access tokens) before they
 # expire. It serves only /healthz and /metrics; its egress is Postgres and
 # HTTPS to token endpoints. Replicas coordinate through row locks, so a rolling
-# update never refreshes a credential twice. Off by default until deployments
-# set its image; the console's refresh jobs refresh credentials only while it is
-# off.
+# update never refreshes a credential twice.
 tokenBroker:
-  enabled: false
+  # Set false to run no broker, for example while another deployment refreshes
+  # the same credentials. The console's own refresh jobs are unaffected.
+  enabled: true
   replicaCount: 1
   nodeSelector: {}
   affinity: {}
@@ -501,6 +533,12 @@ tokenBroker:
 # Slack retention does not run while this is false.
 companyContextV1:
   enabled: true
+
+# API clients: machine callers, such as eval runners, that exchange a client
+# secret for a session API token at api-rs /oauth/token. Off hides them in the
+# Console, removes the token endpoint, and rejects their existing tokens.
+apiClients:
+  enabled: false
 
 # Standalone company-context ingestion service. It indexes Google Docs and PDFs
 # from Google Drive, Google Calendar events, and Granola meeting notes into its
@@ -565,6 +603,10 @@ experimentalCompanyContext:
   slackHistoryDays: 90
   # Per-conversation overrides, e.g. {C0123456789: 3650}.
   slackChannelHistoryDays: {}
+  # Days of recent Slack history each sync rereads, at most 36500. Edits and
+  # new replies to threads started within them are picked up; replies to
+  # older threads are not.
+  slackThreadRefreshDays: 7
   # Rollout limits. An empty list syncs every user or conversation. Narrowing a
   # list removes indexed data that only the excluded users or conversations kept.
   syncLimits:
@@ -624,10 +666,38 @@ apiRs:
   # incompatible with preapproved mode. Internal workflow/MCP sessions use
   # separate principal-provisioning paths.
   sessionPrincipalAdmission: automatic
-  # Expose the experimental centaur MCP dispatcher (currently action=list).
+  # Serve /mcp through Code Mode: a centaur-codemode sandbox per principal,
+  # with api-rs forwarding catalog search/load and centaur_execute over HTTP.
+  # A principal normally has one sandbox; with several api-rs replicas (or
+  # during a rolling deploy) it may briefly have more, which is harmless.
+  # Readiness is the sandbox pod's own readiness probe; api-rs neither polls the
+  # sandbox nor waits for one shared instance. false serves one MCP tool per
+  # Centaur CLI tool.
+  # Rendered as CENTAUR_MCP_V2_ENABLED.
   mcpV2Enabled: false
   sandboxReadyTimeoutSecs: 90
+  # Warm pool of default-harness sandboxes with full repo-cache access.
+  # Ignored when sandboxWarmPools is set.
   sandboxWarmPoolSize: 3
+  # Warm pools per harness, repo-cache access, and optional persona, so
+  # sessions that differ in any of them still get a ready sandbox. A pool
+  # without a persona serves only sessions without one, so with a default
+  # persona configured, add a pool for it. A persona pool must name a
+  # deployed persona allowed for its repoCache and, if the persona pins a
+  # harness, use that harness. Observability is granted at claim time and
+  # does not split pools. Example:
+  # sandboxWarmPools:
+  #   - harness: codex
+  #     repoCache: all      # all | public | none
+  #     size: 3
+  #   - harness: codex
+  #     repoCache: all
+  #     persona: eng
+  #     size: 2
+  #   - harness: claudecode
+  #     repoCache: public
+  #     size: 1
+  sandboxWarmPools: []
   sandboxWarmPoolReplenishIntervalSecs: 5
   # Best-effort admission gate: when nonzero, api-rs rejects sandbox creates
   # and resumes at or above this observed running count, excluding ready warm
@@ -700,8 +770,11 @@ apiRs:
       # migration, index rebuild, and re-embedding existing rows. pgvector will
       # not build an HNSW or IVFFlat index above 2000.
       dimensions: 1536
-  # Reaper: stop sandboxes older than the max lifetime, regardless of whether
-  # they are running or suspended. 0 disables the sweep. Interval must be >= 1.
+  # Reaper: stop sandboxes older than the max lifetime, whether running or
+  # suspended. Warm-pool sandboxes age from when a session claims them, and a
+  # sandbox with a queued or running turn waits for a later sweep unless that
+  # turn has itself run longer than the max lifetime. 0 disables the sweep.
+  # Interval must be >= 1.
   sandboxMaxLifetimeSecs: 259200 # 3 days
   sandboxReapIntervalSecs: 300
   # Delete session.output.line events older than this many days, once their
@@ -736,6 +809,13 @@ apiRs:
     # the whole budget reasoning and returns no message. Empty omits the
     # parameter, for a server that rejects it outright.
     reasoningEffort: low
+    # Post a model-written progress message to the chat thread once an
+    # execution has run afterSecs, then at most every intervalSecs while new
+    # activity arrives. Requires activitySummary.enabled.
+    progressUpdates:
+      enabled: false
+      afterSecs: 60
+      intervalSecs: 120
   metrics:
     # The Rust API always serves Prometheus text metrics at /metrics. This flag
     # only controls scrape annotations for Prometheus/VictoriaMetrics-style
@@ -777,10 +857,18 @@ slackbotv2:
     tag: latest
     pullPolicy: Always
   userName: centaur
+  # Legacy Assistant loading text. With agentViewEnabled, Slack shows its
+  # native working indicator and Stop button instead.
   assistantStatus: ""
   # Match Slack's features.agent_view manifest setting. Changing Slack's
   # manifest is irreversible; this switch only controls the service behavior.
   agentViewEnabled: false
+  # React to mentioned messages that start a turn, then remove the reaction
+  # after the assistant response is posted, so slow turns visibly register.
+  # Requires the Slack app to grant reactions:write. Slackbot disables
+  # reactions for the running process if Slack reports the scope is missing.
+  ackReactionEnabled: true
+  ackReaction: eyes
   # React to mentioned follow-ups while an execution is active, then remove
   # their reactions after the assistant response is posted. Requires the Slack
   # app to grant reactions:write. Slackbot disables the feature for the running
@@ -797,6 +885,26 @@ slackbotv2:
   # Include the Codex service tier when a response metadata footer is rendered.
   # This does not cause the footer to appear on additional responses.
   responseServiceTierEnabled: false
+  # Generative UI cards built with json-render on the Chat SDK card model.
+  # When enabled, a final answer may carry one fenced ```json-render block
+  # (a flat spec or the JSONL patches the catalog prompt describes); slackbotv2
+  # removes it from the streamed markdown and posts the card as a second
+  # message in the thread. A rejected spec stays in the answer as a code block.
+  # Disabled renders every answer exactly as before, block included. Only
+  # LinkButton is available: card buttons that trigger actions are not routed.
+  # slackbotv2 tells the agent about the card on the first Slack turn it
+  # executes in a thread, and again after a harness restart (see
+  # services/slackbotv2/GENERATIVE_UI.md); no persona change is needed and
+  # other chat surfaces never see the note.
+  generativeUi:
+    enabled: false
+    # Per-message limits toCard enforces instead of letting Slack degrade the
+    # content (a second table would otherwise become a code block). Keys are
+    # the @json-render/chat CardLimits fields: tables, charts, fields,
+    # tableRows, tableColumns, chartLabel, chartTitle, chartSeries, chartPoints.
+    limits:
+      tables: 1
+      charts: 2
   # Public/local MCP endpoint shown in MCP SSO setup messages. The default
   # assumes users connect through `kubectl port-forward ... 3000:8080`.
   mcpPublicUrl: "http://localhost:3000"
@@ -818,17 +926,59 @@ slackbotv2:
   #     C0TRIAGE: { reasoning: low }
   channelDefaults: {}
   # Message overrides strategy for Slack message text. "flags" keeps the legacy
-  # deterministic --model/--claude/-rsn strategy. "llm" asks a small model for
-  # normalized overrides, allowing natural language requests such as
-  # "use max effort and the sol model". In llm mode,
+  # deterministic --model/--claude/-rsn strategy. "llm" classifies the message
+  # with the OpenAI Decisions API (which supports only gpt-6-luna), allowing
+  # natural language requests such as "use max effort and the sol model". In
+  # llm mode,
   # set OPENAI_API_KEY in the shared secret or provide
   # SLACKBOTV2_MESSAGE_OVERRIDES_OPENAI_API_KEY via extraEnv.
   messageOverridesStrategy:
     mode: flags
-    model: gpt-5.4-nano
+    model: gpt-6-luna
     openaiBaseUrl: https://api.openai.com/v1
     timeoutMs: 1500
-    maxOutputTokens: 300
+  # Proactive replies without a mention. Once mentioned in a thread, the bot
+  # replies to later unmentioned messages there that its built-in rules
+  # accept. Operator rules remove the need for a mention: the bot replies to
+  # any unmentioned message in the channel that meets a rule's `when`,
+  # starting a thread under a top-level message. Rules are checked in order and
+  # the first match wins; its optional `context` tells the agent how to
+  # respond, once per rule per thread. A stop command silences proactive
+  # replies in its thread until the next mention. The openai classifier reads
+  # OPENAI_API_KEY from the shared secret, or
+  # SLACKBOTV2_PROACTIVITY_OPENAI_API_KEY via extraEnv.
+  proactivity:
+    enabled: false
+    classifier: openai
+    model: gpt-6-luna
+    openaiBaseUrl: https://api.openai.com/v1
+    timeoutMs: 2000
+    # Milliseconds of quiet an idle thread waits for before classifying, so a
+    # message sent in parts (a name, then context) gets one decision and one
+    # turn that sees every part. Every proactive reply waits this long; 0
+    # classifies each message at once. Later parts steer the turn when the
+    # classifier accepts them.
+    debounceMs: 0
+    # Rules are mounted from a ConfigMap, so `when` and `context` can be long
+    # and span lines. Rules for every channel; empty means no rule matching by
+    # default.
+    defaultRules: []
+    # Rules keyed by Slack conversation id. Each list replaces defaultRules in
+    # its channel; an empty list turns rule matching off there. A list holds at
+    # most 20 rules with unique names. Example:
+    #   channelRules:
+    #     C0123456789:
+    #       - name: incident
+    #         when: |
+    #           Questions about an active incident: outages, rollbacks, and
+    #           alerts for services we own.
+    #         context: |
+    #           Check the service's dashboards and recent deploys first, then
+    #           reply in a few lines with what changed and a suggested next step.
+    #       - name: general
+    #         when: A direct question about a service we own.
+    #     C0987654321: []
+    channelRules: {}
   metrics:
     # slackbotv2 serves Prometheus text metrics at /metrics. This flag only
     # controls scrape annotations for Prometheus/VictoriaMetrics-style discovery.
@@ -997,6 +1147,17 @@ externalDatabase:
   # networkPolicy.enabled=true; must be empty while postgres.enabled=true.
   cidrs: []
   #   - 10.0.32.0/20
+  # Labels of the database's pods, for a database running in the cluster such
+  # as a CloudNativePG cluster. Control-plane pods and per-sandbox iron-proxies
+  # may reach these pods on port. Use this instead of cidrs for an in-cluster
+  # database: NetworkPolicy ipBlock rules may not match pod traffic. One of
+  # cidrs or podSelector is required when networkPolicy.enabled=true; both
+  # must be empty while postgres.enabled=true.
+  podSelector: {}
+  #   cnpg.io/cluster: core-db
+  # Namespace of those pods; requires podSelector. Empty means the release
+  # namespace.
+  namespace: ""
   port: 5432
   # Keyword search backend for company context. "postgres" (used when empty)
   # uses built-in full-text search and works on RDS and Cloud SQL; "paradedb"

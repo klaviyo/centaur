@@ -1,8 +1,10 @@
+import type { GenerativeUiOptions } from './generative-ui'
 import type { RustSessionStreamEvent } from '@centaur/harness-events'
 import type { CodexAppServerToChatStreamOptions } from '@centaur/rendering'
 import type { Attachment, Chat, Logger, StateAdapter } from 'chat'
 import type { Hono } from 'hono'
 import type { ChannelDefaults } from './channel-defaults'
+import type { ProactivityRule, ProactivityRules } from './proactivity-rules'
 import type { HarnessOverrides } from './overrides'
 import type { SlackDisplayTextSource } from './slack-display-text'
 
@@ -155,6 +157,11 @@ export type SlackbotV2Options = {
   enabledHarnesses?: readonly string[]
   fetch?: SlackbotV2Fetch
   /**
+   * Render a json-render card from a fenced `json-render` block in the final
+   * answer (see generative-ui.ts). Off when unset: the block stays a code block.
+   */
+  generativeUi?: GenerativeUiOptions
+  /**
    * Deployment-configured default model per harness wire value (claudecode |
    * codex | nanocodex | pi | omp), from the CLAUDE_MODEL / CODEX_MODEL /
    * CENTAUR_PI_MODEL / CENTAUR_OMP_MODEL env vars the chart mirrors
@@ -171,6 +178,12 @@ export type SlackbotV2Options = {
   harnessDefaultReasoning?: Record<string, string>
   /** Strategy for resolving message-level harness/model/provider/reasoning overrides. */
   messageOverridesStrategy?: MessageOverridesStrategy
+  /**
+   * Reply without a mention in threads where the bot was mentioned, and to
+   * messages that match a prompt, when the classifier decides a message calls
+   * for a response. Off when unset.
+   */
+  proactivity?: SlackbotV2ProactivityOptions
   /**
    * Backoff delays between in-process retries of a Slack handoff after a
    * retryable session API failure. Slack's own webhook redelivery cannot
@@ -200,6 +213,10 @@ export type SlackbotV2Options = {
   slackApiTimeoutMs?: number
   state?: StateAdapter
   stateKeyPrefix?: string
+  /** React to mentioned messages that start an execution until the response is posted. */
+  ackReactionEnabled?: boolean
+  /** Slack emoji name used for turn-start acknowledgements. */
+  ackReactionName?: string
   /** React to mentioned messages that are forwarded into an active execution. */
   steeringReactionEnabled?: boolean
   /** Slack emoji name used for active-execution acknowledgements. */
@@ -220,6 +237,66 @@ export type MessageOverridesStrategyResult = {
 export type MessageOverridesStrategy = (
   input: MessageOverridesStrategyInput
 ) => Promise<MessageOverridesStrategyResult>
+
+export type SlackbotV2ProactivityOptions = {
+  classifier: ProactiveClassifier
+  /**
+   * Quiet period an idle thread waits for before classifying, so a message
+   * sent in parts gets one decision and one turn. 0 or unset classifies each
+   * message at once.
+   */
+  debounceMs?: number
+  /** Rules that remove the need for a mention. See proactivity-rules.ts. */
+  rules?: ProactivityRules
+  /** Deadline for one classifier decision; a late decision declines. Defaults to 2s. */
+  timeoutMs?: number
+}
+
+export type ProactiveThreadMessage = {
+  author: string
+  /** Whether this bot wrote the message. */
+  fromBot: boolean
+  text: string
+}
+
+export type ProactiveClassifierInput = {
+  botName: string
+  /**
+   * The channel's operator rules, in order. When set, decide which rule, if
+   * any, the message meets first; otherwise apply the built-in
+   * mentioned-thread rules.
+   */
+  rules?: ProactivityRule[]
+  /** Earlier thread messages, oldest first. */
+  history: ProactiveThreadMessage[]
+  /**
+   * Messages sent in quick succession just before `message`, oldest first,
+   * judged together with it as the newest message.
+   */
+  burst?: ProactiveThreadMessage[]
+  message: ProactiveThreadMessage
+}
+
+export type ProactiveDecision = {
+  respond: boolean
+  /**
+   * The backend's probability that the bot should reply, when it reports one.
+   * With rules, the matched rule's probability, else the highest.
+   */
+  probability?: number
+  /** With rules, the name of the first rule the message meets. */
+  rule?: string
+}
+
+/**
+ * Decides whether an unmentioned message in an eligible thread should get a
+ * reply. Implementations wrap one model backend; a thrown error or an aborted
+ * signal declines.
+ */
+export type ProactiveClassifier = (
+  input: ProactiveClassifierInput,
+  signal: AbortSignal
+) => Promise<ProactiveDecision>
 
 export type SlackbotV2 = {
   app: Hono
@@ -243,6 +320,26 @@ export type SlackbotV2ThreadState = {
   model?: string | null
   /** Persona pinned by the session API. Null means the thread is pinned without a persona. */
   personaId?: string | null
+  /**
+   * Set when the bot joins the thread (a mention or a proactive reply) and
+   * false after a stop, which silences proactive replies until a mention.
+   */
+  proactiveEligible?: boolean
+  /**
+   * When someone pressed the mute button on a proactive reply. While set, no
+   * proactive message may start or steer a turn, even one accepted before the
+   * click; the next mention clears it. Null clears persisted state.
+   */
+  proactiveMutedAt?: number | null
+  /** Proactivity rules whose context a turn in this thread already carried. */
+  proactiveRulesSent?: string[]
+  /**
+   * Fingerprint of the generative UI note a turn in this thread already
+   * carried. The note rides only on the first execute turn (and again after
+   * a harness restart or a note change); later turns have it in context.
+   * Null clears persisted state.
+   */
+  generativeUiNoteSent?: string | null
   /** Last thread-level model provider selected by Slack flags. Null clears persisted state. */
   provider?: string | null
   renderObligation?: SlackbotV2RenderObligation | null
@@ -282,6 +379,17 @@ export type ForwardSessionInput = {
    * new harness still sees the thread history.
    */
   contextPreamble?: string
+  /**
+   * Added before the execute message's text. Set when an operator proactivity
+   * rule's match starts the turn, to say why and how to respond.
+   */
+  proactiveContext?: string
+  /**
+   * Added before the execute message's text. Set on the first Slack execute
+   * turn of a thread (and after a harness restart) when generative UI cards
+   * are enabled, to tell the agent how to attach one.
+   */
+  generativeUiNote?: string
   executionId?: string
   executeMessage?: SlackbotV2ApiMessage
   /** Effective harness selected by sticky thread flags or channel defaults. */

@@ -37,8 +37,9 @@ app.kubernetes.io/component: {{ .component }}
 
 {{/*
 NetworkPolicy egress rule for Postgres clients. With the bundled Postgres,
-allow only its pod. With an external database (postgres.enabled=false, e.g.
-RDS or Cloud SQL), allow externalDatabase.cidrs on externalDatabase.port.
+allow only its pod. With an external database (postgres.enabled=false), allow
+externalDatabase.cidrs (e.g. RDS or Cloud SQL) and the pods matching
+externalDatabase.podSelector (an in-cluster database) on externalDatabase.port.
 NetworkPolicy cannot match hostnames, so the ranges must cover every address
 the database endpoint can resolve to.
 */}}
@@ -54,13 +55,23 @@ the database endpoint can resolve to.
       port: 5432
 {{- else -}}
 {{- $external := $root.Values.externalDatabase -}}
-{{- if not $external.cidrs -}}
-{{- fail "externalDatabase.cidrs must list the external database's address ranges when postgres.enabled=false and networkPolicy.enabled=true" -}}
+{{- if and (not $external.cidrs) (not $external.podSelector) -}}
+{{- fail "externalDatabase.cidrs or externalDatabase.podSelector must select the external database when postgres.enabled=false and networkPolicy.enabled=true" -}}
 {{- end -}}
 - to:
 {{- range $external.cidrs }}
     - ipBlock:
         cidr: {{ . | quote }}
+{{- end }}
+{{- with $external.podSelector }}
+    - podSelector:
+        matchLabels:
+{{ toYaml . | indent 10 }}
+{{- with $external.namespace }}
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: {{ . | quote }}
+{{- end }}
 {{- end }}
   ports:
     - protocol: TCP
@@ -123,9 +134,9 @@ the database endpoint can resolve to.
 {{- $_ := set $source "visibility" (include "centaur.repositoryVisibility" .visibility) -}}
 {{- /*
 Subdir defaults: an omitted key falls back to the conventional layout
-(tools, workflows, .agents/skills); a key explicitly set to "" disables
-that surface for the source. Missing directories are skipped at runtime,
-so the defaults are safe for repos that only carry some surfaces.
+(tools, workflows, .agents/skills, connectors); a key explicitly set to ""
+disables that surface for the source. Missing directories are skipped at
+runtime, so the defaults are safe for repos that only carry some surfaces.
 */ -}}
 {{- if hasKey . "toolsSubdir" -}}
 {{- with .toolsSubdir }}{{- $_ := set $source "toolsSubdir" . -}}{{- end -}}
@@ -142,6 +153,11 @@ so the defaults are safe for repos that only carry some surfaces.
 {{- else -}}
 {{- $_ := set $source "skillsSubdir" ".agents/skills" -}}
 {{- end -}}
+{{- if hasKey . "connectorsSubdir" -}}
+{{- with .connectorsSubdir }}{{- $_ := set $source "connectorsSubdir" . -}}{{- end -}}
+{{- else -}}
+{{- $_ := set $source "connectorsSubdir" "connectors" -}}
+{{- end -}}
 {{- with .promptPath }}{{- $_ := set $source "promptPath" . -}}{{- end -}}
 {{- with .personasSubdir }}{{- $_ := set $source "personasSubdir" . -}}{{- end -}}
 {{- $sources = append $sources $source -}}
@@ -149,13 +165,13 @@ so the defaults are safe for repos that only carry some surfaces.
 {{- end -}}
 {{- else -}}
 {{- if and .Values.toolServer.enabled .Values.toolServer.repo -}}
-{{- $source := dict "repo" .Values.toolServer.repo "toolsSubdir" (default "tools" .Values.toolServer.subdir) "workflowsSubdir" "workflows" "skillsSubdir" ".agents/skills" -}}
+{{- $source := dict "repo" .Values.toolServer.repo "toolsSubdir" (default "tools" .Values.toolServer.subdir) "workflowsSubdir" "workflows" "skillsSubdir" ".agents/skills" "connectorsSubdir" "connectors" -}}
 {{- with .Values.toolServer.ref }}{{- $_ := set $source "ref" . -}}{{- end -}}
 {{- $_ := set $source "visibility" (include "centaur.repositoryVisibility" .Values.toolServer.visibility) -}}
 {{- $sources = append $sources $source -}}
 {{- range .Values.toolServer.extraSources -}}
 {{- if .repo -}}
-{{- $source := dict "repo" .repo "toolsSubdir" (default "tools" .subdir) "workflowsSubdir" (default "workflows" .workflowsSubdir) "skillsSubdir" (default ".agents/skills" .skillsSubdir) -}}
+{{- $source := dict "repo" .repo "toolsSubdir" (default "tools" .subdir) "workflowsSubdir" (default "workflows" .workflowsSubdir) "skillsSubdir" (default ".agents/skills" .skillsSubdir) "connectorsSubdir" (default "connectors" .connectorsSubdir) -}}
 {{- with .ref }}{{- $_ := set $source "ref" . -}}{{- end -}}
 {{- $_ := set $source "visibility" (include "centaur.repositoryVisibility" .visibility) -}}
 {{- $sources = append $sources $source -}}

@@ -21,7 +21,7 @@ def connection(destination):
             or parsed.port not in (None, 443) or parsed.username is not None
             or parsed.password is not None or parsed.query or parsed.fragment):
         raise ValueError("invalid WSS SSH destination")
-    # Preserve the route encoding understood by existing Iron deployments.
+    # Iron's SSH listener reads the destination from the "ee:" username route.
     route = "ee:" + base64.urlsafe_b64encode(destination.encode()).decode().rstrip("=")
     with tempfile.TemporaryDirectory(prefix="centaur-ssh-") as directory:
         root = Path(directory)

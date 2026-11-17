@@ -80,7 +80,6 @@ impl Fixture {
                 vec![]
             },
             console_host: None,
-            runlayer_resource_url: Some("https://tenant.runlayer.test/mcp".to_owned()),
             sync_cache: Arc::new(SyncCache::default()),
             metrics: PrometheusBuilder::new().build_recorder().handle(),
         };
@@ -450,16 +449,28 @@ impl Fixture {
     }
 }
 
+/// Returns a suffix unique across tests sharing one database.
+///
+/// Each component owns disjoint bits, so values never collide the way XORing
+/// them would: the counter makes values unique within this process, and the
+/// process id and start time distinguish concurrent and repeated runs.
 fn rand_suffix() -> u128 {
+    use std::sync::{
+        LazyLock,
+        atomic::{AtomicU32, Ordering},
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    nanos
-        ^ (u128::from(std::process::id()) << 64)
-        ^ u128::from(COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    static STARTED_NANOS: LazyLock<u64> = LazyLock::new(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        u64::try_from(nanos & u128::from(u64::MAX)).unwrap()
+    });
+    (u128::from(std::process::id()) << 96)
+        | (u128::from(*STARTED_NANOS) << 32)
+        | u128::from(COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Hosts of the served static secrets, in served order.
@@ -939,8 +950,378 @@ async fn unknown_or_missing_proxy_tokens_are_rejected() {
     }
 }
 
+const SSH_ENDPOINT: &str = "/api/v1/proxy/ssh/authorize";
+
+fn ssh_request(destination: &str) -> Value {
+    json!({
+        "route": "ee",
+        "public_key": "ssh-ed25519 sandbox-key",
+        "destination": destination,
+    })
+}
+
+impl Fixture {
+    fn allow_ssh_targets(&mut self) {
+        self.state.ssh_targets = crate::ssh::target_policies(Some(
+            r#"[{"host":"*.dev.example.com","path":"/events/events","username":"dev"}]"#,
+        ))
+        .unwrap();
+    }
+
+    /// An SSH key secret whose private key is the inline "known secret".
+    async fn ssh_key(&self, label: &str, owner: Option<i64>) -> i64 {
+        let key: i64 = sqlx::query_scalar(
+            "INSERT INTO ssh_key_secrets (foreign_id, name, public_key, owner_id, created_by_id, created_at, updated_at) \
+             VALUES ($1, $1, 'ssh-ed25519 AAAAfixture', $2, $3, now(), now()) RETURNING id",
+        )
+        .bind(self.name(label))
+        .bind(owner)
+        .bind(self.admin)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO secret_sources (ssh_key_secret_id, source_type, secret, created_at, updated_at) \
+             VALUES ($1, 'control_plane', $2, now(), now())",
+        )
+        .bind(key)
+        .bind(ENCRYPTED)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+        key
+    }
+
+    async fn ssh(&self, token: &str) -> (StatusCode, Value) {
+        self.post(
+            SSH_ENDPOINT,
+            Some(token),
+            ssh_request("wss://one.dev.example.com/events/events"),
+        )
+        .await
+    }
+
+    async fn ssh_status(&self, token: &str) -> StatusCode {
+        self.ssh(token).await.0
+    }
+}
+
 #[tokio::test]
-async fn disabled_non_runlayer_apps_keep_existing_credentials_available() {
+async fn ssh_keys_are_released_only_to_granted_principals() {
+    let Some(mut f) = Fixture::new().await else {
+        return;
+    };
+    f.allow_ssh_targets();
+    let alice = f.principal("ssh-alice").await;
+    let bob = f.principal("ssh-bob").await;
+    let key = f.ssh_key("ssh-alice-key", None).await;
+    f.grant(Grantee::Principal(alice), "ssh_key_secret_id", key, DIRECT)
+        .await;
+    let alice_token = f.proxy(Some(alice), None, json!({})).await;
+
+    let (status, grant) = f.ssh(&alice_token).await;
+    assert_eq!(status, StatusCode::OK, "{grant}");
+    assert_eq!(grant["id"], centaur_console_db::oid("sks", key));
+    assert_eq!(grant["principal"], centaur_console_db::oid("prn", alice));
+    assert_eq!(
+        grant["destination"],
+        "wss://one.dev.example.com/events/events"
+    );
+    assert_eq!(grant["username"], "dev");
+    assert_eq!(grant["host_key"], "");
+    assert_eq!(grant["tls_identity"], true);
+    assert_eq!(
+        grant["private_key"],
+        json!({"type": "control_plane", "value": "known secret"})
+    );
+    let expiry =
+        chrono::DateTime::parse_from_rfc3339(grant["expires_at"].as_str().unwrap()).unwrap();
+    assert!(expiry > chrono::Utc::now());
+    assert!(expiry <= chrono::Utc::now() + chrono::Duration::seconds(30));
+
+    // No grant, no assignment, or no valid token: no key.
+    let bob_token = f.proxy(Some(bob), None, json!({})).await;
+    let unassigned = f.proxy(None, None, json!({})).await;
+    for token in [bob_token.as_str(), unassigned.as_str(), "invalid-token"] {
+        assert_eq!(f.ssh_status(token).await, StatusCode::UNAUTHORIZED);
+    }
+
+    // Revoking the grant ends access.
+    f.update("DELETE FROM grants WHERE ssh_key_secret_id = $1", key)
+        .await;
+    assert_eq!(f.ssh_status(&alice_token).await, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn ssh_channel_turns_use_the_channel_grant_never_the_requester() {
+    let Some(mut f) = Fixture::new().await else {
+        return;
+    };
+    f.allow_ssh_targets();
+    let channel = f.principal("ssh-channel").await;
+    let alice = f.principal("ssh-requester").await;
+    let personal = f.ssh_key("ssh-personal-key", None).await;
+    f.grant(
+        Grantee::Principal(alice),
+        "ssh_key_secret_id",
+        personal,
+        DIRECT,
+    )
+    .await;
+    let token = f.proxy(Some(channel), Some(alice), json!({})).await;
+
+    // The requester's own key is never hoisted into a channel turn.
+    assert_eq!(f.ssh_status(&token).await, StatusCode::UNAUTHORIZED);
+
+    // An admin grant to a role the channel holds makes a key available.
+    let team = f.ssh_key("ssh-team-key", None).await;
+    let role = f.role("ssh-team", channel).await;
+    f.grant(Grantee::Role(role), "ssh_key_secret_id", team, ROLE)
+        .await;
+    let (status, grant) = f.ssh(&token).await;
+    assert_eq!(status, StatusCode::OK, "{grant}");
+    assert_eq!(grant["id"], centaur_console_db::oid("sks", team));
+    assert_eq!(grant["principal"], centaur_console_db::oid("prn", channel));
+}
+
+#[tokio::test]
+async fn ssh_grants_pick_the_strongest_key_and_refuse_ties() {
+    let Some(mut f) = Fixture::new().await else {
+        return;
+    };
+    f.allow_ssh_targets();
+    let principal = f.principal("ssh-priority").await;
+    let role = f.role("ssh-priority-role", principal).await;
+    let shared = f.ssh_key("ssh-shared", None).await;
+    let direct = f.ssh_key("ssh-direct", None).await;
+    f.grant(Grantee::Role(role), "ssh_key_secret_id", shared, ROLE)
+        .await;
+    f.grant(
+        Grantee::Principal(principal),
+        "ssh_key_secret_id",
+        direct,
+        DIRECT,
+    )
+    .await;
+    let token = f.proxy(Some(principal), None, json!({})).await;
+    let (status, grant) = f.ssh(&token).await;
+    assert_eq!(status, StatusCode::OK, "{grant}");
+    assert_eq!(grant["id"], centaur_console_db::oid("sks", direct));
+
+    f.update(
+        "UPDATE grants SET priority = 100 WHERE ssh_key_secret_id = $1",
+        shared,
+    )
+    .await;
+    assert_eq!(
+        f.ssh_status(&token).await,
+        StatusCode::UNAUTHORIZED,
+        "equally strong keys are ambiguous"
+    );
+}
+
+#[tokio::test]
+async fn ssh_external_sources_are_resolved_by_the_proxy() {
+    let Some(mut f) = Fixture::new().await else {
+        return;
+    };
+    f.allow_ssh_targets();
+    let principal = f.principal("ssh-env").await;
+    let key: i64 = sqlx::query_scalar(
+        "INSERT INTO ssh_key_secrets (foreign_id, name, public_key, created_by_id, created_at, updated_at) \
+         VALUES ($1, $1, 'ssh-ed25519 AAAAfixture', $2, now(), now()) RETURNING id",
+    )
+    .bind(f.name("ssh-env-key"))
+    .bind(f.admin)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    f.source(
+        "ssh_key_secret_id",
+        key,
+        "env",
+        json!({ "var": "TEAM_SSH_KEY" }),
+        None,
+    )
+    .await;
+    f.grant(
+        Grantee::Principal(principal),
+        "ssh_key_secret_id",
+        key,
+        DIRECT,
+    )
+    .await;
+    let token = f.proxy(Some(principal), None, json!({})).await;
+    let (status, grant) = f.ssh(&token).await;
+    assert_eq!(status, StatusCode::OK, "{grant}");
+    assert_eq!(
+        grant["private_key"],
+        json!({"type": "env", "var": "TEAM_SSH_KEY"})
+    );
+}
+
+#[tokio::test]
+async fn ssh_leases_change_on_reassignment_and_key_replacement() {
+    let Some(mut f) = Fixture::new().await else {
+        return;
+    };
+    f.allow_ssh_targets();
+    let alice = f.principal("ssh-lease-alice").await;
+    let bob = f.principal("ssh-lease-bob").await;
+    let key = f.ssh_key("ssh-lease-key", None).await;
+    f.grant(Grantee::Principal(alice), "ssh_key_secret_id", key, DIRECT)
+        .await;
+    let token = f.proxy(Some(alice), None, json!({})).await;
+    let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
+    let mut previous = f.ssh(&token).await.1["generation"].clone();
+    assert!(previous.is_string());
+    assert_eq!(f.ssh(&token).await.1["generation"], previous);
+
+    // Reassigning away and back, even to the same principal, starts a new lease.
+    for (step, other) in [Some(bob), None].into_iter().enumerate() {
+        sqlx::query("UPDATE proxies SET principal_id = $1, principal_assigned_at = now() WHERE bearer_token_hash = $2")
+            .bind(other).bind(&token_hash).execute(&f.pool).await.unwrap();
+        assert_eq!(f.ssh_status(&token).await, StatusCode::UNAUTHORIZED);
+        sqlx::query("UPDATE proxies SET principal_id = $1, principal_assigned_at = now() + make_interval(secs => $3) WHERE bearer_token_hash = $2")
+            .bind(alice).bind(&token_hash).bind((step + 1) as f64).execute(&f.pool).await.unwrap();
+        let (status, renewed) = f.ssh(&token).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(renewed["generation"], previous);
+        previous = renewed["generation"].clone();
+    }
+
+    // An assignment without an epoch fails closed.
+    sqlx::query("UPDATE proxies SET principal_assigned_at = NULL WHERE bearer_token_hash = $1")
+        .bind(&token_hash)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(f.ssh_status(&token).await, StatusCode::UNAUTHORIZED);
+    sqlx::query("UPDATE proxies SET principal_assigned_at = now() + interval '10 seconds' WHERE bearer_token_hash = $1")
+        .bind(&token_hash).execute(&f.pool).await.unwrap();
+    previous = f.ssh(&token).await.1["generation"].clone();
+
+    // Console touches the key whenever its source is replaced.
+    f.update(
+        "UPDATE ssh_key_secrets SET updated_at = now() + interval '1 second' WHERE id = $1",
+        key,
+    )
+    .await;
+    assert_ne!(f.ssh(&token).await.1["generation"], previous);
+}
+
+#[tokio::test]
+async fn ssh_personal_keys_require_an_active_owner() {
+    let Some(mut f) = Fixture::new().await else {
+        return;
+    };
+    f.allow_ssh_targets();
+    let owner: i64 = sqlx::query_scalar(
+        "INSERT INTO users (email, status, created_at, updated_at) VALUES ($1, 'active', now(), now()) RETURNING id",
+    )
+    .bind(format!("ssh-owner-{}@example.com", f.unique))
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    let principal = f.principal("ssh-owned").await;
+    let key = f.ssh_key("ssh-owned-key", Some(owner)).await;
+    f.grant(
+        Grantee::Principal(principal),
+        "ssh_key_secret_id",
+        key,
+        DIRECT,
+    )
+    .await;
+    let token = f.proxy(Some(principal), None, json!({})).await;
+    assert_eq!(f.ssh_status(&token).await, StatusCode::OK);
+    for status in ["disabled", "pending"] {
+        sqlx::query("UPDATE users SET status = $1 WHERE id = $2")
+            .bind(status)
+            .bind(owner)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            f.ssh_status(&token).await,
+            StatusCode::UNAUTHORIZED,
+            "{status}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ssh_requests_are_limited_to_deployment_policy() {
+    let Some(mut f) = Fixture::new().await else {
+        return;
+    };
+    let principal = f.principal("ssh-policy").await;
+    let key = f.ssh_key("ssh-policy-key", None).await;
+    f.grant(
+        Grantee::Principal(principal),
+        "ssh_key_secret_id",
+        key,
+        DIRECT,
+    )
+    .await;
+    let token = f.proxy(Some(principal), None, json!({})).await;
+    // No configured targets denies every destination.
+    assert_eq!(f.ssh_status(&token).await, StatusCode::UNAUTHORIZED);
+
+    f.allow_ssh_targets();
+    for target in [
+        "wss://one.dev.example.com/events/events",
+        "wss://two.dev.example.com/events/events",
+    ] {
+        let (status, grant) = f
+            .post(SSH_ENDPOINT, Some(&token), ssh_request(target))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(grant["destination"], target);
+    }
+    for target in [
+        "wss://evil.example.com/events/events",
+        "wss://one.dev.example.com/other",
+    ] {
+        assert_eq!(
+            f.post(SSH_ENDPOINT, Some(&token), ssh_request(target))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let mut wrong_route = ssh_request("wss://one.dev.example.com/events/events");
+    wrong_route["route"] = json!("other");
+    assert_eq!(
+        f.post(SSH_ENDPOINT, Some(&token), wrong_route).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // The tool cannot add fields such as a requester; unknown fields are refused.
+    for body in [
+        json!({"route": "ee", "public_key": "ssh-ed25519 sandbox-key"}),
+        json!({
+            "route": "ee",
+            "public_key": "ssh-ed25519 sandbox-key",
+            "destination": "wss://one.dev.example.com/events/events",
+            "requester_principal_id": centaur_console_db::oid("prn", principal),
+        }),
+    ] {
+        let response = router(f.state.clone())
+            .oneshot(
+                Request::post(SSH_ENDPOINT)
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+}
+
+#[tokio::test]
+async fn disabled_apps_keep_existing_credentials_available() {
     let Some(f) = Fixture::new().await else {
         return;
     };
@@ -975,18 +1356,32 @@ async fn disabled_non_runlayer_apps_keep_existing_credentials_available() {
         assert_eq!(secret_hosts(&config), vec!["api.github.test"]);
         assert_eq!(config["secrets"][0]["source"]["value"], "known secret");
     }
-    let redacted = centaur_console_db::effective_config(&f.pool, principal, None)
+    let redacted = centaur_console_db::effective_config(&f.pool, principal)
         .await
         .unwrap()
         .unwrap();
     let redacted = json!({ "secrets": redacted.secrets });
     assert_eq!(secret_hosts(&redacted), vec!["api.github.test"]);
     assert_eq!(redacted["secrets"][0]["source"]["value"], "[redacted]");
+
+    // The owner-only liveness gate does not change delivery for other apps.
+    sqlx::query(
+        "UPDATE broker_credentials SET expires_at = now() - interval '1 minute' WHERE id = $1",
+    )
+    .bind(credential)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let proxy = f.proxy(Some(principal), None, json!({})).await;
+    assert_eq!(
+        f.sync(&proxy).await["secrets"][0]["source"]["value"],
+        "known secret"
+    );
 }
 
 #[tokio::test]
-async fn personal_runlayer_credentials_follow_the_owner_and_stop_after_revocation() {
-    let Some(mut f) = Fixture::new().await else {
+async fn owner_only_credentials_follow_the_owner_and_stop_after_revocation() {
+    let Some(f) = Fixture::new().await else {
         return;
     };
     sqlx::query("UPDATE users SET status = 'active' WHERE id = $1")
@@ -1010,8 +1405,8 @@ async fn personal_runlayer_credentials_follow_the_owner_and_stop_after_revocatio
         .await
         .unwrap();
     }
-    let app = f.oauth_app("runlayer", true).await;
-    sqlx::query("UPDATE oauth_apps SET provider = 'runlayer' WHERE id = $1")
+    let app = f.oauth_app("personal-mcp", true).await;
+    sqlx::query("UPDATE oauth_apps SET owner_only = true WHERE id = $1")
         .bind(app)
         .execute(&f.pool)
         .await
@@ -1024,16 +1419,14 @@ async fn personal_runlayer_credentials_follow_the_owner_and_stop_after_revocatio
         .execute(&f.pool)
         .await
         .unwrap();
-    sqlx::query("UPDATE broker_credentials SET labels = jsonb_build_object('runlayer_resource', 'https://tenant.runlayer.test/mcp') WHERE oauth_app_id = $1")
-        .bind(app).execute(&f.pool).await.unwrap();
-    let sa = f.wrapper_secret("alice", a, a, "alice.runlayer.test").await;
-    let sb = f.wrapper_secret("bob", b, b, "bob.runlayer.test").await;
+    let sa = f.wrapper_secret("alice", a, a, "alice.mcp.test").await;
+    let sb = f.wrapper_secret("bob", b, b, "bob.mcp.test").await;
     f.grant(Grantee::Principal(alice), "static_secret_id", sa, DIRECT)
         .await;
     f.grant(Grantee::Principal(bob), "static_secret_id", sb, DIRECT)
         .await;
     // Even stale or manually inserted shared/cross-owner grants cannot supply
-    // another user's Runlayer token.
+    // another user's owner-only token.
     let shared_role = f.role("shared", channel).await;
     f.grant(
         Grantee::Role(shared_role),
@@ -1052,9 +1445,9 @@ async fn personal_runlayer_credentials_follow_the_owner_and_stop_after_revocatio
     let token = f.proxy(Some(channel), Some(alice), json!({})).await;
     let mut last_hash = Value::Null;
     for (actor, expected) in [
-        (Some(alice), vec!["alice.runlayer.test"]),
-        (Some(bob), vec!["bob.runlayer.test"]),
-        (Some(alice), vec!["alice.runlayer.test"]),
+        (Some(alice), vec!["alice.mcp.test"]),
+        (Some(bob), vec!["bob.mcp.test"]),
+        (Some(alice), vec!["alice.mcp.test"]),
         (None, vec![]),
     ] {
         sqlx::query("UPDATE proxies SET requester_principal_id = $1 WHERE bearer_token_hash = $2")
@@ -1069,27 +1462,18 @@ async fn personal_runlayer_credentials_follow_the_owner_and_stop_after_revocatio
         last_hash = body["config_hash"].clone();
     }
     // The shared reader also protects api-rs' redacted effective-config path.
-    let redacted = centaur_console_db::effective_config(
-        &f.pool,
-        bob,
-        f.state.runlayer_resource_url.as_deref(),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    let redacted = json!({ "secrets": redacted.secrets });
-    assert_eq!(secret_hosts(&redacted), vec!["bob.runlayer.test"]);
-    assert_eq!(redacted["secrets"][0]["source"]["value"], "[redacted]");
-    let unconfigured = centaur_console_db::effective_config(&f.pool, alice, None)
+    let redacted = centaur_console_db::effective_config(&f.pool, bob)
         .await
         .unwrap()
         .unwrap();
-    assert!(unconfigured.secrets.is_empty());
+    let redacted = json!({ "secrets": redacted.secrets });
+    assert_eq!(secret_hosts(&redacted), vec!["bob.mcp.test"]);
+    assert_eq!(redacted["secrets"][0]["source"]["value"], "[redacted]");
 
     // The DM path has no requester and would otherwise cache the old token.
     let dm = f.proxy(Some(alice), None, json!({})).await;
     let previous = f.sync(&dm).await;
-    assert_eq!(secret_hosts(&previous), vec!["alice.runlayer.test"]);
+    assert_eq!(secret_hosts(&previous), vec!["alice.mcp.test"]);
     sqlx::query("UPDATE secret_sources SET broker_credential_id = $1 WHERE static_secret_id = $2")
         .bind(b)
         .bind(sa)
@@ -1127,9 +1511,6 @@ async fn personal_runlayer_credentials_follow_the_owner_and_stop_after_revocatio
     .execute(&f.pool)
     .await
     .unwrap();
-    f.state.runlayer_resource_url = Some("https://changed.runlayer.test/mcp".to_owned());
-    assert!(secret_hosts(&f.sync(&dm).await).is_empty());
-    f.state.runlayer_resource_url = Some("https://tenant.runlayer.test/mcp".to_owned());
     sqlx::query("UPDATE oauth_apps SET enabled = false WHERE id = $1")
         .bind(app)
         .execute(&f.pool)
@@ -1139,7 +1520,7 @@ async fn personal_runlayer_credentials_follow_the_owner_and_stop_after_revocatio
 }
 
 #[tokio::test]
-async fn personal_runlayer_requires_the_owners_verified_slack_team_and_active_account() {
+async fn owner_only_requires_the_owners_verified_slack_team_and_active_account() {
     let Some(f) = Fixture::new().await else {
         return;
     };
@@ -1161,17 +1542,15 @@ async fn personal_runlayer_requires_the_owners_verified_slack_team_and_active_ac
     .execute(&f.pool)
     .await
     .unwrap();
-    let app = f.oauth_app("runlayer-slack", true).await;
-    sqlx::query("UPDATE oauth_apps SET provider = 'runlayer' WHERE id = $1")
+    let app = f.oauth_app("personal-mcp-slack", true).await;
+    sqlx::query("UPDATE oauth_apps SET owner_only = true WHERE id = $1")
         .bind(app)
         .execute(&f.pool)
         .await
         .unwrap();
     let credential = f.broker_credential("slack-user", Some(app), true).await;
-    sqlx::query("UPDATE broker_credentials SET labels = jsonb_build_object('runlayer_resource', 'https://tenant.runlayer.test/mcp') WHERE id = $1")
-        .bind(credential).execute(&f.pool).await.unwrap();
     let secret = f
-        .wrapper_secret("slack-user", credential, credential, "tenant.runlayer.test")
+        .wrapper_secret("slack-user", credential, credential, "tenant.mcp.test")
         .await;
     f.grant(
         Grantee::Principal(actor),
@@ -1181,10 +1560,7 @@ async fn personal_runlayer_requires_the_owners_verified_slack_team_and_active_ac
     )
     .await;
     let token = f.proxy(Some(channel), Some(actor), json!({})).await;
-    assert_eq!(
-        secret_hosts(&f.sync(&token).await),
-        vec!["tenant.runlayer.test"]
-    );
+    assert_eq!(secret_hosts(&f.sync(&token).await), vec!["tenant.mcp.test"]);
 
     sqlx::query("UPDATE principals SET slack_team_id = 'T000000002' WHERE id = $1")
         .bind(actor)
@@ -1223,474 +1599,12 @@ async fn personal_runlayer_requires_the_owners_verified_slack_team_and_active_ac
         .execute(&f.pool)
         .await
         .unwrap();
+    // Console ignores identities without a team when resolving the owner's
+    // Slack identity, so they must not make the owner ambiguous here either.
+    sqlx::query("INSERT INTO user_identities (user_id, provider, subject, team_id, created_at, updated_at) VALUES ($1, 'slack', $2, NULL, now(), now())")
+        .bind(f.admin).bind(format!("UNOTEAM{}", f.unique.to_uppercase())).execute(&f.pool).await.unwrap();
+    assert_eq!(secret_hosts(&f.sync(&token).await), vec!["tenant.mcp.test"]);
     sqlx::query("INSERT INTO user_identities (user_id, provider, subject, team_id, created_at, updated_at) VALUES ($1, 'slack', $2, 'T000000002', now(), now())")
         .bind(f.admin).bind(format!("W{}", f.unique.to_uppercase())).execute(&f.pool).await.unwrap();
     assert!(secret_hosts(&f.sync(&token).await).is_empty());
-}
-
-// Save a personal key through the same encrypted table used by Console.
-impl Fixture {
-    async fn ssh_key(&mut self, principal: i64) -> i64 {
-        self.state.ssh_targets = crate::ssh::target_policies(Some(
-            r#"[{"host":"*.dev.example.com","path":"/events/events","username":"dev"}]"#,
-        ))
-        .unwrap();
-        let owner: i64 = sqlx::query_scalar("INSERT INTO users (email, status, created_at, updated_at) VALUES ($1, 'active', now(), now()) RETURNING id")
-            .bind(self.name(&format!("ssh-{principal}@example.com"))).fetch_one(&self.pool).await.unwrap();
-        let subject = self.name(&format!("U{principal}")).to_uppercase();
-        sqlx::query("UPDATE principals SET console_user_id = $1, slack_user_id = $2, slack_team_id = 'TTEST' WHERE id = $3")
-            .bind(owner).bind(&subject).bind(principal).execute(&self.pool).await.unwrap();
-        sqlx::query("INSERT INTO user_identities (user_id, provider, subject, team_id, created_at, updated_at) VALUES ($1, 'slack', $2, 'TTEST', now(), now())")
-            .bind(owner).bind(subject).execute(&self.pool).await.unwrap();
-        sqlx::query_scalar("INSERT INTO ssh_connections (user_id, name, public_key, private_key, generation, created_at, updated_at) VALUES ($1, 'Synthetic key', 'ssh-ed25519 fixture', $2, 'one', now(), now()) RETURNING id")
-            .bind(owner).bind(ENCRYPTED).fetch_one(&self.pool).await.unwrap()
-    }
-}
-
-#[tokio::test]
-async fn ssh_authorization_is_personal_and_revocable() {
-    let Some(mut f) = Fixture::new().await else {
-        return;
-    };
-    let alice = f.principal("ssh-alice").await;
-    let bob = f.principal("ssh-bob").await;
-    let alice_token = f.proxy(Some(alice), None, json!({})).await;
-    let bob_token = f.proxy(Some(bob), Some(alice), json!({})).await;
-    let unassigned = f.proxy(None, Some(alice), json!({})).await;
-    sqlx::query("UPDATE principals SET kind = 'console_user' WHERE id = $1")
-        .bind(alice)
-        .execute(&f.pool)
-        .await
-        .unwrap();
-    let connection = f.ssh_key(alice).await;
-    let body = json!({"route":"ee","public_key":"ssh-ed25519 sandbox-key","destination":"wss://one.dev.example.com/events/events"});
-    let endpoint = "/api/v1/proxy/ssh/authorize";
-    let (status, grant) = f.post(endpoint, Some(&alice_token), body.clone()).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(grant["principal"], centaur_console_db::oid("prn", alice));
-    assert_eq!(grant["private_key"]["type"], "control_plane");
-    let expiry =
-        chrono::DateTime::parse_from_rfc3339(grant["expires_at"].as_str().unwrap()).unwrap();
-    assert!((expiry.timestamp() - chrono::Utc::now().timestamp()) <= 30);
-    let token_hash = hex::encode(Sha256::digest(alice_token.as_bytes()));
-    let mut previous = grant["generation"].clone();
-    for (step, other) in [Some(bob), None].into_iter().enumerate() {
-        assert_eq!(
-            f.post(endpoint, Some(&alice_token), body.clone()).await.1["generation"],
-            previous
-        );
-        sqlx::query("UPDATE proxies SET principal_id = $1, principal_assigned_at = NULL WHERE bearer_token_hash = $2")
-            .bind(other).bind(&token_hash).execute(&f.pool).await.unwrap();
-        assert_eq!(
-            f.post(endpoint, Some(&alice_token), body.clone()).await.0,
-            StatusCode::UNAUTHORIZED
-        );
-        sqlx::query("UPDATE proxies SET principal_id = $1, principal_assigned_at = now() + make_interval(secs => $3) WHERE bearer_token_hash = $2")
-            .bind(alice).bind(&token_hash).bind((step + 1) as f64).execute(&f.pool).await.unwrap();
-        let (status, renewed) = f.post(endpoint, Some(&alice_token), body.clone()).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_ne!(
-            renewed["generation"], previous,
-            "principal reassignment must invalidate the earlier lease"
-        );
-        previous = renewed["generation"].clone();
-    }
-    sqlx::query("UPDATE proxies SET principal_assigned_at = NULL WHERE bearer_token_hash = $1")
-        .bind(&token_hash)
-        .execute(&f.pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        f.post(endpoint, Some(&alice_token), body.clone()).await.0,
-        StatusCode::UNAUTHORIZED,
-        "an assigned principal without an epoch must fail closed"
-    );
-    sqlx::query("UPDATE proxies SET principal_assigned_at = now() + interval '3 seconds' WHERE bearer_token_hash = $1")
-        .bind(&token_hash).execute(&f.pool).await.unwrap();
-    for token in [&bob_token, &unassigned, "invalid-token"] {
-        assert_eq!(
-            f.post(endpoint, Some(token), body.clone()).await.0,
-            StatusCode::UNAUTHORIZED
-        );
-    }
-    sqlx::query("UPDATE principals SET kind = 'console_user' WHERE id = $1")
-        .bind(bob)
-        .execute(&f.pool)
-        .await
-        .unwrap();
-    f.ssh_key(bob).await;
-    let (status, bob_grant) = f.post(endpoint, Some(&bob_token), body.clone()).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(bob_grant["principal"], centaur_console_db::oid("prn", bob));
-    assert_eq!(bob_grant["private_key"]["value"], "known secret");
-    // Personal ingress kinds retain their own grant; shared contexts cannot use it.
-    for kind in ["console_user", "slack_dm"] {
-        sqlx::query("UPDATE principals SET kind = $1 WHERE id = $2")
-            .bind(kind)
-            .bind(alice)
-            .execute(&f.pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            f.post(endpoint, Some(&alice_token), body.clone()).await.0,
-            StatusCode::OK,
-            "personal kind {kind}"
-        );
-    }
-    for kind in ["user", "slack_channel", "workflow", "unknown"] {
-        sqlx::query("UPDATE principals SET kind = $1 WHERE id = $2")
-            .bind(kind)
-            .bind(alice)
-            .execute(&f.pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            f.post(endpoint, Some(&alice_token), body.clone()).await.0,
-            StatusCode::UNAUTHORIZED,
-            "shared kind {kind}"
-        );
-    }
-    sqlx::query("UPDATE principals SET kind = 'console_user' WHERE id = $1")
-        .bind(alice)
-        .execute(&f.pool)
-        .await
-        .unwrap();
-    sqlx::query("UPDATE ssh_connections SET revoked_at = now(), private_key = NULL WHERE id = $1")
-        .bind(connection)
-        .execute(&f.pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        f.post(endpoint, Some(&alice_token), body).await.0,
-        StatusCode::UNAUTHORIZED
-    );
-}
-
-#[tokio::test]
-async fn ssh_channel_turn_uses_only_the_bound_slack_requester() {
-    let Some(mut f) = Fixture::new().await else {
-        return;
-    };
-    let channel = f.principal("ssh-channel").await;
-    let alice = f.principal("ssh-requester-alice").await;
-    let bob = f.principal("ssh-requester-bob").await;
-    sqlx::query("UPDATE principals SET kind = 'slack_channel' WHERE id = $1")
-        .bind(channel)
-        .execute(&f.pool)
-        .await
-        .unwrap();
-    for (id, user) in [(alice, "UALICE"), (bob, "UBOB")] {
-        sqlx::query("UPDATE principals SET kind = 'slack_dm', slack_user_id = $1, slack_team_id = 'TTEST' WHERE id = $2")
-            .bind(user).bind(id).execute(&f.pool).await.unwrap();
-    }
-    let token = f.proxy(Some(channel), Some(alice), json!({})).await;
-    let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
-    f.ssh_key(alice).await;
-    let endpoint = "/api/v1/proxy/ssh/authorize";
-    let body = json!({"route":"ee","public_key":"ssh-ed25519 sandbox-key","destination":"wss://one.dev.example.com/events/events"});
-    let (status, lease) = f.post(endpoint, Some(&token), body.clone()).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(lease["principal"], centaur_console_db::oid("prn", alice));
-    assert_eq!(lease["private_key"]["value"], "known secret");
-    assert_eq!(
-        f.post(endpoint, Some(&token), body.clone()).await.1["generation"],
-        lease["generation"]
-    );
-
-    sqlx::query("UPDATE proxies SET principal_id = NULL, principal_assigned_at = NULL WHERE bearer_token_hash = $1")
-        .bind(&token_hash).execute(&f.pool).await.unwrap();
-    assert_eq!(
-        f.post(endpoint, Some(&token), body.clone()).await.0,
-        StatusCode::UNAUTHORIZED
-    );
-    sqlx::query("UPDATE proxies SET principal_id = $1, principal_assigned_at = now() + interval '1 second' WHERE bearer_token_hash = $2")
-        .bind(channel).bind(&token_hash).execute(&f.pool).await.unwrap();
-    let (status, reassigned) = f.post(endpoint, Some(&token), body.clone()).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_ne!(
-        reassigned["generation"], lease["generation"],
-        "channel principal reassignment must invalidate the earlier lease even with the same requester"
-    );
-    assert_eq!(
-        f.post(endpoint, Some(&token), body.clone()).await.1["generation"],
-        reassigned["generation"]
-    );
-
-    // Same shared sandbox: another user's turn cannot inherit Alice's grant.
-    // Missing attribution also clears access instead of falling back to the channel.
-    for requester in [Some(bob), None] {
-        sqlx::query("UPDATE proxies SET requester_principal_id = $1, requester_principal_assigned_at = now() WHERE bearer_token_hash = $2")
-            .bind(requester).bind(&token_hash).execute(&f.pool).await.unwrap();
-        assert_eq!(
-            f.post(endpoint, Some(&token), body.clone()).await.0,
-            StatusCode::UNAUTHORIZED
-        );
-    }
-    sqlx::query("UPDATE proxies SET requester_principal_id = $1, requester_principal_assigned_at = now() WHERE bearer_token_hash = $2")
-        .bind(alice).bind(&token_hash).execute(&f.pool).await.unwrap();
-    let (status, next_lease) = f.post(endpoint, Some(&token), body.clone()).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_ne!(
-        next_lease["generation"], reassigned["generation"],
-        "an old lease must not survive rebinding to Alice"
-    );
-
-    // The tool cannot nominate a user; only the authenticated control-plane binding can.
-    let mut forged = body.clone();
-    forged["requester_principal_id"] = json!(centaur_console_db::oid("prn", alice));
-    let response = router(f.state.clone())
-        .oneshot(
-            Request::post(endpoint)
-                .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {token}"))
-                .body(Body::from(forged.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    for kind in ["workflow", "unknown"] {
-        sqlx::query("UPDATE principals SET kind = $1 WHERE id = $2")
-            .bind(kind)
-            .bind(channel)
-            .execute(&f.pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            f.post(endpoint, Some(&token), body.clone()).await.0,
-            StatusCode::UNAUTHORIZED
-        );
-    }
-    sqlx::query("UPDATE principals SET kind = 'slack_channel' WHERE id = $1")
-        .bind(channel)
-        .execute(&f.pool)
-        .await
-        .unwrap();
-    // A non-Slack requester or incomplete binding must not unlock a personal key.
-    for kind in [
-        "user",
-        "console_user",
-        "slack_channel",
-        "workflow",
-        "unknown",
-    ] {
-        sqlx::query("UPDATE principals SET kind = $1 WHERE id = $2")
-            .bind(kind)
-            .bind(alice)
-            .execute(&f.pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            f.post(endpoint, Some(&token), body.clone()).await.0,
-            StatusCode::UNAUTHORIZED
-        );
-    }
-    sqlx::query("UPDATE principals SET kind = 'slack_dm', slack_team_id = NULL WHERE id = $1")
-        .bind(alice)
-        .execute(&f.pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        f.post(endpoint, Some(&token), body.clone()).await.0,
-        StatusCode::UNAUTHORIZED
-    );
-    sqlx::query("UPDATE principals SET slack_team_id = 'TTEST' WHERE id = $1")
-        .bind(alice)
-        .execute(&f.pool)
-        .await
-        .unwrap();
-    sqlx::query(
-        "UPDATE proxies SET requester_principal_assigned_at = NULL WHERE bearer_token_hash = $1",
-    )
-    .bind(&token_hash)
-    .execute(&f.pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        f.post(endpoint, Some(&token), body.clone()).await.0,
-        StatusCode::UNAUTHORIZED
-    );
-}
-
-#[tokio::test]
-async fn managed_ssh_connections_follow_verified_ownership_and_revocation() {
-    let Some(mut f) = Fixture::new().await else {
-        return;
-    };
-    sqlx::query("UPDATE users SET status = 'active' WHERE id = $1")
-        .bind(f.admin)
-        .execute(&f.pool)
-        .await
-        .unwrap();
-    let console = f.principal("ssh-console-owner").await;
-    let slack = f.principal("ssh-slack-owner").await;
-    let other = f.principal("ssh-other-owner").await;
-    let channel = f.principal("ssh-shared-channel").await;
-    sqlx::query("UPDATE principals SET kind = 'console_user', console_user_id = $1 WHERE id = $2")
-        .bind(f.admin)
-        .bind(console)
-        .execute(&f.pool)
-        .await
-        .unwrap();
-    let owner_subject = format!("U{}", f.unique.to_uppercase());
-    let other_subject = format!("W{}", f.unique.to_uppercase());
-    for (id, kind, user) in [
-        (slack, "slack_dm", owner_subject.as_str()),
-        (other, "slack_dm", other_subject.as_str()),
-        (channel, "slack_channel", owner_subject.as_str()),
-    ] {
-        sqlx::query("UPDATE principals SET kind = $1, slack_user_id = $2, slack_team_id = 'T000000001' WHERE id = $3")
-            .bind(kind).bind(user).bind(id).execute(&f.pool).await.unwrap();
-    }
-    sqlx::query("INSERT INTO user_identities (user_id, provider, subject, team_id, created_at, updated_at) VALUES ($1, 'slack', $2, 'T000000001', now(), now())")
-        .bind(f.admin).bind(&owner_subject).execute(&f.pool).await.unwrap();
-    let connection: i64 = sqlx::query_scalar("INSERT INTO ssh_connections (user_id, name, destination, username, host_key, public_key, private_key, generation, expires_at, created_at, updated_at) VALUES ($1, 'Synthetic EE', 'wss://ee.example.com/events/events', 'dev', 'ssh-ed25519 fixture', 'ssh-ed25519 fixture', $2, 'managed-one', now() + interval '1 day', now(), now()) RETURNING id")
-        .bind(f.admin).bind(ENCRYPTED).fetch_one(&f.pool).await.unwrap();
-    let console_token = f.proxy(Some(console), None, json!({})).await;
-    let slack_token = f.proxy(Some(slack), None, json!({})).await;
-    let other_token = f.proxy(Some(other), None, json!({})).await;
-    let channel_token = f.proxy(Some(channel), Some(slack), json!({})).await;
-    let endpoint = "/api/v1/proxy/ssh/authorize";
-    f.state.ssh_targets = crate::ssh::target_policies(Some(
-        r#"[{"host":"*.dev.example.com","path":"/events/events","username":"dev"}]"#,
-    ))
-    .unwrap();
-    let body = json!({"route":"ee","public_key":"ssh-ed25519 sandbox-key","destination":"wss://one.dev.example.com/events/events"});
-    for (token, principal) in [
-        (&console_token, console),
-        (&slack_token, slack),
-        (&channel_token, slack),
-    ] {
-        let (status, grant) = f.post(endpoint, Some(token), body.clone()).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            grant["principal"],
-            centaur_console_db::oid("prn", principal)
-        );
-        assert_eq!(grant["private_key"]["type"], "control_plane");
-        assert_ne!(grant["private_key"]["value"], ENCRYPTED);
-    }
-    assert_eq!(
-        f.post(endpoint, Some(&other_token), body.clone()).await.0,
-        StatusCode::UNAUTHORIZED
-    );
-    // One stored key can be used for several explicitly allowed targets.
-    for target in [
-        "wss://one.dev.example.com/events/events",
-        "wss://two.dev.example.com/events/events",
-    ] {
-        let mut request = body.clone();
-        request["destination"] = json!(target);
-        let (status, grant) = f.post(endpoint, Some(&slack_token), request.clone()).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(grant["destination"], target);
-        assert_eq!(grant["tls_identity"], true);
-        assert_eq!(grant["host_key"], "");
-        assert_eq!(
-            f.post(endpoint, Some(&other_token), request).await.0,
-            StatusCode::UNAUTHORIZED
-        );
-    }
-    for target in [
-        "wss://evil.example.com/events/events",
-        "wss://one.dev.example.com/other",
-    ] {
-        let mut request = body.clone();
-        request["destination"] = json!(target);
-        assert_eq!(
-            f.post(endpoint, Some(&slack_token), request).await.0,
-            StatusCode::UNAUTHORIZED
-        );
-    }
-    let mut missing_target = body.clone();
-    missing_target
-        .as_object_mut()
-        .unwrap()
-        .remove("destination");
-    let response = router(f.state.clone())
-        .oneshot(
-            Request::post(endpoint)
-                .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {slack_token}"))
-                .body(Body::from(missing_target.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    sqlx::query("UPDATE ssh_connections SET expires_at = NULL WHERE id = $1")
-        .bind(connection)
-        .execute(&f.pool)
-        .await
-        .unwrap();
-    for token in [&console_token, &slack_token, &channel_token] {
-        let mut request = body.clone();
-        request["destination"] = json!("wss://one.dev.example.com/events/events");
-        let (status, grant) = f.post(endpoint, Some(token), request).await;
-        assert_eq!(status, StatusCode::OK);
-        let lease =
-            chrono::DateTime::parse_from_rfc3339(grant["expires_at"].as_str().unwrap()).unwrap();
-        assert!(lease > chrono::Utc::now());
-        assert!(lease <= chrono::Utc::now() + chrono::Duration::seconds(30));
-    }
-    let mut wrong_route = body.clone();
-    wrong_route["route"] = json!("other");
-    assert_eq!(
-        f.post(endpoint, Some(&slack_token), wrong_route).await.0,
-        StatusCode::UNAUTHORIZED
-    );
-    let first = f.post(endpoint, Some(&slack_token), body.clone()).await.1;
-    sqlx::query("UPDATE ssh_connections SET generation = 'managed-two' WHERE id = $1")
-        .bind(connection)
-        .execute(&f.pool)
-        .await
-        .unwrap();
-    let second = f.post(endpoint, Some(&slack_token), body.clone()).await.1;
-    assert_ne!(first["generation"], second["generation"]);
-    // Same subject in a different workspace cannot select the owner's connection.
-    sqlx::query("UPDATE principals SET slack_team_id = 'T000000002' WHERE id = $1")
-        .bind(slack)
-        .execute(&f.pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        f.post(endpoint, Some(&slack_token), body.clone()).await.0,
-        StatusCode::UNAUTHORIZED
-    );
-    sqlx::query("UPDATE principals SET slack_team_id = 'T000000001' WHERE id = $1")
-        .bind(slack)
-        .execute(&f.pool)
-        .await
-        .unwrap();
-    sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1")
-        .bind(f.admin)
-        .execute(&f.pool)
-        .await
-        .unwrap();
-    for token in [&console_token, &slack_token, &channel_token] {
-        assert_eq!(
-            f.post(endpoint, Some(token), body.clone()).await.0,
-            StatusCode::UNAUTHORIZED
-        );
-    }
-    sqlx::query("UPDATE users SET status = 'active' WHERE id = $1")
-        .bind(f.admin)
-        .execute(&f.pool)
-        .await
-        .unwrap();
-    // Explicit disconnect and expiry both revoke saved-key access.
-    for sql in [
-        "UPDATE ssh_connections SET expires_at = now() - interval '1 minute' WHERE id = $1",
-        "UPDATE ssh_connections SET expires_at = NULL, revoked_at = now(), private_key = NULL WHERE id = $1",
-    ] {
-        sqlx::query(sql)
-            .bind(connection)
-            .execute(&f.pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            f.post(endpoint, Some(&slack_token), body.clone()).await.0,
-            StatusCode::UNAUTHORIZED
-        );
-    }
 }

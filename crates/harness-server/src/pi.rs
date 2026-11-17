@@ -31,13 +31,17 @@ const DEFAULT_THINKING_LEVEL: &str = "medium";
 /// ingresses offer. Each needs its provider's `api_key` credential.
 const MODELS: &[(&str, &str)] = &[
     ("anthropic", "claude-fable-5"),
+    ("anthropic", "claude-fable-5-1"),
+    ("anthropic", "claude-fable-5-2"),
     ("anthropic", "claude-haiku-4-5"),
+    ("anthropic", "claude-haiku-5-5"),
     ("anthropic", "claude-opus-4-7"),
     ("anthropic", "claude-opus-4-8"),
     ("anthropic", "claude-opus-5"),
     ("anthropic", "claude-opus-5-5"),
     ("anthropic", "claude-sonnet-4-6"),
     ("anthropic", "claude-sonnet-5"),
+    ("anthropic", "claude-sonnet-5-5"),
     ("openai", "gpt-5.4"),
     ("openai", "gpt-5.4-mini"),
     ("openai", "gpt-5.4-nano"),
@@ -50,6 +54,8 @@ const MODELS: &[(&str, &str)] = &[
     ("openai", "gpt-6-astra"),
     ("openai", "gpt-6-luna"),
     ("openai", "gpt-6-sol"),
+    ("openai", "gpt-6.1-sol"),
+    ("openai", "gpt-6.1-terra"),
 ];
 const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
@@ -370,8 +376,14 @@ mod tests {
     fn only_supported_models_are_accepted() {
         for model in [
             "anthropic/claude-sonnet-5",
+            "anthropic/claude-fable-5-1",
+            "anthropic/claude-fable-5-2",
+            "anthropic/claude-sonnet-5-5",
+            "claude-haiku-5-5",
             "claude-sonnet-5",
             "openai/gpt-5.5",
+            "openai/gpt-6.1-sol",
+            "gpt-6.1-terra",
         ] {
             assert_eq!(check_model(model), Ok(()), "{model}");
         }

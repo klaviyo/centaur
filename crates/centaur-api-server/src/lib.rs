@@ -1,3 +1,4 @@
+mod api_clients;
 mod api_jwt;
 mod auth;
 pub mod client;
@@ -12,6 +13,7 @@ pub mod types;
 pub use auth::{ApiAuthConfig, ApiAuthConfigError};
 pub use centaur_session_runtime::{SandboxRuntime, SessionRuntime};
 pub use error::ApiError;
+pub use mcp::mcp_codemode_enabled;
 pub use routes::{
     AppState, build_router_with_app_state, build_router_with_runtime,
     build_router_with_session_and_workflow_runtime, build_router_with_session_runtime,
@@ -288,6 +290,12 @@ mod tests {
                 .body(Body::empty())
                 .unwrap(),
             Request::builder()
+                .method(Method::DELETE)
+                .uri("/api/session/slack%3AC123%3A123.456/sandbox")
+                .header(header::AUTHORIZATION, format!("Bearer {}", console_token()))
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
                 .uri("/api/workflows/runs")
                 .header(header::AUTHORIZATION, format!("Bearer {}", console_token()))
                 .body(Body::empty())
@@ -393,6 +401,15 @@ mod tests {
                     .header(header::AUTHORIZATION, &authorized)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"harness_type":"codex"}"#))
+                    .unwrap(),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/session/slack%3AC123%3A123.456/sandbox")
+                    .header(header::AUTHORIZATION, &authorized)
+                    .body(Body::empty())
                     .unwrap(),
                 StatusCode::FORBIDDEN,
             ),
@@ -550,6 +567,19 @@ mod tests {
             .unwrap();
         assert_eq!(write_response.status(), StatusCode::FORBIDDEN);
 
+        let release_response = build_router_with_app_state(AppState::unready(test_auth()))
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/session/slack%3AC123%3A123.456/sandbox")
+                    .header(header::AUTHORIZATION, format!("Bearer {principal}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(release_response.status(), StatusCode::FORBIDDEN);
+
         let slack_response = build_router_with_app_state(AppState::unready(test_auth()))
             .oneshot(
                 Request::builder()
@@ -562,6 +592,78 @@ mod tests {
             .unwrap();
         assert_ne!(slack_response.status(), StatusCode::UNAUTHORIZED);
         assert_ne!(slack_response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn slack_proxy_user_message_and_reaction_routes_are_principal_only() {
+        let routes = [
+            (Method::GET, "/api/slack/users"),
+            (Method::GET, "/api/slack/users?limit=10&cursor=next"),
+            (Method::GET, "/api/slack/users/U123456789"),
+            (
+                Method::GET,
+                "/api/slack/channels/C123456789/messages/1700000000.000001/permalink",
+            ),
+            (
+                Method::POST,
+                "/api/slack/channels/C123456789/messages/1700000000.000001/reactions/eyes",
+            ),
+            (
+                Method::DELETE,
+                "/api/slack/channels/C123456789/messages/1700000000.000001/reactions/eyes",
+            ),
+            (
+                Method::POST,
+                "/api/slack/channels/C123456789/messages/1700000000.000001/reactions/%2B1",
+            ),
+        ];
+        let forged = encode(
+            &Header::new(Algorithm::HS256),
+            &json!({
+                "iss": "centaur-console",
+                "sub": "prn_sandbox",
+                "aud": "centaur-api",
+                "iat": 1_700_000_000i64,
+                "exp": 4_102_444_800i64,
+            }),
+            &EncodingKey::from_secret(b"wrong-secret"),
+        )
+        .unwrap();
+        let principal = principal_token("prn_sandbox");
+
+        for (method, uri) in routes {
+            for (authorization, expected) in [
+                (None, Some(StatusCode::UNAUTHORIZED)),
+                (Some(forged.clone()), Some(StatusCode::UNAUTHORIZED)),
+                (
+                    Some("test-slackbot-key".to_owned()),
+                    Some(StatusCode::FORBIDDEN),
+                ),
+                (Some(console_token()), Some(StatusCode::FORBIDDEN)),
+                // Principals pass the gate; the handler then needs Slack config.
+                (Some(principal.clone()), None),
+            ] {
+                let mut request = Request::builder().method(&method).uri(uri);
+                if let Some(token) = &authorization {
+                    request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+                }
+                let response =
+                    build_router_with_app_state(AppState::unready(test_auth_with_slack()))
+                        .oneshot(request.body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                let status = response.status();
+                match expected {
+                    Some(expected) => assert_eq!(status, expected, "{method} {uri}"),
+                    None => {
+                        assert_ne!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+                        assert_ne!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+                        assert_ne!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+                        assert_ne!(status, StatusCode::METHOD_NOT_ALLOWED, "{method} {uri}");
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -664,6 +766,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_endpoint_is_routed_only_while_api_clients_are_enabled() {
+        for (enabled, status) in [
+            (true, StatusCode::BAD_REQUEST),
+            (false, StatusCode::NOT_FOUND),
+        ] {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("/oauth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("grant_type=password"))
+                .unwrap();
+            let response = build_router_with_app_state(AppState::unready(
+                test_auth().with_api_clients_enabled(enabled),
+            ))
+            .oneshot(request)
+            .await
+            .unwrap();
+            assert_eq!(response.status(), status, "enabled={enabled}");
+        }
+    }
+
+    #[tokio::test]
     async fn runtime_routes_report_unavailable_until_runtime_is_ready() {
         for mut request in [
             Request::builder()
@@ -713,7 +837,7 @@ mod tests {
                 .method(Method::POST)
                 .uri("/api/workflows/runs")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"workflow_name":"agent_turn","input":{}}"#))
+                .body(Body::from(r#"{"workflow_name":"echo","input":{}}"#))
                 .unwrap(),
             Request::builder()
                 .method(Method::GET)
