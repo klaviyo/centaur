@@ -1575,7 +1575,7 @@ function ensureTrailingSlash(value: string): string {
   return value.endsWith('/') ? value : `${value}/`
 }
 
-function apiHeaders(options: SlackbotV2Options, jsonBody = true): HeadersInit {
+export function apiHeaders(options: SlackbotV2Options, jsonBody = true): HeadersInit {
   const apiKey = options.apiKey ?? process.env.SLACKBOT_API_KEY
   return {
     ...(jsonBody ? { 'content-type': 'application/json' } : {}),

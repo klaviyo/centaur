@@ -468,6 +468,64 @@ describe('slackbotv2', () => {
     expect(codexApi.executes).toHaveLength(0)
   })
 
+  it('forwards verified channel messages to the configured workflow webhook', async () => {
+    const forwarded: { url: string; body: string; authorization: string | null }[] = []
+    bot = createTestBot({
+      workflowWebhookSlug: 'slack-channel',
+      fetch: async (input, init) => {
+        if (String(input).endsWith('/api/webhooks/slack-channel')) {
+          forwarded.push({
+            url: String(input),
+            body: String(init?.body),
+            authorization: new Headers(init?.headers).get('authorization')
+          })
+          return Response.json({ ok: true, filtered: true })
+        }
+        return globalThis.fetch(input, init)
+      }
+    })
+    const delivery = await deliverEvent({
+      type: 'message',
+      user: USER_ID,
+      channel: CHANNEL_ID,
+      team: TEAM_ID,
+      ts: '1700000010.000100',
+      text: 'no mention here'
+    }, { eventId: 'Ev-workflow-forward' })
+
+    expect(delivery.response.status).toBe(200)
+    await delivery.finished()
+    expect(forwarded).toHaveLength(1)
+    expect(forwarded[0]!.authorization).toBe('Bearer slackbotv2-api-key')
+    const body = JSON.parse(forwarded[0]!.body)
+    expect(body.event_id).toBe('Ev-workflow-forward')
+    expect(body.event.channel).toBe(CHANNEL_ID)
+    expect(codexApi.creates).toHaveLength(0)
+  })
+
+  it('does not forward when the Slack signature is invalid', async () => {
+    const forwarded: string[] = []
+    bot = createTestBot({
+      workflowWebhookSlug: 'slack-channel',
+      fetch: async (input, init) => {
+        if (String(input).includes('/api/webhooks/')) forwarded.push(String(input))
+        return globalThis.fetch(input, init)
+      }
+    })
+    const response = await bot.app.request('/api/webhooks/slack', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-slack-request-timestamp': String(Math.floor(Date.now() / 1000)),
+        'x-slack-signature': 'v0=deadbeef'
+      },
+      body: JSON.stringify({ type: 'event_callback', event_id: 'Ev-bad', event: { type: 'message', channel: CHANNEL_ID } })
+    })
+
+    expect(response.status).toBe(401)
+    expect(forwarded).toHaveLength(0)
+  })
+
   it('does not join newly-created public channels when auto-join is disabled', async () => {
     const delivery = await deliverEvent({
       type: 'channel_created',

@@ -225,6 +225,12 @@ export type SlackbotV2Options = {
   triggerBotAllowlist?: readonly string[]
   userName?: string
   mapper?: CodexAppServerToChatStreamOptions
+  /**
+   * Relay verified Slack message events to this api-rs workflow webhook slug
+   * (SLACKBOTV2_WORKFLOW_WEBHOOK_SLUG), authenticated with apiKey. Off when
+   * unset. See workflow-forward.ts.
+   */
+  workflowWebhookSlug?: string
 }
 
 export type MessageOverridesStrategyInput = { text: string }

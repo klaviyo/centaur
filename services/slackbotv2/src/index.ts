@@ -110,6 +110,7 @@ import {
   slackStreamRecipientUserId
 } from './slack-events'
 import { isSlackStopCommand } from './stop-command'
+import { forwardSlackEventToWorkflow } from './workflow-forward'
 import {
   createSteeringReactionController,
   type SteeringReactionAck,
@@ -735,6 +736,8 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
         ? joinSlackChannelCreatedEvent(rawBody, options)
         : null
       if (channelCreatedJoinTask) keepAlive(channelCreatedJoinTask)
+      const workflowForwardTask = response.ok ? forwardSlackEventToWorkflow(rawBody, options) : null
+      if (workflowForwardTask) keepAlive(workflowForwardTask)
       if (awaitHandoff && response.ok) {
         const waitStartedAtMs = nowMs()
         const waitFields = {

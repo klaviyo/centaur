@@ -10,6 +10,7 @@ import {
 import { createOpenAiProactiveClassifier } from './proactive-classifier'
 import { loadProactivityRules } from './proactivity-rules'
 import { parseGenerativeUiLimits } from './generative-ui'
+import { parseWorkflowWebhookSlug } from './workflow-forward'
 
 const port = numberEnv('PORT', 3002)
 const apiUrl = stringEnv('CENTAUR_API_URL', 'http://127.0.0.1:8080')
@@ -114,6 +115,10 @@ const options: SlackbotV2Options = {
     'hourglass_flowing_sand'
   ),
   userName: stringEnv('SLACKBOTV2_USER_NAME', 'centaur'),
+  workflowWebhookSlug: parseWorkflowWebhookSlug(
+    optionalEnv('SLACKBOTV2_WORKFLOW_WEBHOOK_SLUG'),
+    reason => consoleLogger.warn('slackbotv2 workflow forward', { reason })
+  ),
   logger: consoleLogger
 }
 options.slackHomeTeamId = await resolveSlackHomeTeamId(options)
@@ -133,6 +138,7 @@ console.log(
     agent_view_enabled: options.agentViewEnabled,
     activity_summary_status_enabled: options.activitySummaryStatusEnabled,
     auto_join_created_channels_enabled: options.autoJoinCreatedChannels,
+    workflow_webhook_slug: options.workflowWebhookSlug,
     message_overrides_strategy: messageOverridesStrategyMode,
     enabled_harnesses: enabledHarnesses,
     generative_ui_enabled: options.generativeUi?.enabled === true,
