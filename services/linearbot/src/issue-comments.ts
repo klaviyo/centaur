@@ -60,6 +60,13 @@ export function parseIssueCommentWebhook(
 
 /** An issue handed to the bot, reduced to what the assignment turn needs. */
 export type IssueAssignmentEvent = {
+  /**
+   * The Linear user who assigned or delegated the issue (the webhook `actor`),
+   * whom the turn runs as. Absent when the actor is not a user (an automation,
+   * integration, or triage rule) or is missing. Never the assignee.
+   */
+  actorId?: string;
+  actorName?: string;
   issueId: string;
   /** True when the bot is the issue's delegate (vs. plain assignee). */
   delegated: boolean;
@@ -122,7 +129,15 @@ export function parseIssueAssignmentWebhook(
       if (!assigneeChanged && !delegateChanged) return null;
     }
   }
+  const userActor =
+    actor && stringValue(actor.type)?.toLowerCase() === "user"
+      ? actor
+      : undefined;
+  const actorId = stringValue(userActor?.id);
+  const actorName = actorId ? stringValue(userActor?.name) : undefined;
   return {
+    ...(actorId ? { actorId } : {}),
+    ...(actorName ? { actorName } : {}),
     issueId,
     delegated: delegatedToBot,
     updatedAt:

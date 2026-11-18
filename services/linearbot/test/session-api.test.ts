@@ -395,6 +395,44 @@ describe("forwardToSessionApi principal naming", () => {
   });
 });
 
+describe("forwardToSessionApi Linear requester", () => {
+  async function executeMetadata(
+    author: Partial<LinearbotApiMessage["author"]>,
+  ): Promise<Record<string, unknown>> {
+    const { fetchFn, requests } = fakeApi();
+    const message = apiMessage("go");
+    message.author = { ...message.author, ...author };
+    await forwardToSessionApi(options(fetchFn), forwardInput(message));
+    const execute = requests.find((request) =>
+      request.url.endsWith("/execute"),
+    );
+    return (execute?.body as { metadata: Record<string, unknown> }).metadata;
+  }
+
+  test("names the human author as the turn's Linear user", async () => {
+    const metadata = await executeMetadata({
+      userId: "lin-user-1",
+      userName: "Ada Lovelace",
+    });
+    expect(metadata.linear_user_id).toBe("lin-user-1");
+    expect(metadata.linear_user_name).toBe("Ada Lovelace");
+  });
+
+  test("never names the bot, another bot, or the synthetic assignment author", async () => {
+    for (const author of [
+      { isMe: true, userId: "bot-user-1" },
+      { isBot: true, userId: "other-bot" },
+      { isBot: "unknown" as const, userId: "maybe-bot" },
+      { userId: "linear-assignment", userName: "linear-assignment" },
+      { userId: "  " },
+    ]) {
+      const metadata = await executeMetadata(author);
+      expect(metadata).not.toHaveProperty("linear_user_id");
+      expect(metadata).not.toHaveProperty("linear_user_name");
+    }
+  });
+});
+
 describe("harnessRestartPreamble", () => {
   function historyMessage(
     id: string,

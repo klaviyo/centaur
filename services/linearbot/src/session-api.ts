@@ -6,6 +6,7 @@ import type {
   JsonObject,
   JsonValue,
   LinearbotApiAttachment,
+  LinearbotApiAuthor,
   LinearbotApiMessage,
   LinearbotAppendMessagesRequest,
   LinearbotCreateSessionRequest,
@@ -670,6 +671,12 @@ function sessionAttachmentPart(attachment: LinearbotApiAttachment): JsonObject {
   return part;
 }
 
+/**
+ * Author id of the synthetic assignment prompt when no Linear user assigned
+ * or delegated the issue (an automation, integration, or triage rule).
+ */
+export const LINEAR_ASSIGNMENT_AUTHOR_ID = "linear-assignment";
+
 function sessionMetadata(
   message: LinearbotApiMessage,
   extra: JsonObject = {},
@@ -683,7 +690,31 @@ function sessionMetadata(
     timestamp: message.timestamp,
     user_id: message.author.userId,
     user_name: message.author.userName,
+    ...linearRequesterMetadata(message.author),
     ...extra,
+  };
+}
+
+/**
+ * The Linear user a turn runs as. api-rs resolves `linear_user_id` to the
+ * Console user who linked that Linear account and binds their credentials as
+ * the turn's requester. Only a human author counts: never the bot itself,
+ * another bot, or the synthetic assignment author.
+ */
+function linearRequesterMetadata(author: LinearbotApiAuthor): JsonObject {
+  const userId = author.userId.trim();
+  if (
+    author.isMe ||
+    author.isBot !== false ||
+    !userId ||
+    userId === LINEAR_ASSIGNMENT_AUTHOR_ID
+  ) {
+    return {};
+  }
+  const userName = author.userName.trim();
+  return {
+    linear_user_id: userId,
+    ...(userName ? { linear_user_name: userName } : {}),
   };
 }
 
