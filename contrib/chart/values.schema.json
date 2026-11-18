@@ -652,6 +652,7 @@
             "openaiBaseUrl": { "type": "string" },
             "timeoutMs": { "type": "integer", "minimum": 1 },
             "debounceMs": { "type": "integer", "minimum": 0 },
+            "channelScope": { "enum": ["all_channels", "configured_channels_only"] },
             "defaultRules": { "$ref": "#/definitions/slackbotv2ProactivityRules" },
             "channelRules": {
               "type": "object",

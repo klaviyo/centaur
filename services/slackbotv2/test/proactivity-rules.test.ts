@@ -2,7 +2,13 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { loadProactivityRules, resolveProactivityRules } from '../src/proactivity-rules'
+import {
+  loadProactivityRules,
+  parseProactivityChannelScope,
+  proactiveChannelInScope,
+  proactivityDefaultRulesIgnored,
+  resolveProactivityRules
+} from '../src/proactivity-rules'
 
 describe('proactivity rules', () => {
   let dir = ''
@@ -66,5 +72,47 @@ describe('proactivity rules', () => {
 
   test('apply no rules when none are configured', () => {
     expect(resolveProactivityRules({}, 'slack:C0OTHER:1.000')).toBeUndefined()
+  })
+})
+
+describe('proactivity channel scope', () => {
+  const rules = {
+    default: [{ name: 'services', when: 'Questions about our services.' }],
+    channels: {
+      C0ONCALL: [{ name: 'incident', when: 'An active incident.' }],
+      C0SOCIAL: []
+    }
+  }
+
+  test('all_channels keeps every channel in scope with default rules as the fallback', () => {
+    for (const thread of ['slack:C0OTHER:1.000', 'slack:C0ONCALL:1.000', 'slack:C0SOCIAL:1.000']) {
+      expect(proactiveChannelInScope(rules, thread)).toBe(true)
+      expect(proactiveChannelInScope(rules, thread, 'all_channels')).toBe(true)
+    }
+    expect(resolveProactivityRules(rules, 'slack:C0OTHER:1.000', 'all_channels')).toEqual(rules.default)
+  })
+
+  test('configured_channels_only scopes to channels with their own entry and ignores default rules', () => {
+    const scope = 'configured_channels_only'
+    expect(proactiveChannelInScope(rules, 'slack:T0TEAM:C0ONCALL:1.000', scope)).toBe(true)
+    expect(proactiveChannelInScope(rules, 'slack:C0SOCIAL:1.000', scope)).toBe(true)
+    expect(proactiveChannelInScope(rules, 'slack:C0OTHER:1.000', scope)).toBe(false)
+    expect(proactiveChannelInScope(undefined, 'slack:C0OTHER:1.000', scope)).toBe(false)
+    expect(resolveProactivityRules(rules, 'slack:C0ONCALL:1.000', scope)).toEqual(rules.channels.C0ONCALL)
+    expect(resolveProactivityRules(rules, 'slack:C0SOCIAL:1.000', scope)).toBeUndefined()
+    expect(resolveProactivityRules(rules, 'slack:C0OTHER:1.000', scope)).toBeUndefined()
+  })
+
+  test('flag default rules as ignored only when the scope ignores them', () => {
+    expect(proactivityDefaultRulesIgnored(rules, 'configured_channels_only')).toBe(true)
+    expect(proactivityDefaultRulesIgnored(rules, 'all_channels')).toBe(false)
+    expect(proactivityDefaultRulesIgnored({ channels: rules.channels }, 'configured_channels_only')).toBe(false)
+  })
+
+  test('parse the scope, defaulting to all_channels and rejecting unknown values', () => {
+    expect(parseProactivityChannelScope(undefined)).toBe('all_channels')
+    expect(parseProactivityChannelScope('')).toBe('all_channels')
+    expect(parseProactivityChannelScope(' Configured_Channels_Only ')).toBe('configured_channels_only')
+    expect(() => parseProactivityChannelScope('never')).toThrow()
   })
 })
