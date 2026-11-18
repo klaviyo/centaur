@@ -701,13 +701,22 @@ impl SandboxBackend for AgentSandboxBackend {
         id: &SandboxId,
         since: Option<std::time::SystemTime>,
     ) -> SandboxResult<Vec<String>> {
+        let since = since
+            .map(jiff::Timestamp::try_from)
+            .transpose()
+            .map_err(|error| SandboxError::io_source("invalid log since time", error))?;
         let mut params = LogParams {
             container: Some(self.config.container_name.clone()),
+            timestamps: since.is_some(),
             ..LogParams::default()
         };
+        // kube rounds `sinceTime` to the nearest second, which can return
+        // output from just before `since` (an earlier turn's) or drop output
+        // just after it. Ask from the whole second before and filter on each
+        // line's own timestamp instead.
         if let Some(since) = since {
             params.since_time = Some(
-                jiff::Timestamp::try_from(since)
+                jiff::Timestamp::from_second(since.as_second() - 1)
                     .map_err(|error| SandboxError::io_source("invalid log since time", error))?,
             );
         }
@@ -716,7 +725,10 @@ impl SandboxBackend for AgentSandboxBackend {
             .logs(id.as_str(), &params)
             .await
             .map_err(|err| map_kube_error("read sandbox pod logs", err))?;
-        Ok(text.lines().map(str::to_owned).collect())
+        Ok(match since {
+            Some(since) => log_lines_since(&text, since),
+            None => text.lines().map(str::to_owned).collect(),
+        })
     }
 
     /// Report the pod IP a sandbox workload listens on. The sandbox NetworkPolicy
@@ -1658,6 +1670,23 @@ fn map_kube_error(operation: &str, err: Error) -> SandboxError {
     }
 }
 
+/// Lines of a `timestamps=true` pod log written at or after `since`, with
+/// the kubelet's timestamp prefix removed. A line without a parseable prefix
+/// is kept as is.
+fn log_lines_since(text: &str, since: jiff::Timestamp) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let Some((prefix, rest)) = line.split_once(' ') else {
+                return Some(line.to_owned());
+            };
+            match prefix.parse::<jiff::Timestamp>() {
+                Ok(at) => (at >= since).then(|| rest.to_owned()),
+                Err(_) => Some(line.to_owned()),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use centaur_sandbox_core::{
@@ -1665,6 +1694,21 @@ mod tests {
     };
     use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
     use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+
+    #[test]
+    fn log_lines_since_filters_on_each_line_timestamp() {
+        let text = "2026-11-18T12:00:01.100000000Z {\"type\":\"turn.completed\",\"turn_id\":\"a\"}\n\
+                    2026-11-18T12:00:01.300000000Z {\"type\":\"turn.started\",\"turn_id\":\"b\"}\n\
+                    no timestamp here\n";
+        let since: jiff::Timestamp = "2026-11-18T12:00:01.200Z".parse().unwrap();
+        assert_eq!(
+            log_lines_since(text, since),
+            vec![
+                "{\"type\":\"turn.started\",\"turn_id\":\"b\"}".to_owned(),
+                "no timestamp here".to_owned(),
+            ]
+        );
+    }
 
     use super::*;
 
