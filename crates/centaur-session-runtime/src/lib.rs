@@ -2413,7 +2413,11 @@ impl SessionRuntime {
                 return Err(error);
             }
             let requester_principal_id = self
-                .resolve_requester_principal(thread_key, requester_metadata.as_ref())
+                .resolve_requester_principal(
+                    thread_key,
+                    &execution.execution_id,
+                    requester_metadata.as_ref(),
+                )
                 .await;
             let desired_capabilities = match pre_resolved_sandbox_capabilities {
                 Some(capabilities) => capabilities,
@@ -3447,9 +3451,13 @@ impl SessionRuntime {
     /// the execute metadata. `None` for DM and non-Slack threads (the
     /// registrar decides) and on registrar failure: a broken requester lookup
     /// must degrade to today's requester-less turn, never fail the execution.
+    /// A named requester who has not linked their account also runs without
+    /// one, but records `session.requester_unresolved` so the ingress and
+    /// operators can see why the turn lacked that person's credentials.
     async fn resolve_requester_principal(
         &self,
         thread_key: &ThreadKey,
+        execution_id: &str,
         metadata: Option<&Value>,
     ) -> Option<String> {
         match self
@@ -3462,6 +3470,41 @@ impl SessionRuntime {
             .await
         {
             Ok(principal) => principal.map(|principal| principal.id),
+            Err(IronControlError::RequesterNotLinked { provider, subject }) => {
+                info!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_requester_not_linked",
+                    thread_key = %thread_key,
+                    execution_id,
+                    provider,
+                    "requester has not linked their account; proceeding without a requester"
+                );
+                if let Err(error) = self
+                    .store
+                    .append_event(
+                        thread_key,
+                        Some(execution_id),
+                        "session.requester_unresolved",
+                        json!({
+                            "execution_id": execution_id,
+                            "reason": "not_linked",
+                            "provider": provider,
+                            "subject": subject,
+                        }),
+                    )
+                    .await
+                {
+                    warn!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "session_requester_unresolved_event_failed",
+                        thread_key = %thread_key,
+                        execution_id,
+                        %error,
+                        "failed to record the unresolved requester"
+                    );
+                }
+                None
+            }
             Err(error) => {
                 warn!(
                     component = COMPONENT_SESSION_RUNTIME,
@@ -11495,6 +11538,79 @@ mod adoption_tests {
         reset_test_store(&store).await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unlinked_linear_requester_runs_without_a_requester_and_records_why() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, _stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+
+        let execution = execute_with_metadata(
+            &runtime,
+            &thread_key,
+            json!({"linear_user_id": "lin-user-1", "linear_user_name": "Ada"}),
+        )
+        .await;
+        store
+            .complete_execution(&execution.execution_id)
+            .await
+            .expect("complete execution");
+
+        let spec = backend.created_specs().pop().expect("created cold spec");
+        assert_eq!(spec.iron_control_requester_principal, None);
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request == "POST /api/v1/principals/resolve_requester"),
+            "the Linear requester is resolved through the console"
+        );
+        let unresolved = events(&store, &thread_key)
+            .await
+            .into_iter()
+            .find(|event| event.event_type == "session.requester_unresolved")
+            .expect("an unlinked requester is recorded on the thread");
+        assert_eq!(
+            unresolved.execution_id.as_deref(),
+            Some(execution.execution_id.as_str())
+        );
+        assert_eq!(
+            unresolved.payload,
+            json!({
+                "execution_id": execution.execution_id,
+                "reason": "not_linked",
+                "provider": "linear",
+                "subject": "lin-user-1",
+            })
+        );
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
     /// Minimal raw-TCP iron-control stub for execute-level requester tests:
     /// principal lookups 404 (every upsert is a create), upserts return an OID
     /// derived from the foreign id (``prn_<foreign_id>``) so assertions can
@@ -11563,6 +11679,10 @@ mod adoption_tests {
             }
             "POST" if path.ends_with("/slack_channel_permissions") => {
                 ("200 OK", r#"{"data":{"ok":true}}"#.to_owned())
+            }
+            // No Linear account is linked in the stub console.
+            "POST" if path == "/api/v1/principals/resolve_requester" => {
+                ("404 Not Found", r#"{"error":"not found"}"#.to_owned())
             }
             _ => (
                 "500 Internal Server Error",

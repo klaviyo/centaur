@@ -411,6 +411,11 @@ fn parse_linear_issue(thread_key: &str) -> Option<&str> {
         .filter(|issue| !issue.is_empty())
 }
 
+/// Whether ``thread_key`` is a Linear thread (``linear:<issue_id>[:…]``).
+pub(crate) fn is_linear_thread(thread_key: &str) -> bool {
+    parse_linear_issue(thread_key).is_some()
+}
+
 /// Parse the official Chat SDK Teams adapter key:
 /// ``teams:<base64url conversation id>:<base64url service url>``.
 fn parse_teams_adapter_segments(thread_key: &str) -> Option<(String, String, Option<String>)> {

@@ -38,6 +38,13 @@ pub enum IronControlError {
         resource: &'static str,
         ident: String,
     },
+    /// The turn named a linked requester (for Linear, the triggering Linear
+    /// user), but no eligible Console user has linked that account.
+    #[error("no Console user has linked {provider} account {subject}")]
+    RequesterNotLinked {
+        provider: &'static str,
+        subject: String,
+    },
     /// A 2xx response body did not deserialize into the expected shape.
     #[error("iron-control {path} response did not match the expected schema: {source}")]
     Decode {
