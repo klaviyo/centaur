@@ -73,6 +73,12 @@ const STEERING_STARTUP_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
 const STDOUT_STALL_PROBE_INTERVAL: Duration = Duration::from_secs(60);
 #[cfg(test)]
 const STDOUT_STALL_PROBE_INTERVAL: Duration = Duration::from_millis(200);
+/// Longest a stall probe (store reads and a recorded-output read) may hold up
+/// reading stdout.
+#[cfg(not(test))]
+const STDOUT_STALL_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(test)]
+const STDOUT_STALL_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 /// Unreceived harness lines tolerated before the stream counts as stalled.
 const STDOUT_STALL_LINE_SLACK: u64 = 2;
 /// Margin for clock skew between the control plane and the node. Missed
@@ -5192,22 +5198,37 @@ async fn run_stdout_pump(
         // it then (adoption, or the pump this one replaced), so it never counts
         // as missed.
         let attached_at = SystemTime::now();
+        // Turns whose terminal output this pump delivered. Their terminal
+        // lines can reappear in a recorded-output window and must not be taken
+        // for a later execution's.
+        let mut delivered_terminal_turns: HashSet<String> = HashSet::new();
         loop {
             let line = match timeout(STDOUT_STALL_PROBE_INTERVAL, stdout.next()).await {
                 Ok(Some(line)) => line,
                 Ok(None) => break,
                 Err(_) => {
-                    if let Some(stall) = probe_stdout_stall(
+                    // The probe runs in place of reading stdout, so bound it.
+                    let probe = probe_stdout_stall(
                         &ctx,
                         &thread_key,
                         sandbox_id,
                         attached_at,
                         &last_line_by_execution,
-                    )
-                    .await
-                    {
-                        record_stdout_stall(&ctx, &thread_key, sandbox_id, &stall).await;
-                        break;
+                        &delivered_terminal_turns,
+                    );
+                    match timeout(STDOUT_STALL_PROBE_TIMEOUT, probe).await {
+                        Ok(Some(stall)) => {
+                            record_stdout_stall(&ctx, &thread_key, sandbox_id, &stall).await;
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(_) => warn!(
+                            component = COMPONENT_SESSION_RUNTIME,
+                            event = "session_stdout_stall_probe_timed_out",
+                            thread_key = %thread_key,
+                            sandbox_id,
+                            "stdout stall probe timed out; resuming stdout"
+                        ),
                     }
                     continue;
                 }
@@ -5311,6 +5332,9 @@ async fn run_stdout_pump(
                 && execution.execution_id == output_execution_id
                 && let Some(terminal) = output_state.observe(&output_execution_id, &line)
             {
+                if let Some(value) = output_value.as_ref() {
+                    delivered_terminal_turns.extend(turn_ids(value));
+                }
                 record_terminal_output(
                     &ctx,
                     &thread_key,
@@ -5404,6 +5428,7 @@ async fn probe_stdout_stall(
     sandbox_id: &str,
     attached_at: SystemTime,
     last_line_by_execution: &HashMap<String, SystemTime>,
+    delivered_terminal_turns: &HashSet<String>,
 ) -> Option<StdoutStall> {
     let execution = match ctx.store.active_execution_for_thread(thread_key).await {
         Ok(Some(execution)) => execution,
@@ -5441,7 +5466,9 @@ async fn probe_stdout_stall(
     });
     let lines =
         read_recorded_output(ctx, thread_key, &execution, sandbox_id, terminal_since).await?;
-    if terminal_output_from_lines(&lines).is_some() {
+    if terminal_output_from_lines(&without_delivered_turns(&lines, delivered_terminal_turns))
+        .is_some()
+    {
         return Some(StdoutStall::Terminal);
     }
 
@@ -5510,6 +5537,25 @@ async fn read_recorded_output(
             None
         }
     }
+}
+
+/// `lines` without those belonging to a turn whose terminal output was
+/// already delivered.
+fn without_delivered_turns(lines: &[String], delivered_turns: &HashSet<String>) -> Vec<String> {
+    if delivered_turns.is_empty() {
+        return lines.to_vec();
+    }
+    lines
+        .iter()
+        .filter(|line| {
+            serde_json::from_str::<Value>(line).map_or(true, |value| {
+                !turn_ids(&value)
+                    .iter()
+                    .any(|turn_id| delivered_turns.contains(turn_id))
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 fn harness_line_count(lines: &[String]) -> u64 {
@@ -9931,6 +9977,7 @@ mod adoption_tests {
         missing_on_stop: std::sync::Mutex<BTreeSet<String>>,
         observability_enabled: std::sync::Mutex<Vec<String>>,
         observability_fails: AtomicBool,
+        hang_output_reads: AtomicBool,
     }
 
     impl MockBackend {
@@ -9960,7 +10007,12 @@ mod adoption_tests {
                 missing_on_stop: std::sync::Mutex::new(BTreeSet::new()),
                 observability_enabled: std::sync::Mutex::new(Vec::new()),
                 observability_fails: AtomicBool::new(false),
+                hang_output_reads: AtomicBool::new(false),
             }
+        }
+
+        fn hang_output_reads(&self) {
+            self.hang_output_reads.store(true, Ordering::SeqCst);
         }
 
         fn observability_enabled(&self) -> Vec<String> {
@@ -10095,6 +10147,9 @@ mod adoption_tests {
             _id: &SandboxId,
             since: Option<SystemTime>,
         ) -> SandboxResult<Vec<String>> {
+            if self.hang_output_reads.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             Ok(self
                 .recorded_output
                 .lock()
@@ -13184,6 +13239,45 @@ mod adoption_tests {
         assert!(stall_reasons(&all).is_empty(), "unexpected stall: {all:?}");
         assert_eq!(backend.opens(), 1);
         reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hanging_stall_probe_does_not_stop_stdout() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (thread_key, backend, mut stdout, _stdin) =
+            adopted_live_execution(&store, "stall-probe-hang").await;
+
+        // Recorded-output reads never return; the pump must give up on the
+        // probe and go back to reading stdout.
+        backend.hang_output_reads();
+        sleep(STDOUT_STALL_PROBE_INTERVAL + Duration::from_millis(50)).await;
+        stdout
+            .write_all(
+                b"{\"type\":\"turn.completed\",\"turn\":{\"id\":\"turn-1\",\"status\":\"completed\"}}\n",
+            )
+            .await
+            .unwrap();
+
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        assert!(stall_reasons(&events(&store, &thread_key).await).is_empty());
+        reset_test_store(&store).await;
+    }
+
+    #[test]
+    fn delivered_turns_are_excluded_from_recorded_output() {
+        let earlier = r#"{"type":"turn.completed","turn":{"id":"turn-a","status":"completed"}}"#;
+        let current = r#"{"type":"turn.started","turn_id":"turn-b"}"#;
+        let lines = vec![earlier.to_owned(), current.to_owned(), "plain".to_owned()];
+        let delivered = HashSet::from(["turn-a".to_owned()]);
+        assert_eq!(
+            without_delivered_turns(&lines, &delivered),
+            vec![current.to_owned(), "plain".to_owned()]
+        );
+        assert!(terminal_output_from_lines(&without_delivered_turns(&lines, &delivered)).is_none());
+        assert!(terminal_output_from_lines(&lines).is_some());
     }
 
     #[test]
