@@ -424,7 +424,27 @@ fn parse_content(value: &Value, staged: &HashMap<String, PathBuf>) -> Result<Vec
         .ok_or_else(|| HarnessServerError::InvalidBlocksInput {
             message: "user content must be a string or array".to_owned(),
         })?;
-    items.iter().map(|item| parse_input(item, staged)).collect()
+    let mut inputs = Vec::new();
+    for item in items {
+        let input = parse_input(item, staged)?;
+        let path = match &input {
+            UserInput::LocalImage { path, .. } => Some(path.clone()),
+            UserInput::Image { image_url, .. } if image_url.starts_with("data:") => {
+                Some(crate::server::image_data_url_path(image_url)?)
+            }
+            _ => None,
+        };
+        if let Some(path) = path {
+            let (text, preview) = crate::server::local_image_preview(&path);
+            inputs.push(UserInput::Text { text });
+            if let Some(path) = preview {
+                inputs.push(UserInput::LocalImage { path, detail: None });
+            }
+        } else {
+            inputs.push(input);
+        }
+    }
+    Ok(inputs)
 }
 
 fn parse_input(value: &Value, staged: &HashMap<String, PathBuf>) -> Result<UserInput> {
@@ -484,7 +504,9 @@ fn attachment_input(value: &Value, staged: &HashMap<String, PathBuf>) -> Result<
         .or_else(|| value.get("mime_type"))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if mime.starts_with("image/") {
+    if mime.starts_with("image/")
+        || value.get("attachment_type").and_then(Value::as_str) == Some("image")
+    {
         Ok(UserInput::LocalImage { path, detail: None })
     } else if mime.starts_with("audio/") {
         Ok(UserInput::LocalAudio { path })
@@ -603,6 +625,37 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn image_inputs_use_shared_bounded_previews() {
+        let dir = env::temp_dir().join(format!("nanocodex-image-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = dir.join("wide.png");
+        image::RgbImage::new(2000, 32).save(&original).unwrap();
+        let bytes = std::fs::read(&original).unwrap();
+        let data = BASE64_STANDARD.encode(&bytes);
+        let staged = HashMap::from([("img".to_owned(), original.clone())]);
+        for block in [
+            serde_json::json!({"type":"localImage", "path":original}),
+            serde_json::json!({"type":"image", "url":format!("data:image/png;base64,{data}")}),
+            serde_json::json!({"type":"attachment", "localPath":original, "mimeType":"image/png"}),
+            serde_json::json!({"type":"attachment", "name":"wide.png", "dataBase64":data, "mimeType":"image/png"}),
+            serde_json::json!({"type":"attachment", "stagedAttachmentId":"img", "attachment_type":"image"}),
+        ] {
+            let inputs = parse_content(&serde_json::json!([block]), &staged).unwrap();
+            let UserInput::Text { text } = &inputs[0] else {
+                panic!("missing original file notice")
+            };
+            assert!(text.contains("Resized preview"));
+            let UserInput::LocalImage { path, .. } = &inputs[1] else {
+                panic!("missing preview")
+            };
+            assert_ne!(path, &original);
+            assert!(image::image_dimensions(path).unwrap().0 <= 1568);
+        }
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

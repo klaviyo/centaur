@@ -515,6 +515,13 @@ fn blocks_input_to_user_input(
     _trace_context: &TraceContext,
 ) -> Result<Vec<UserInput>> {
     match input {
+        BlocksInput::UserInput(UserInput::LocalImage { path, detail }) => {
+            Ok(local_image_inputs_with_detail(path, *detail))
+        }
+        BlocksInput::UserInput(UserInput::Image { url, detail }) if url.starts_with("data:") => {
+            let path = image_data_url_path(url)?;
+            Ok(local_image_inputs_with_detail(&path, *detail))
+        }
         BlocksInput::UserInput(input) => Ok(vec![input.clone()]),
         BlocksInput::Attachment(block) if block.kind == "attachment" => {
             attachment_block_to_user_input(block, state)
@@ -666,26 +673,34 @@ fn handle_attachment_chunk(parsed: BlocksLine, state: &mut BlocksState) -> Resul
     Ok(())
 }
 
+fn local_image_inputs_with_detail(
+    path: &Path,
+    detail: Option<crate::protocol::ImageDetail>,
+) -> Vec<UserInput> {
+    let mut inputs = local_file_inputs(path, None, true);
+    for input in &mut inputs {
+        if let UserInput::LocalImage {
+            detail: image_detail,
+            ..
+        } = input
+        {
+            *image_detail = detail;
+        }
+    }
+    inputs
+}
+
 fn local_file_inputs(path: &Path, mime_type: Option<&str>, is_image: bool) -> Vec<UserInput> {
     if is_image || mime_type.is_some_and(|value| value.starts_with("image/")) {
-        // Model providers reject images past their per-image caps (Bedrock/mantle
-        // and the Anthropic API cap at ~5 MB / 8000 px) and nothing upstream of
-        // the model downscales, so a large pasted screenshot or photo fails the
-        // turn at validation. Normalize oversized images here — the single choke
-        // point every attachment path funnels through — before handing the model
-        // a LocalImage. Best-effort: the original file is used unchanged if the
-        // image is already within limits or re-encoding fails for any reason.
-        let path = downscale_oversized_image(path);
-        return vec![
-            UserInput::Text {
-                text: format!("[Attached image saved to {}]", path.display()),
-                text_elements: Vec::new(),
-            },
-            UserInput::LocalImage {
-                path: path.clone(),
-                detail: None,
-            },
-        ];
+        let (text, preview) = local_image_preview(path);
+        let mut inputs = vec![UserInput::Text {
+            text,
+            text_elements: Vec::new(),
+        }];
+        if let Some(path) = preview {
+            inputs.push(UserInput::LocalImage { path, detail: None });
+        }
+        return inputs;
     }
     vec![UserInput::Text {
         text: format!("[Attached file saved to {}]", path.display()),
@@ -693,9 +708,60 @@ fn local_file_inputs(path: &Path, mime_type: Option<&str>, is_image: bool) -> Ve
     }]
 }
 
+/// Shared by the blocks parser and Nanocodex without coupling their protocols.
+/// Keep originals available for crops/OCR; never submit an unchecked fallback.
+pub(crate) fn local_image_preview(path: &Path) -> (String, Option<PathBuf>) {
+    let preview = match try_downscale_oversized_image(path) {
+        Ok(preview) => preview.unwrap_or_else(|| path.to_path_buf()),
+        Err(error) => {
+            eprintln!(
+                "harness image preview unavailable for {}: {error}",
+                path.display()
+            );
+            return (
+                format!(
+                    "[Attached image saved to {}. An inline preview could not be prepared within model limits; inspect the original file locally.]",
+                    path.display()
+                ),
+                None,
+            );
+        }
+    };
+    let text = if preview == path {
+        format!("[Attached image saved to {}]", path.display())
+    } else {
+        format!(
+            "[Attached image saved to {}. Resized preview of original file at {}; crop the original locally for finer detail rather than submitting the full-resolution image.]",
+            preview.display(),
+            path.display()
+        )
+    };
+    (text, Some(preview))
+}
+
+/// Materialize inline images so they receive the same validation as uploads.
+/// Remote URLs are left to the harness; do not fetch arbitrary URLs here.
+pub(crate) fn image_data_url_path(url: &str) -> Result<PathBuf> {
+    let (header, data) =
+        url.split_once(',')
+            .ok_or_else(|| HarnessServerError::InvalidBlocksInput {
+                message: "invalid image data URL".to_owned(),
+            })?;
+    let mime = header
+        .strip_prefix("data:")
+        .and_then(|header| header.strip_suffix(";base64"))
+        .filter(|mime| mime.starts_with("image/"))
+        .ok_or_else(|| HarnessServerError::InvalidBlocksInput {
+            message: "image data URL must contain a base64-encoded image".to_owned(),
+        })?;
+    write_base64_upload(data, "inline-image", Some(mime))
+}
+
 /// Longest edge (px) oversized images are downscaled to before the model sees
 /// them. 1568 px is the Anthropic-recommended max before their API downscales
 /// server-side, and stays well under Bedrock/mantle's 8000 px hard cap.
+/// It also bounds OpenAI's ceil(width/32) * ceil(height/32) to 2401 patches,
+/// safely below its 30,000-patch per-image rejection limit.
 const MAX_IMAGE_EDGE: u32 = 1568;
 /// Byte budget above which an image is re-encoded even when its dimensions are
 /// already small. Kept safely under mantle's ~5 MB per-image cap.
@@ -704,27 +770,8 @@ const MAX_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
 /// re-encoded output comfortably under the byte cap.
 const DOWNSCALE_JPEG_QUALITY: u8 = 80;
 
-/// Downscale an image that exceeds the model provider's caps, returning the path
-/// to feed the model. Best-effort: on any failure (unknown/unsupported format,
-/// decode or I/O error) the original path is returned unchanged, so a
-/// normalization miss never breaks a turn that would otherwise succeed.
-fn downscale_oversized_image(path: &Path) -> PathBuf {
-    match try_downscale_oversized_image(path) {
-        Ok(Some(scaled)) => scaled,
-        Ok(None) => path.to_path_buf(),
-        Err(error) => {
-            eprintln!(
-                "harness image downscale skipped for {}: {error}",
-                path.display()
-            );
-            path.to_path_buf()
-        }
-    }
-}
-
-/// Returns `Ok(Some(new_path))` when the image was downscaled/re-encoded,
-/// `Ok(None)` when it was already within limits, and `Err` on any decode/encode
-/// failure (handled as best-effort by the caller).
+/// Returns a bounded preview, or `None` when the original already fits. Errors
+/// must not fall back to submitting an unchecked original to the provider.
 fn try_downscale_oversized_image(path: &Path) -> std::result::Result<Option<PathBuf>, ImageError> {
     let byte_len = std::fs::metadata(path)?.len();
     let (width, height) = image::image_dimensions(path)?;
@@ -746,6 +793,12 @@ fn try_downscale_oversized_image(path: &Path) -> std::result::Result<Option<Path
     let mut encoded = Vec::new();
     let encoder = JpegEncoder::new_with_quality(&mut encoded, DOWNSCALE_JPEG_QUALITY);
     DynamicImage::ImageRgb8(resized.to_rgb8()).write_with_encoder(encoder)?;
+
+    if encoded.len() as u64 > MAX_IMAGE_BYTES {
+        return Err(ImageError::IoError(io::Error::other(
+            "image preview exceeds byte limit",
+        )));
+    }
 
     let stem = path
         .file_stem()
@@ -1597,7 +1650,7 @@ mod tests {
         let dir = temp_upload_dir();
         let original = write_gradient_png(&dir, "big.png", 3000, 2000);
 
-        let scaled = downscale_oversized_image(&original);
+        let scaled = try_downscale_oversized_image(&original).unwrap().unwrap();
 
         assert_ne!(
             scaled, original,
@@ -1618,9 +1671,110 @@ mod tests {
         let dir = temp_upload_dir();
         let original = write_gradient_png(&dir, "small.png", 320, 240);
 
-        let same = downscale_oversized_image(&original);
+        let same = try_downscale_oversized_image(&original).unwrap();
 
-        assert_eq!(same, original, "within-limit image is returned unchanged");
+        assert_eq!(same, None, "within-limit image is returned unchanged");
+    }
+
+    #[test]
+    fn image_previews_stay_below_openai_patch_limit_and_preserve_original() {
+        let dir = env::temp_dir().join(format!("image-preview-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = dir.join("large.jpg");
+        image::RgbImage::new(6000, 6000).save(&original).unwrap();
+        let bytes = std::fs::read(&original).unwrap();
+        assert!(6000_u32.div_ceil(32).pow(2) > 30_000);
+        let input = local_file_inputs(&original, Some("image/jpeg"), true);
+        let UserInput::LocalImage { path, .. } = &input[1] else {
+            panic!("missing preview")
+        };
+        let (width, height) = image::image_dimensions(path).unwrap();
+        assert!(width.div_ceil(32) * height.div_ceil(32) <= 2401);
+        assert!(std::fs::metadata(path).unwrap().len() <= MAX_IMAGE_BYTES);
+        let UserInput::Text { text, .. } = &input[0] else {
+            panic!("missing notice")
+        };
+        assert!(text.contains(&original.display().to_string()));
+        assert_eq!(std::fs::read(&original).unwrap(), bytes);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn local_inline_and_staged_images_share_preview_limits() {
+        let dir = env::temp_dir().join(format!("image-input-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = write_gradient_png(&dir, "wide.png", 2000, 32);
+        let data = BASE64_STANDARD.encode(std::fs::read(&original).unwrap());
+        let blocks = [
+            json!({"type":"localImage", "path":original, "detail":"low"}),
+            json!({"type":"image", "url":format!("data:image/png;base64,{data}"), "detail":"low"}),
+            json!({"type":"attachment", "localPath":original, "mimeType":"image/png"}),
+            json!({"type":"attachment", "name":"inline.png", "dataBase64":data, "mimeType":"image/png"}),
+            json!({"type":"attachment", "stagedAttachmentId":"img", "mimeType":"image/png"}),
+        ];
+        let mut state = BlocksState::default();
+        let chunk = json!({"type":"attachment.chunk", "attachmentId":"img", "name":"staged.png", "mimeType":"image/png", "dataBase64":data, "final":true});
+        parse_blocks_line_with_state(&chunk.to_string(), &mut state).unwrap();
+        for (index, block) in blocks.into_iter().enumerate() {
+            let line = json!({"type":"user", "content":[block]}).to_string();
+            let BlocksCommand::User { input, .. } =
+                parse_blocks_line_with_state(&line, &mut state).unwrap()
+            else {
+                panic!("expected user")
+            };
+            let UserInput::LocalImage { path, detail } = &input[1] else {
+                panic!("missing preview")
+            };
+            assert!(image::image_dimensions(path).unwrap().0 <= MAX_IMAGE_EDGE);
+            if index < 2 {
+                assert_eq!(*detail, Some(crate::protocol::ImageDetail::Low));
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn undecodable_image_keeps_file_reference_without_sending_invalid_preview() {
+        let dir = env::temp_dir().join(format!("bad-image-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = dir.join("broken.png");
+        std::fs::write(&original, b"not an image").unwrap();
+        let input = local_file_inputs(&original, Some("image/png"), true);
+        assert_eq!(input.len(), 1);
+        let UserInput::Text { text, .. } = &input[0] else {
+            panic!("expected file reference")
+        };
+        assert!(text.contains("inline preview could not be prepared"));
+        assert!(text.contains(&original.display().to_string()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_bytes_are_reencoded_even_when_dimensions_fit() {
+        let dir = env::temp_dir().join(format!("image-bytes-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = write_gradient_png(&dir, "padded.png", 32, 24);
+        OpenOptions::new()
+            .write(true)
+            .open(&original)
+            .unwrap()
+            .set_len(MAX_IMAGE_BYTES + 1)
+            .unwrap();
+        let preview = try_downscale_oversized_image(&original).unwrap().unwrap();
+        assert!(std::fs::metadata(&preview).unwrap().len() <= MAX_IMAGE_BYTES);
+        assert_eq!(image::image_dimensions(preview).unwrap(), (32, 24));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_gif_is_resized_instead_of_bypassing_limits() {
+        let dir = env::temp_dir().join(format!("gif-image-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = dir.join("wide.gif");
+        image::RgbaImage::new(2000, 32).save(&original).unwrap();
+        let preview = try_downscale_oversized_image(&original).unwrap().unwrap();
+        assert_eq!(image::image_dimensions(preview).unwrap().0, MAX_IMAGE_EDGE);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1800,9 +1954,15 @@ mod tests {
     fn inline_image_attachment_block_becomes_local_image_input() {
         let _upload_dir = temp_upload_dir();
         let mut state = BlocksState::default();
-        let user = r#"{"type":"user","message":{"role":"user","content":[{"type":"attachment","attachment_type":"image","dataBase64":"aGVsbG8=","name":"image.png","mimeType":"image/png","size":5}]}}"#;
+        let original = write_gradient_png(&_upload_dir, "source.png", 32, 24);
+        let bytes = std::fs::read(original).unwrap();
+        let user = json!({"type":"user","message":{"content":[{
+            "type":"attachment", "attachment_type":"image", "name":"image.png",
+            "mimeType":"image/png", "dataBase64": BASE64_STANDARD.encode(&bytes)
+        }]}})
+        .to_string();
         let BlocksCommand::User { input, .. } =
-            parse_blocks_line_with_state(user, &mut state).expect("user parses")
+            parse_blocks_line_with_state(&user, &mut state).expect("user parses")
         else {
             panic!("expected user command");
         };
@@ -1821,6 +1981,6 @@ mod tests {
             path.file_name().and_then(|name| name.to_str()),
             Some("image.png")
         );
-        assert_eq!(std::fs::read(path).expect("read image bytes"), b"hello");
+        assert_eq!(std::fs::read(path).expect("read image bytes"), bytes);
     }
 }

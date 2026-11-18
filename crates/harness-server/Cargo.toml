@@ -17,7 +17,7 @@ clap = { version = "4.5", features = ["derive"] }
 # Decode + downscale oversized image attachments so they stay under the model
 # provider's per-image caps (Bedrock/mantle rejects images past ~5 MB / 8000 px).
 # Scoped to the formats chat clients actually paste to keep the build lean.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 # PID 1 shutdown: forward SIGTERM to the harness processes and reap them.
 libc = "0.2"
 nanocodex = { git = "https://github.com/gakonst/nanocodex", rev = "bf022728c6d36501bdb1c380c7092743db3d5dae" }
