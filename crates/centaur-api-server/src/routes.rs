@@ -51,7 +51,7 @@ use crate::{
         issue_api_client_token, refresh_api_client, select_principal,
     },
     api_jwt::{bearer_jwt_from_headers, decode_jwt_payload, verify_console_jwt},
-    auth::{ApiAuthConfig, AuthenticatedCaller, CallerClass, Capability},
+    auth::{ApiAuthConfig, AuthenticatedCaller, CallerClass, Capability, LINEARBOT_IDENTITY},
     mcp::{mcp_get, mcp_post, mcp_protected_resource_metadata},
     slack_external_teams::{get_slack_external_team_ids, replace_slack_external_team_ids},
     slack_proxy::slack_proxy_router,
@@ -845,7 +845,7 @@ async fn execute_session(
             admit_api_client_execution(&state, &runtime, &client, &thread_key).await?;
             Some(api_client_metadata(client.client_id(), request.metadata))
         }
-        None => sanitize_execute_metadata(caller.class(), request.metadata),
+        None => sanitize_execute_metadata(caller.class(), caller.identity(), request.metadata),
     };
     let execution = runtime
         .enqueue_session_execution(
@@ -890,14 +890,23 @@ async fn admit_api_client_execution(
 /// authenticated Console service, not ordinary caller-controlled metadata.
 /// Strip it from every other caller class before the execution is persisted so
 /// the runtime can safely honor Console requesters on any thread namespace.
+/// Likewise `linear_user_id` (and its display name) names the Linear user a
+/// turn runs as; only linearbot reads it from a signature-verified webhook, so
+/// it is stripped from every other caller.
 fn sanitize_execute_metadata(
     caller_class: CallerClass,
+    caller_identity: &str,
     mut metadata: Option<Value>,
 ) -> Option<Value> {
-    if caller_class != CallerClass::Console
-        && let Some(Value::Object(fields)) = metadata.as_mut()
-    {
+    let Some(Value::Object(fields)) = metadata.as_mut() else {
+        return metadata;
+    };
+    if caller_class != CallerClass::Console {
         fields.remove("requester_principal_foreign_id");
+    }
+    if !(caller_class == CallerClass::Ingress && caller_identity == LINEARBOT_IDENTITY) {
+        fields.remove("linear_user_id");
+        fields.remove("linear_user_name");
     }
     metadata
 }
@@ -1065,7 +1074,7 @@ mod session_authorization_tests {
     use std::collections::BTreeSet;
 
     use super::{
-        CallerClass, caller_may_start_workflow, principal_subject_owns_session,
+        CallerClass, LINEARBOT_IDENTITY, caller_may_start_workflow, principal_subject_owns_session,
         sanitize_execute_metadata,
     };
     use serde_json::json;
@@ -1116,19 +1125,62 @@ mod session_authorization_tests {
         });
 
         assert_eq!(
-            sanitize_execute_metadata(CallerClass::Console, Some(metadata.clone())),
+            sanitize_execute_metadata(
+                CallerClass::Console,
+                "centaur-console",
+                Some(metadata.clone())
+            ),
             Some(metadata.clone())
         );
-        for caller_class in [
-            CallerClass::Admin,
-            CallerClass::Ingress,
-            CallerClass::Principal,
+        for (caller_class, identity) in [
+            (CallerClass::Admin, "api-rs-admin"),
+            (CallerClass::Ingress, "slackbot"),
+            (CallerClass::Ingress, LINEARBOT_IDENTITY),
+            (CallerClass::Principal, "prn_sandbox"),
         ] {
             assert_eq!(
-                sanitize_execute_metadata(caller_class, Some(metadata.clone())),
+                sanitize_execute_metadata(caller_class, identity, Some(metadata.clone())),
                 Some(json!({ "source": "console" }))
             );
         }
+    }
+
+    #[test]
+    fn only_linearbot_may_name_the_linear_requester() {
+        let metadata = json!({
+            "source": "linearbot",
+            "linear_user_id": "lin-user-1",
+            "linear_user_name": "Ada"
+        });
+
+        assert_eq!(
+            sanitize_execute_metadata(
+                CallerClass::Ingress,
+                LINEARBOT_IDENTITY,
+                Some(metadata.clone())
+            ),
+            Some(metadata.clone())
+        );
+        for (caller_class, identity) in [
+            (CallerClass::Admin, "api-rs-admin"),
+            (CallerClass::Console, "centaur-console"),
+            (CallerClass::Ingress, "slackbot"),
+            (CallerClass::Ingress, "githubbot"),
+            // A principal whose subject happens to read "linearbot" is still
+            // not the linearbot ingress.
+            (CallerClass::Principal, LINEARBOT_IDENTITY),
+            (CallerClass::ApiClient, LINEARBOT_IDENTITY),
+        ] {
+            assert_eq!(
+                sanitize_execute_metadata(caller_class, identity, Some(metadata.clone())),
+                Some(json!({ "source": "linearbot" })),
+                "{caller_class:?} {identity}"
+            );
+        }
+        assert_eq!(
+            sanitize_execute_metadata(CallerClass::Admin, "api-rs-admin", None),
+            None
+        );
     }
 }
 

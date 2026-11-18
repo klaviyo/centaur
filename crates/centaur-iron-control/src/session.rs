@@ -16,7 +16,7 @@ use crate::error::{IronControlError, Result};
 use crate::models::{Principal, PrincipalInput, SlackChannelPermissionInput};
 use crate::principal::{
     PrincipalRef, derive_github_requester_principal, derive_principal_with_slack_team,
-    derive_slack_requester_principal, is_direct_message, slack_conversation_id,
+    derive_slack_requester_principal, is_direct_message, is_linear_thread, slack_conversation_id,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -120,8 +120,11 @@ impl SessionRegistrar {
 
     /// Bind the principal of the human requesting this turn, resolved from the
     /// execute metadata (see [`requester_plan`]): fetched for authenticated
-    /// Console executions and upserted for Slack channel and GitHub turns.
-    /// Returns ``Ok(None)`` when the metadata carries no eligible requester.
+    /// Console executions, resolved through Console for Linear turns, and
+    /// upserted for Slack channel and GitHub turns.
+    /// Returns ``Ok(None)`` when the metadata carries no eligible requester,
+    /// and [`IronControlError::RequesterNotLinked`] when a Linear requester
+    /// has not linked their account in Console.
     /// For Slack that includes DM threads (the conversation principal already
     /// is the user's) and requesters not proven to belong to the Slack app's
     /// home team, which prevents Slack Connect users from supplying requester
@@ -156,6 +159,21 @@ impl SessionRegistrar {
             // The console owns console-user principals: fetch, never upsert.
             Some(RequesterPlan::FetchExisting(foreign_id)) => {
                 self.client.get_principal(&foreign_id).await.map(Some)
+            }
+            // The console also owns the provider-account link, so it resolves
+            // (and provisions) the linked user's principal.
+            Some(RequesterPlan::ResolveLinked { provider, subject }) => {
+                match self
+                    .client
+                    .resolve_linked_requester(provider, &subject)
+                    .await
+                {
+                    Ok(principal) => Ok(Some(principal)),
+                    Err(error) if error.is_not_found() => {
+                        Err(IronControlError::RequesterNotLinked { provider, subject })
+                    }
+                    Err(error) => Err(error),
+                }
             }
             Some(RequesterPlan::UpsertDerived(principal)) => {
                 let mut input = principal.to_principal_input();
@@ -245,6 +263,14 @@ enum RequesterPlan {
     /// every caller except the authenticated Console service, so checking the
     /// field also covers Console replies to non-Console threads.
     FetchExisting(String),
+    /// Ask the console for the console-user principal of the user who linked
+    /// this provider account through the console's OAuth consent flow (Linear
+    /// turns). The API server strips the subject from every caller except the
+    /// provider's ingress, which reads it from the signature-verified webhook.
+    ResolveLinked {
+        provider: &'static str,
+        subject: String,
+    },
     /// Upsert the api-rs-owned per-user principal derived from the ingress's
     /// verified actor identity (Slack channel turns, GitHub turns).
     UpsertDerived(PrincipalRef),
@@ -258,6 +284,20 @@ fn requester_plan(thread_key: &str, metadata: &Value) -> Option<RequesterPlan> {
             .map(str::trim)
             .filter(|foreign_id| !foreign_id.is_empty())?;
         return Some(RequesterPlan::FetchExisting(foreign_id.to_owned()));
+    }
+    // linearbot forwards the person who triggered the turn (`linear_user_id`):
+    // the comment author, or the user who assigned or delegated the issue.
+    if is_linear_thread(thread_key)
+        && let Some(subject) = metadata
+            .get("linear_user_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|subject| !subject.is_empty())
+    {
+        return Some(RequesterPlan::ResolveLinked {
+            provider: "linear",
+            subject: subject.to_owned(),
+        });
     }
     // githubbot forwards the comment author (`user_id`, `user_name`) from the
     // signature-verified webhook payload. Let the derivation helper recognize
@@ -584,6 +624,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn linked_linear_requester_resolves_through_the_console_without_an_upsert() {
+        let (base_url, requests, server) =
+            spawn_iron_control_stub(|method, path| match (method, path) {
+                ("POST", "/api/v1/principals/resolve_requester") => principal(
+                    "prn_console_user",
+                    "console-user-ada-example-com-abc123",
+                    json!({}),
+                ),
+                _ => not_found(),
+            })
+            .await;
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+
+        let requester = registrar
+            .register_requester(
+                "linear:issue-1",
+                Some(&json!({"linear_user_id": "lin-user-1", "linear_user_name": "Ada"})),
+            )
+            .await
+            .expect("resolve linked requester")
+            .expect("a linked Linear user resolves");
+
+        assert_eq!(requester.id, "prn_console_user");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "only the console resolves the requester");
+        assert_eq!(
+            requests[0].body,
+            Some(json!({"data": {"provider": "linear", "subject": "lin-user-1"}}))
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unlinked_linear_requester_is_a_typed_error() {
+        let (base_url, _requests, server) = spawn_iron_control_stub(|_, _| not_found()).await;
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+
+        let error = registrar
+            .register_requester(
+                "linear:issue-1:c:comment-1",
+                Some(&json!({"linear_user_id": "lin-ghost"})),
+            )
+            .await
+            .expect_err("an unlinked Linear user must not resolve");
+
+        assert!(
+            matches!(
+                &error,
+                IronControlError::RequesterNotLinked { provider: "linear", subject }
+                    if subject == "lin-ghost"
+            ),
+            "{error:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn linear_requester_lookup_failures_are_not_reported_as_unlinked() {
+        let (base_url, _requests, server) = spawn_iron_control_stub(|_, _| {
+            (
+                "500 Internal Server Error",
+                r#"{"error":"unexpected"}"#.to_owned(),
+            )
+        })
+        .await;
+        let registrar = SessionRegistrar::new(IronControlClient::new(base_url, "test-key"));
+
+        let error = registrar
+            .register_requester(
+                "linear:issue-1",
+                Some(&json!({"linear_user_id": "lin-user-1"})),
+            )
+            .await
+            .expect_err("a failed console lookup must surface");
+
+        assert!(
+            matches!(error, IronControlError::Status { status: 500, .. }),
+            "{error:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn channel_requester_upsert_keeps_existing_labels_and_sets_email() {
         let (base_url, requests, server) =
             spawn_iron_control_stub(|method, path| match (method, path) {
@@ -738,6 +861,16 @@ mod tests {
                 "linear:issue-1",
                 json!({"user_id": "90210001", "user_name": "ada"}),
             ),
+            ("linear:issue-1", json!({"linear_user_id": "   "})),
+            // Only Linear threads resolve a Linear requester.
+            (
+                "slack:T123:C123:1773364194.179929",
+                json!({"linear_user_id": "lin-user-1"}),
+            ),
+            (
+                "console:9f1b7a3c-2d4e-4f6a-8b0c-1d2e3f4a5b6c",
+                json!({"linear_user_id": "lin-user-1"}),
+            ),
         ] {
             assert!(
                 requester_plan(thread_key, &metadata).is_none(),
@@ -761,6 +894,25 @@ mod tests {
                 panic!("expected a console requester fetch for {thread_key}");
             };
             assert_eq!(foreign_id, "console-user-ada-example-com-abc123");
+        }
+    }
+
+    #[test]
+    fn requester_plan_resolves_linear_requesters_through_the_console() {
+        let metadata = json!({
+            "linear_user_id": " lin-user-1 ",
+            "linear_user_name": "Ada Lovelace",
+            // linearbot's legacy author field never names a GitHub requester.
+            "user_id": "90210001"
+        });
+        for thread_key in ["linear:issue-1", "linear:issue-1:c:comment-1"] {
+            let Some(RequesterPlan::ResolveLinked { provider, subject }) =
+                requester_plan(thread_key, &metadata)
+            else {
+                panic!("expected a linked Linear requester for {thread_key}");
+            };
+            assert_eq!(provider, "linear");
+            assert_eq!(subject, "lin-user-1");
         }
     }
 

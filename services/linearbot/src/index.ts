@@ -60,6 +60,7 @@ import {
   executeSessionTurn,
   forwardToSessionApi,
   isRetryableSessionApiError,
+  LINEAR_ASSIGNMENT_AUTHOR_ID,
   openSessionEventStream,
   serializeMessage,
   sessionStreamError,
@@ -1033,20 +1034,32 @@ async function runThreadTurn(input: {
   });
 }
 
-/** Synthetic "work this assigned issue" prompt for an assignment turn. */
+/**
+ * Synthetic "work this assigned issue" prompt for an assignment turn. Authored
+ * by the Linear user who assigned or delegated the issue, so the turn runs as
+ * them; a non-user actor keeps the synthetic author and runs without one.
+ */
 function assignmentInstructionMessage(
   event: IssueAssignmentEvent,
   threadKey: string,
 ): LinearbotApiMessage {
   return {
     attachments: [],
-    author: {
-      fullName: "Linear",
-      isBot: false,
-      isMe: false,
-      userId: "linear-assignment",
-      userName: "linear-assignment",
-    },
+    author: event.actorId
+      ? {
+          fullName: event.actorName ?? event.actorId,
+          isBot: false,
+          isMe: false,
+          userId: event.actorId,
+          userName: event.actorName ?? event.actorId,
+        }
+      : {
+          fullName: "Linear",
+          isBot: false,
+          isMe: false,
+          userId: LINEAR_ASSIGNMENT_AUTHOR_ID,
+          userName: LINEAR_ASSIGNMENT_AUTHOR_ID,
+        },
     id: `assign-${event.issueId}-${event.updatedAt}`,
     isMention: true,
     raw: { linearbotAssignment: true },

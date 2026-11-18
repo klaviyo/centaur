@@ -108,6 +108,12 @@ describe("linearbot comment-thread pipeline", () => {
     expect(execTexts.some((t) => t.includes("You own this Linear issue"))).toBe(
       false,
     );
+    // The comment author is the turn's requester.
+    const mentionExec = codexApi.executes.find(
+      (e) => e.threadKey === threadKey,
+    )!;
+    expect(mentionExec.body.metadata.linear_user_id).toBe(USER_ID);
+    expect(mentionExec.body.metadata.linear_user_name).toBe("Ada Lovelace");
 
     codexApi.emitOutputLines(threadKey, sampleCodexOutputLines("About a day."));
 
@@ -529,6 +535,10 @@ describe("linearbot comment-thread pipeline", () => {
         (c.text ?? "").includes("work the task"),
       ),
     ).toBe(true);
+    // No webhook actor: the synthetic author runs without a requester.
+    expect(exec.body.metadata.user_id).toBe("linear-assignment");
+    expect(exec.body.metadata).not.toHaveProperty("linear_user_id");
+    expect(exec.body.metadata).not.toHaveProperty("linear_user_name");
 
     codexApi.emitOutputLines(
       threadKey,
@@ -600,6 +610,60 @@ describe("linearbot comment-thread pipeline", () => {
     expect(
       linearApi.botComments.some((c) => c.issueId === ISSUE_ID && !c.parentId),
     ).toBe(false);
+  });
+
+  it("runs an assignment turn as the user who delegated the issue", async () => {
+    const threadKey = `linear:${ISSUE_ID}`;
+    await postWebhook(
+      issueAssignmentPayload({
+        actor: { id: "user-2", name: "Grace Hopper", type: "user" },
+        assigneeId: "user-3",
+        delegateId: BOT_USER_ID,
+        updatedAt: "2026-06-16T07:00:00.000Z",
+        updatedFrom: { delegateId: null },
+      }),
+    );
+    await waitFor(() =>
+      codexApi.executes.some((e) => e.threadKey === threadKey),
+    );
+    const exec = codexApi.executes.find((e) => e.threadKey === threadKey)!;
+    // The delegator, never the assignee, is the requester.
+    expect(exec.body.metadata.user_id).toBe("user-2");
+    expect(exec.body.metadata.linear_user_id).toBe("user-2");
+    expect(exec.body.metadata.linear_user_name).toBe("Grace Hopper");
+    codexApi.emitOutputLines(threadKey, sampleCodexOutputLines("Delegated."));
+    await waitFor(() =>
+      linearApi.botComments.some(
+        (c) =>
+          c.issueId === ISSUE_ID &&
+          !c.parentId &&
+          c.body.includes("Delegated."),
+      ),
+    );
+  });
+
+  it("runs an automation's assignment turn without a requester", async () => {
+    const threadKey = `linear:${ISSUE_ID}`;
+    await postWebhook(
+      issueAssignmentPayload({
+        actor: { id: "oauth-client-1", name: "Triage", type: "OauthClient" },
+        updatedAt: "2026-06-16T08:00:00.000Z",
+        updatedFrom: { assigneeId: null },
+      }),
+    );
+    await waitFor(() =>
+      codexApi.executes.some((e) => e.threadKey === threadKey),
+    );
+    const exec = codexApi.executes.find((e) => e.threadKey === threadKey)!;
+    expect(exec.body.metadata.user_id).toBe("linear-assignment");
+    expect(exec.body.metadata).not.toHaveProperty("linear_user_id");
+    codexApi.emitOutputLines(threadKey, sampleCodexOutputLines("Triaged."));
+    await waitFor(() =>
+      linearApi.botComments.some(
+        (c) =>
+          c.issueId === ISSUE_ID && !c.parentId && c.body.includes("Triaged."),
+      ),
+    );
   });
 
   it("runs a turn when an issue is created already assigned to the bot", async () => {
@@ -865,6 +929,7 @@ function agentSessionPromptedPayload(input: {
 function issueAssignmentPayload(input: {
   updatedAt: string;
   action?: "create" | "update";
+  actor?: { id: string; name: string; type: string };
   assigneeId?: string | null;
   delegateId?: string | null;
   updatedFrom?: Record<string, unknown>;
@@ -876,6 +941,7 @@ function issueAssignmentPayload(input: {
     organizationId: ORG_ID,
     webhookTimestamp: Date.now(),
     webhookId: "wh-issue",
+    ...(input.actor ? { actor: input.actor } : {}),
     ...(input.updatedFrom ? { updatedFrom: input.updatedFrom } : {}),
     data: {
       id: ISSUE_ID,

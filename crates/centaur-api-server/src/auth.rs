@@ -15,6 +15,8 @@ use crate::{
 
 const CONSOLE_SERVICE_SUBJECT: &str = "centaur-console";
 const STATIC_ADMIN_IDENTITY: &str = "api-rs-admin";
+/// The linearbot ingress, the only caller that may name a turn's Linear user.
+pub(crate) const LINEARBOT_IDENTITY: &str = "linearbot";
 /// Issuer of the access tokens api-rs mints for API clients. Distinct from
 /// Console's issuer so neither kind of token can be read as the other.
 pub(crate) const API_CLIENT_TOKEN_ISSUER: &str = "centaur-api-rs";
@@ -468,7 +470,7 @@ const INGRESS_SPECS: &[IngressSpec] = &[
     },
     IngressSpec {
         env_var: "LINEARBOT_API_KEY",
-        identity: "linearbot",
+        identity: LINEARBOT_IDENTITY,
         platform_prefixes: &["linear:"],
         workflow_events: false,
     },

@@ -66,6 +66,31 @@ module Api
         render json: body
       end
 
+      # POST /api/v1/principals/resolve_requester
+      #
+      # The console-user principal of the Console user who linked the provider
+      # account `subject` (for Linear, the Linear user id) through the OAuth
+      # consent flow, provisioned if needed. api-rs calls this to run a turn as
+      # the person who triggered it. 404 when no eligible user linked it (see
+      # LinkedRequesterResolver).
+      def resolve_requester
+        provider = data_params[:provider].to_s
+        subject = data_params[:subject].to_s.strip
+        unless LinkedRequesterResolver::PROVIDERS.include?(provider)
+          return render_error(status: :unprocessable_entity, message: "validation failed",
+                              details: { provider: [ "must be one of #{LinkedRequesterResolver::PROVIDERS.join(", ")}" ] })
+        end
+        if subject.blank?
+          return render_error(status: :unprocessable_entity, message: "validation failed",
+                              details: { subject: [ "can't be blank" ] })
+        end
+
+        user = LinkedRequesterResolver.call(provider: provider, subject: subject)
+        return render_error(status: :not_found, message: "no Console user has linked this #{provider} account") unless user
+
+        render json: { data: record_payload(ConsoleUserPrincipalProvisioner.call(user)) }
+      end
+
       private
 
       # Concurrent first turns upsert the same new foreign_id. The loser fails

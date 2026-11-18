@@ -175,6 +175,26 @@ impl IronControlClient {
         decode_data(resp, Method::GET, &path).await
     }
 
+    /// Resolve the principal of the Console user who linked the ``provider``
+    /// account ``subject`` (for Linear, the Linear user id) through Console's
+    /// OAuth consent flow. Console owns and, when needed, provisions that
+    /// user's ``console-user-*`` principal, so this never upserts one. Always
+    /// asks the admin API, even with a Console database connection, because
+    /// the link conditions and provisioning live in Console. A 404 means no
+    /// eligible linked account.
+    pub async fn resolve_linked_requester(
+        &self,
+        provider: &str,
+        subject: &str,
+    ) -> Result<Principal> {
+        self.write(
+            Method::POST,
+            &format!("{API_PREFIX}/principals/resolve_requester"),
+            &json!({ "provider": provider, "subject": subject }),
+        )
+        .await
+    }
+
     /// Assign a role (by OID) to a principal (by OID).
     pub async fn assign_role(&self, principal_id: &str, role_id: &str) -> Result<()> {
         let path = format!(

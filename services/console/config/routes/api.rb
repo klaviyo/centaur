@@ -77,6 +77,7 @@ namespace :api do
             constraints: { foreign_id: /[^\/]+/ }
         get "lookup/:foreign_id", action: :lookup, as: :lookup,
             constraints: { foreign_id: /[^\/]+/ }
+        post "resolve_requester", action: :resolve_requester, as: :resolve_requester
       end
       member do
         get "effective_config"

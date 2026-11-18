@@ -230,4 +230,46 @@ describe("parseIssueAssignmentWebhook", () => {
       ),
     ).not.toBeNull();
   });
+
+  it("returns the user who assigned or delegated the issue as the actor", () => {
+    for (const data of [{}, { assigneeId: null, delegateId: BOT_USER_ID }]) {
+      const event = parseIssueAssignmentWebhook(
+        assignmentPayload(
+          {
+            actor: { id: "user-9", name: "Ada Lovelace", type: "user" },
+            updatedFrom: { assigneeId: null, delegateId: null },
+          },
+          data,
+        ),
+        BOT_USER_ID,
+      );
+      expect(event?.actorId).toBe("user-9");
+      expect(event?.actorName).toBe("Ada Lovelace");
+    }
+  });
+
+  it("returns no actor for non-user or missing actors, still firing the turn", () => {
+    for (const actor of [
+      { id: "oauth-client-1", name: "Triage rule", type: "OauthClient" },
+      { id: "integration-1", name: "GitHub", type: "integration" },
+      { id: "user-9", name: "Ada Lovelace" },
+      undefined,
+    ]) {
+      const event = parseIssueAssignmentWebhook(
+        assignmentPayload({ actor, updatedFrom: { assigneeId: null } }),
+        BOT_USER_ID,
+      );
+      expect(event).not.toBeNull();
+      expect(event?.actorId).toBeUndefined();
+      expect(event?.actorName).toBeUndefined();
+    }
+  });
+
+  it("never treats the assignee as the actor", () => {
+    const event = parseIssueAssignmentWebhook(
+      assignmentPayload({ updatedFrom: { assigneeId: null } }),
+      BOT_USER_ID,
+    );
+    expect(event?.actorId).toBeUndefined();
+  });
 });

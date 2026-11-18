@@ -1380,6 +1380,88 @@ module Api
         get effective_config_api_v1_principal_url(id: principals(:acme_channel).oid)
         assert_response :unauthorized
       end
+
+      test "POST resolve_requester returns the linked user's provisioned console-user principal" do
+        user = users(:member_user)
+        create_linear_credential("lin-user-1", created_by: user)
+
+        assert_difference -> { Principal.where(kind: "console_user", console_user: user).count }, 1 do
+          post resolve_requester_api_v1_principals_url,
+               params: { data: { provider: "linear", subject: "lin-user-1" } }.to_json,
+               headers: auth_headers
+        end
+        assert_response :ok
+        principal = Principal.find_by!(kind: "console_user", console_user: user)
+        data = json_body.fetch("data")
+        assert_equal principal.oid, data["id"]
+        assert_equal principal.foreign_id, data["foreign_id"]
+        assert data["foreign_id"].start_with?("console-user-")
+
+        assert_no_difference -> { Principal.count } do
+          post resolve_requester_api_v1_principals_url,
+               params: { data: { provider: "linear", subject: " lin-user-1 " } }.to_json,
+               headers: auth_headers
+        end
+        assert_response :ok
+        assert_equal principal.oid, json_body.dig("data", "id")
+      end
+
+      test "POST resolve_requester returns 404 without provisioning for an unlinked account" do
+        create_linear_credential("lin-disabled", created_by: users(:disabled_user))
+
+        %w[lin-unknown lin-disabled].each do |subject|
+          assert_no_difference -> { Principal.count } do
+            post resolve_requester_api_v1_principals_url,
+                 params: { data: { provider: "linear", subject: subject } }.to_json,
+                 headers: auth_headers
+          end
+          assert_response :not_found, subject
+          assert_equal "no Console user has linked this linear account", json_body.dig("error", "message")
+        end
+      end
+
+      test "POST resolve_requester rejects unsupported providers and blank subjects" do
+        post resolve_requester_api_v1_principals_url,
+             params: { data: { provider: "github", subject: "90210001" } }.to_json,
+             headers: auth_headers
+        assert_response :unprocessable_entity
+        assert json_body.dig("error", "details", "provider")
+
+        post resolve_requester_api_v1_principals_url,
+             params: { data: { provider: "linear", subject: "  " } }.to_json,
+             headers: auth_headers
+        assert_response :unprocessable_entity
+        assert json_body.dig("error", "details", "subject")
+      end
+
+      test "POST resolve_requester requires an admin API key" do
+        create_linear_credential("lin-user-1", created_by: users(:member_user))
+        body = { data: { provider: "linear", subject: "lin-user-1" } }.to_json
+
+        post resolve_requester_api_v1_principals_url, params: body,
+             headers: { "Content-Type" => "application/json" }
+        assert_response :unauthorized
+
+        post resolve_requester_api_v1_principals_url, params: body, headers: auth_headers("iak_member-token")
+        assert_response :forbidden
+      end
+
+      private
+
+      def create_linear_credential(subject, created_by:)
+        app = oauth_apps(:acme_linear)
+        BrokerCredential.create!(
+          oauth_app: app,
+          provider_subject: subject,
+          token_endpoint: app.provider_strategy.token_endpoint,
+          refresh_token: "refresh-#{subject}",
+          access_token: "access-#{subject}",
+          expires_at: 1.hour.from_now,
+          last_refresh: Time.current,
+          external_user_key: "user-#{subject}",
+          created_by: created_by
+        )
+      end
     end
   end
 end

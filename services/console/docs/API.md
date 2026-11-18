@@ -1339,6 +1339,7 @@ Returns `201`:
 | `GET`  | `/api/v1/principals/:id/effective_config` | [Effective config](#effective-config) the principal resolves to. `:id` is an OID. |
 | `GET`  | `/api/v1/principals/lookup/:foreign_id/effective_config` | [Effective config](#effective-config) by foreign id. `404` if missing. |
 | `GET`  | `/api/v1/principals/:principal_id/grants` | [List the grants](#list-by-grantee) granted directly to the principal. |
+| `POST` | `/api/v1/principals/resolve_requester` | Resolve a provider account to the `console_user` principal of the Console user who linked it through an OAuth app's consent flow (`data: { provider: "linear", subject: "<provider user id>" }`), provisioning the principal if needed. The app must be enabled, not `shared`, and not `owner_only`; the credential must not be dead; and its connecting user must be active. Emails are never matched. `404` when no such user exists, or when different users linked the account; `422` for an unsupported `provider` or a blank `subject`. api-rs calls this to bind a Linear turn's requester. |
 | `POST` | `/api/v1/principals/:id/slack_channel_permissions` | Idempotently create or update one direct Slack channel permission. Omitted flags default to enabled on create and remain unchanged on update. |
 | `PUT`/`PATCH` | `/api/v1/principals/:id` | [Upsert](#upsert-put--patch) by OID or `foreign_id`. `name`, first-class identity fields, `labels`, and direct `slack_channel_permissions` are mutable on an existing record. `foreign_id` applies only when creating. |
 
