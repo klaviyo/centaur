@@ -4,7 +4,7 @@ import type { CodexAppServerToChatStreamOptions } from '@centaur/rendering'
 import type { Attachment, Chat, Logger, StateAdapter } from 'chat'
 import type { Hono } from 'hono'
 import type { ChannelDefaults } from './channel-defaults'
-import type { ProactivityRule, ProactivityRules } from './proactivity-rules'
+import type { ProactivityChannelScope, ProactivityRule, ProactivityRules } from './proactivity-rules'
 import type { HarnessOverrides } from './overrides'
 import type { SlackDisplayTextSource } from './slack-display-text'
 
@@ -239,6 +239,11 @@ export type MessageOverridesStrategy = (
 ) => Promise<MessageOverridesStrategyResult>
 
 export type SlackbotV2ProactivityOptions = {
+  /**
+   * Where proactivity may run (SLACKBOTV2_PROACTIVITY_CHANNEL_SCOPE). Unset
+   * is `all_channels`. See proactivity-rules.ts.
+   */
+  channelScope?: ProactivityChannelScope
   classifier: ProactiveClassifier
   /**
    * Quiet period an idle thread waits for before classifying, so a message

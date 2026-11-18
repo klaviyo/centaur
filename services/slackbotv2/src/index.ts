@@ -92,7 +92,11 @@ import {
 import { configuredModels, findConfiguredModel } from './model-catalog'
 import { resolveChannelDefault } from './channel-defaults'
 import { proactiveThreadMessage } from './proactive-classifier'
-import { resolveProactivityRules, type ProactivityRule } from './proactivity-rules'
+import {
+  proactiveChannelInScope,
+  resolveProactivityRules,
+  type ProactivityRule
+} from './proactivity-rules'
 import {
   extractMessageOverrides,
   extractPersonaOverride,
@@ -580,7 +584,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
       const proactivity = options.proactivity
       if (
         proactivity
-        && resolveProactivityRules(proactivity.rules, thread.id) !== undefined
+        && resolveProactivityRules(proactivity.rules, thread.id, proactivity.channelScope) !== undefined
         && (await isAllowedSlackMessage(message, options, logger))
       ) {
         scheduleProactiveMessage(thread, message, proactivity)
@@ -1042,7 +1046,13 @@ async function handleProactiveMessage(
       ...fields
     })
   }
-  const rules = resolveProactivityRules(proactivity.rules, thread.id)
+  // Out-of-scope channels stop here for both layers, before any classifier
+  // call; mentions never reach this path.
+  if (!proactiveChannelInScope(proactivity.rules, thread.id, proactivity.channelScope)) {
+    record('skip_channel_out_of_scope')
+    return
+  }
+  const rules = resolveProactivityRules(proactivity.rules, thread.id, proactivity.channelScope)
   let state = (await thread.state) ?? {}
   let skipReason = proactiveSkipReason(rules, state, message)
   if (skipReason) {

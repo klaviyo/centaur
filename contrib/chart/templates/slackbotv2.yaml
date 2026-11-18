@@ -148,6 +148,8 @@ spec:
             - name: SLACKBOTV2_PROACTIVITY_ENABLED
               value: {{ .Values.slackbotv2.proactivity.enabled | quote }}
 {{- if .Values.slackbotv2.proactivity.enabled }}
+            - name: SLACKBOTV2_PROACTIVITY_CHANNEL_SCOPE
+              value: {{ .Values.slackbotv2.proactivity.channelScope | quote }}
             - name: SLACKBOTV2_PROACTIVITY_CLASSIFIER
               value: {{ .Values.slackbotv2.proactivity.classifier | quote }}
 {{- if gt (int .Values.slackbotv2.proactivity.debounceMs) 0 }}

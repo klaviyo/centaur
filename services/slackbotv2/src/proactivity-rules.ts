@@ -10,6 +10,10 @@
  * ConfigMap), each an array of rules: `default.json` applies in every channel,
  * and `<CHANNEL_ID>.json` replaces it in that Slack conversation. An empty
  * channel list turns rule matching off there.
+ *
+ * `SLACKBOTV2_PROACTIVITY_CHANNEL_SCOPE=configured_channels_only` narrows all
+ * of this to channels with their own file: elsewhere the bot replies only when
+ * mentioned, and `default.json` is ignored.
  */
 
 import { readdirSync, readFileSync } from 'node:fs'
@@ -31,6 +35,15 @@ export type ProactivityRules = {
   /** Rules keyed by Slack conversation id; empty means none in that channel. */
   channels?: Record<string, ProactivityRule[]>
 }
+
+/**
+ * Where proactivity may run. `all_channels` covers every channel, with
+ * `default.json` as the fallback rules; `configured_channels_only` limits both
+ * mentioned-thread replies and rule matching to channels with their own rule
+ * file, and ignores `default.json`.
+ */
+export const PROACTIVITY_CHANNEL_SCOPES = ['all_channels', 'configured_channels_only'] as const
+export type ProactivityChannelScope = (typeof PROACTIVITY_CHANNEL_SCOPES)[number]
 
 const DEFAULT_RULES_NAME = 'default'
 // Each rule is a question in one classifier request, so the list bounds its
@@ -58,15 +71,56 @@ export function loadProactivityRules(dir: string): ProactivityRules {
   return rules
 }
 
-/** The rules that apply to a thread, in order, or undefined when none do. */
+/**
+ * The rules that apply to a thread, in order, or undefined when none do. Under
+ * `configured_channels_only` only the channel's own list applies: the default
+ * rules are ignored.
+ */
 export function resolveProactivityRules(
   rules: ProactivityRules | undefined,
-  threadId: string
+  threadId: string,
+  scope: ProactivityChannelScope = 'all_channels'
 ): ProactivityRule[] | undefined {
   const channelId = channelIdFromThreadId(threadId)
   const channel = channelId === undefined ? undefined : rules?.channels?.[channelId]
-  const resolved = channel ?? rules?.default
+  const resolved = scope === 'configured_channels_only' ? channel : channel ?? rules?.default
   return resolved && resolved.length > 0 ? resolved : undefined
+}
+
+/**
+ * Whether proactivity may run in a thread's channel at all. `all_channels`
+ * allows every channel; `configured_channels_only` allows only channels with
+ * a `channelRules` entry, including an empty one, which allows only replies in
+ * threads where the bot was mentioned.
+ */
+export function proactiveChannelInScope(
+  rules: ProactivityRules | undefined,
+  threadId: string,
+  scope: ProactivityChannelScope = 'all_channels'
+): boolean {
+  if (scope === 'all_channels') return true
+  const channelId = channelIdFromThreadId(threadId)
+  return channelId !== undefined && rules?.channels?.[channelId] !== undefined
+}
+
+/** Whether default rules are configured but unused because the scope ignores them. */
+export function proactivityDefaultRulesIgnored(
+  rules: ProactivityRules | undefined,
+  scope: ProactivityChannelScope = 'all_channels'
+): boolean {
+  return scope === 'configured_channels_only' && (rules?.default?.length ?? 0) > 0
+}
+
+/** Parses SLACKBOTV2_PROACTIVITY_CHANNEL_SCOPE; unset is `all_channels`. Throws on unknown values. */
+export function parseProactivityChannelScope(value: string | undefined): ProactivityChannelScope {
+  const scope = value?.trim().toLowerCase()
+  if (!scope) return 'all_channels'
+  if ((PROACTIVITY_CHANNEL_SCOPES as readonly string[]).includes(scope)) {
+    return scope as ProactivityChannelScope
+  }
+  throw new Error(
+    `SLACKBOTV2_PROACTIVITY_CHANNEL_SCOPE must be one of ${PROACTIVITY_CHANNEL_SCOPES.join(', ')}`
+  )
 }
 
 function parseRules(raw: string, file: string): ProactivityRule[] {

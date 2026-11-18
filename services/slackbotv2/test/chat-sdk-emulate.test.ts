@@ -27,7 +27,7 @@ import {
 } from '../src/index'
 import { clearRequesterIdentityCacheForTests, NON_SLACK_FILE_URL_ERROR } from '../src/session-api'
 import { resetSlackbotMetricsForTests, slackbotMetrics } from '../src/metrics'
-import type { ProactivityRules } from '../src/proactivity-rules'
+import type { ProactivityChannelScope, ProactivityRules } from '../src/proactivity-rules'
 import { createOpenAiMessageOverridesStrategy } from '../src/message-overrides-strategy'
 import { buildProactiveMuteBlock, modelDisplayName } from '../src/response-context'
 import claudeSettings from '../../../harness/claude/settings.json'
@@ -5144,11 +5144,13 @@ describe('proactive replies', () => {
     decide: (input: ProactiveClassifierInput) => ProactiveDecision | Promise<ProactiveDecision>,
     overrides: Partial<Parameters<typeof createSlackbotV2>[0]> = {},
     rules?: ProactivityRules,
-    debounceMs?: number
+    debounceMs?: number,
+    channelScope?: ProactivityChannelScope
   ): ProactiveClassifierInput[] {
     const calls: ProactiveClassifierInput[] = []
     bot = createTestBot({
       proactivity: {
+        channelScope,
         classifier: async input => {
           calls.push(input)
           return decide(input)
@@ -5244,6 +5246,63 @@ describe('proactive replies', () => {
   })
 
   const deployRules = [{ name: 'deploy', when: 'Questions about deploys.' }]
+
+  describe('configured_channels_only scope', () => {
+    const scoped = (
+      decide: (input: ProactiveClassifierInput) => ProactiveDecision,
+      rules: ProactivityRules
+    ) => createProactiveBot(decide, {}, rules, undefined, 'configured_channels_only')
+
+    it('stays quiet in mentioned threads of a channel without rules but still answers mentions', async () => {
+      const calls = scoped(() => ({ respond: true }), { channels: { COTHERCHANNEL: [] } })
+      const threadTs = await mentionThread('Scoped no-entry context.')
+
+      const unmentioned = await sendMessage('what about staging?', { threadTs })
+      await unmentioned.finished()
+
+      expect(calls).toHaveLength(0)
+      expect(codexApi.executes).toHaveLength(1)
+      expect(sessionMessageTexts(codexApi.appends.flatMap(append => append.body.messages)))
+        .not.toContain('what about staging?')
+    })
+
+    it('answers mentioned-thread follow-ups in a channel whose rule list is empty', async () => {
+      const calls = scoped(() => ({ respond: true }), { channels: { [CHANNEL_ID]: [] } })
+      const threadTs = await mentionThread('Scoped empty-list context.')
+
+      await reply('what about staging?', threadTs)
+
+      expect(calls).toHaveLength(1)
+      expect(calls[0]!.rules).toBeUndefined()
+      expect(codexApi.executes).toHaveLength(2)
+    })
+
+    it('rule-matches top-level messages only in channels with their own rules', async () => {
+      const calls = scoped(() => ({ respond: true, rule: 'deploy' }), {
+        channels: { [CHANNEL_ID]: deployRules }
+      })
+
+      const message = await sendMessage('is staging deployed?')
+      await message.finished()
+      await waitFor(async () => (await threadText(message.ts)).includes('Executed request 1.'))
+
+      expect(calls).toHaveLength(1)
+      expect(calls[0]).toMatchObject({ rules: deployRules })
+    })
+
+    it('ignores default rules', async () => {
+      const calls = scoped(() => ({ respond: true, rule: 'deploy' }), { default: deployRules })
+      const threadTs = await mentionThread('Scoped default-rules context.')
+
+      const topLevel = await sendMessage('is staging deployed?')
+      await topLevel.finished()
+      const unmentioned = await sendMessage('what about staging?', { threadTs })
+      await unmentioned.finished()
+
+      expect(calls).toHaveLength(0)
+      expect(codexApi.executes).toHaveLength(1)
+    })
+  })
 
   it('answers a top-level message that matches a channel rule', async () => {
     let repliesRequestsWhenClassified = -1

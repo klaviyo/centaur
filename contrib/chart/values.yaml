@@ -963,6 +963,13 @@ slackbotv2:
     # classifies each message at once. Later parts steer the turn when the
     # classifier accepts them.
     debounceMs: 0
+    # Where proactivity may run. all_channels: every channel, with defaultRules
+    # as the fallback. configured_channels_only: only channels with a key in
+    # channelRules, for both mentioned-thread replies and rule matching; an
+    # empty list there allows only mentioned-thread replies. Every other
+    # channel gets replies only when mentioned, and defaultRules is ignored
+    # (the bot logs a warning when it is set).
+    channelScope: all_channels
     # Rules are mounted from a ConfigMap, so `when` and `context` can be long
     # and span lines. Rules for every channel; empty means no rule matching by
     # default.
