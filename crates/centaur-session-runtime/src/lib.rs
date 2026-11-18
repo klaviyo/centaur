@@ -75,9 +75,10 @@ const STDOUT_STALL_PROBE_INTERVAL: Duration = Duration::from_secs(60);
 const STDOUT_STALL_PROBE_INTERVAL: Duration = Duration::from_millis(200);
 /// Unreceived harness lines tolerated before the stream counts as stalled.
 const STDOUT_STALL_LINE_SLACK: u64 = 2;
-/// Recorded output is read from this long after the pump's last line, so
-/// clock skew between the control plane and the node cannot count a line the
-/// pump already received.
+/// Margin for clock skew between the control plane and the node. Missed
+/// output is counted from this long after the pump's last line, so a line it
+/// already received is never counted; terminal output is looked for from this
+/// long before it, so a terminal line written just after it is never skipped.
 const STDOUT_STALL_LOG_SKEW: Duration = Duration::from_secs(5);
 /// How long a running execution may go without any harness output before its
 /// input counts as lost. Harnesses report a started turn within seconds.
@@ -5187,14 +5188,23 @@ async fn run_stdout_pump(
         // stall probe looks for recorded output after it to notice an attach
         // stream that stopped delivering without closing.
         let mut last_line_by_execution: HashMap<String, SystemTime> = HashMap::new();
+        // Output recorded before this pump attached was handled by whoever read
+        // it then (adoption, or the pump this one replaced), so it never counts
+        // as missed.
+        let attached_at = SystemTime::now();
         loop {
             let line = match timeout(STDOUT_STALL_PROBE_INTERVAL, stdout.next()).await {
                 Ok(Some(line)) => line,
                 Ok(None) => break,
                 Err(_) => {
-                    if let Some(stall) =
-                        probe_stdout_stall(&ctx, &thread_key, sandbox_id, &last_line_by_execution)
-                            .await
+                    if let Some(stall) = probe_stdout_stall(
+                        &ctx,
+                        &thread_key,
+                        sandbox_id,
+                        attached_at,
+                        &last_line_by_execution,
+                    )
+                    .await
                     {
                         record_stdout_stall(&ctx, &thread_key, sandbox_id, &stall).await;
                         break;
@@ -5356,7 +5366,8 @@ enum StdoutStall {
     /// the pump never received.
     Output { unreceived: u64 },
     /// The execution has run past the grace period without the harness
-    /// writing anything, so its input never reached the sandbox.
+    /// writing anything, so its input never reached the sandbox. Not applied
+    /// to tool-host calls, which stay silent until the call finishes.
     Input,
 }
 
@@ -5383,15 +5394,15 @@ fn is_harness_output_line(value: &Value) -> bool {
 /// Called when the pump has received no line for
 /// `STDOUT_STALL_PROBE_INTERVAL`. A kube attach stream can die without
 /// closing, which leaves the pump blocked and the execution running forever:
-/// writes to the dead stdin are dropped and output never arrives. Read what
-/// the sandbox recorded after the pump's last line (or since the execution
-/// started) and look for output the pump should have received. Only the
+/// writes to the dead stdin are dropped and output never arrives. Look for
+/// output the sandbox recorded that the pump should have received. Only the
 /// execution this pump serves is considered: it must be running, past
 /// dispatch, and on this pump's sandbox.
 async fn probe_stdout_stall(
     ctx: &RuntimeContext,
     thread_key: &ThreadKey,
     sandbox_id: &str,
+    attached_at: SystemTime,
     last_line_by_execution: &HashMap<String, SystemTime>,
 ) -> Option<StdoutStall> {
     let execution = match ctx.store.active_execution_for_thread(thread_key).await {
@@ -5420,17 +5431,72 @@ async fn probe_stdout_stall(
     }
 
     let started = SystemTime::from(execution.started_at.unwrap_or(execution.created_at));
-    let last_line_at = last_line_by_execution.get(&execution.execution_id);
-    let since = last_line_at.map_or(started, |last_line_at| {
-        *last_line_at + STDOUT_STALL_LOG_SKEW
+    let last_line_at = last_line_by_execution.get(&execution.execution_id).copied();
+
+    // Terminal output: from just before the pump's last line, or from the
+    // execution's start. The execution would no longer be running had the
+    // pump received it, so an overlapping window cannot misfire.
+    let terminal_since = last_line_at.map_or(started, |last_line_at| {
+        (last_line_at - STDOUT_STALL_LOG_SKEW).max(started)
     });
-    let lines = match ctx
+    let lines =
+        read_recorded_output(ctx, thread_key, &execution, sandbox_id, terminal_since).await?;
+    if terminal_output_from_lines(&lines).is_some() {
+        return Some(StdoutStall::Terminal);
+    }
+
+    // Missed output: harness lines recorded after the pump's last line, or,
+    // before it has one, after it attached.
+    let unreceived_since = match last_line_at {
+        Some(last_line_at) => last_line_at + STDOUT_STALL_LOG_SKEW,
+        None => attached_at.max(started),
+    };
+    let unreceived = if unreceived_since == terminal_since {
+        harness_line_count(&lines)
+    } else {
+        harness_line_count(
+            &read_recorded_output(ctx, thread_key, &execution, sandbox_id, unreceived_since)
+                .await?,
+        )
+    };
+    if unreceived > STDOUT_STALL_LINE_SLACK {
+        return Some(StdoutStall::Output { unreceived });
+    }
+
+    // Lost input: nothing from the harness at all since the execution started.
+    // `lines` covers that span exactly when the pump has no line for it.
+    let tool_host_call = execution
+        .metadata
+        .get("mcp_tool_host_call")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let running_for = SystemTime::now()
+        .duration_since(started)
+        .unwrap_or_default();
+    if !tool_host_call
+        && last_line_at.is_none()
+        && harness_line_count(&lines) == 0
+        && running_for >= STDOUT_INPUT_GRACE
+    {
+        return Some(StdoutStall::Input);
+    }
+    None
+}
+
+async fn read_recorded_output(
+    ctx: &RuntimeContext,
+    thread_key: &ThreadKey,
+    execution: &SessionExecution,
+    sandbox_id: &str,
+    since: SystemTime,
+) -> Option<Vec<String>> {
+    match ctx
         .manager
         .read_output_since(&SandboxId::new(sandbox_id), Some(since))
         .await
     {
-        Ok(lines) => lines,
-        Err(SandboxError::Unsupported { .. }) => return None,
+        Ok(lines) => Some(lines),
+        Err(SandboxError::Unsupported { .. }) => None,
         Err(error) => {
             warn!(
                 component = COMPONENT_SESSION_RUNTIME,
@@ -5441,30 +5507,20 @@ async fn probe_stdout_stall(
                 %error,
                 "failed to read recorded sandbox output for a stdout stall probe"
             );
-            return None;
+            None
         }
-    };
-    if terminal_output_from_lines(&lines).is_some() {
-        return Some(StdoutStall::Terminal);
     }
-    let unreceived = lines
+}
+
+fn harness_line_count(lines: &[String]) -> u64 {
+    lines
         .iter()
         .filter(|line| {
             serde_json::from_str::<Value>(line)
                 .as_ref()
                 .is_ok_and(is_harness_output_line)
         })
-        .count() as u64;
-    if unreceived > STDOUT_STALL_LINE_SLACK {
-        return Some(StdoutStall::Output { unreceived });
-    }
-    let running_for = SystemTime::now()
-        .duration_since(started)
-        .unwrap_or_default();
-    if last_line_at.is_none() && unreceived == 0 && running_for >= STDOUT_INPUT_GRACE {
-        return Some(StdoutStall::Input);
-    }
-    None
+        .count() as u64
 }
 
 async fn record_stdout_stall(
@@ -9854,7 +9910,10 @@ mod adoption_tests {
 
     struct MockBackend {
         ios: Mutex<VecDeque<SandboxIo>>,
-        recorded_output: std::sync::Mutex<Vec<String>>,
+        /// Recorded sandbox output. A line with a timestamp is returned only
+        /// for reads since that time or earlier, like pod logs; a line without
+        /// one is returned by every read.
+        recorded_output: std::sync::Mutex<Vec<(Option<SystemTime>, String)>>,
         open_count: AtomicUsize,
         create_started: tokio::sync::Notify,
         create_gate: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
@@ -9878,7 +9937,12 @@ mod adoption_tests {
         fn new(status: SandboxStatus, recorded_output: Vec<String>) -> Self {
             Self {
                 ios: Mutex::new(VecDeque::new()),
-                recorded_output: std::sync::Mutex::new(recorded_output),
+                recorded_output: std::sync::Mutex::new(
+                    recorded_output
+                        .into_iter()
+                        .map(|line| (None, line))
+                        .collect(),
+                ),
                 open_count: AtomicUsize::new(0),
                 create_started: tokio::sync::Notify::new(),
                 create_gate: std::sync::Mutex::new(None),
@@ -9918,7 +9982,17 @@ mod adoption_tests {
         }
 
         fn set_recorded_output(&self, recorded_output: Vec<String>) {
-            *self.recorded_output.lock().unwrap() = recorded_output;
+            *self.recorded_output.lock().unwrap() = recorded_output
+                .into_iter()
+                .map(|line| (None, line))
+                .collect();
+        }
+
+        fn set_recorded_output_at(&self, recorded_output: Vec<(SystemTime, String)>) {
+            *self.recorded_output.lock().unwrap() = recorded_output
+                .into_iter()
+                .map(|(at, line)| (Some(at), line))
+                .collect();
         }
 
         fn set_status(&self, status: SandboxStatus) {
@@ -10019,9 +10093,19 @@ mod adoption_tests {
         async fn read_output_since(
             &self,
             _id: &SandboxId,
-            _since: Option<SystemTime>,
+            since: Option<SystemTime>,
         ) -> SandboxResult<Vec<String>> {
-            Ok(self.recorded_output.lock().unwrap().clone())
+            Ok(self
+                .recorded_output
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(at, _)| match (at, since) {
+                    (Some(at), Some(since)) => *at >= since,
+                    _ => true,
+                })
+                .map(|(_, line)| line.clone())
+                .collect())
         }
 
         async fn status(&self, _id: &SandboxId) -> SandboxResult<SandboxStatus> {
@@ -13003,6 +13087,102 @@ mod adoption_tests {
                 .any(|event| event.event_type == "session.execution_failed"),
             "execution should still be running"
         );
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn output_recorded_before_attach_is_not_counted_as_missed() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (thread_key, backend, _stdout, _stdin) =
+            adopted_live_execution(&store, "stall-history").await;
+
+        // The turn started a minute ago and wrote progress before the pump
+        // attached; adoption read that history, and the turn is now in a long,
+        // silent tool call. Reattaching must not be triggered by it.
+        let execution = store
+            .active_execution_for_thread(&thread_key)
+            .await
+            .unwrap()
+            .expect("active execution");
+        backdate_execution(&store, &execution.execution_id, 60.0).await;
+        let before_attach = SystemTime::now() - Duration::from_secs(30);
+        let progress = "{\"type\":\"item.started\",\"item\":{\"type\":\"reasoning\"}}";
+        backend.set_recorded_output_at(
+            std::iter::repeat_n((before_attach, progress.to_owned()), 8).collect(),
+        );
+
+        sleep(STDOUT_STALL_PROBE_INTERVAL * 6).await;
+        let all = events(&store, &thread_key).await;
+        assert!(stall_reasons(&all).is_empty(), "unexpected stall: {all:?}");
+        assert_eq!(
+            backend.opens(),
+            1,
+            "a healthy stream must not be reattached"
+        );
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_output_just_after_the_last_received_line_is_recovered() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (thread_key, backend, mut stdout, _stdin) =
+            adopted_live_execution(&store, "stall-terminal-skew").await;
+
+        let started = "{\"type\":\"turn.started\",\"turn\":{\"id\":\"turn-1\"}}";
+        stdout
+            .write_all(format!("{started}\n").as_bytes())
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(50)).await;
+        // The stream died right after that line: the terminal line was recorded
+        // within the skew margin of it but never delivered.
+        let now = SystemTime::now();
+        backend.set_recorded_output_at(vec![
+            (now - Duration::from_millis(50), started.to_owned()),
+            (
+                now,
+                "{\"type\":\"turn.completed\",\"turn\":{\"id\":\"turn-1\",\"status\":\"completed\"}}"
+                    .to_owned(),
+            ),
+        ]);
+
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        let all = events(&store, &thread_key).await;
+        assert_eq!(stall_reasons(&all), vec!["terminal_not_delivered"]);
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn silent_tool_host_call_is_not_treated_as_lost_input() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (thread_key, backend, _stdout, _stdin) =
+            adopted_live_execution(&store, "stall-tool-host").await;
+        let execution = store
+            .active_execution_for_thread(&thread_key)
+            .await
+            .unwrap()
+            .expect("active execution");
+        sqlx::query("update session_executions set metadata = $2 where execution_id = $1")
+            .bind(&execution.execution_id)
+            .bind(json!({"mcp_tool_host_call": true}))
+            .execute(store.pool())
+            .await
+            .expect("mark tool host call");
+
+        // centaur-tool-host prints nothing until the call finishes.
+        sleep(STDOUT_INPUT_GRACE + STDOUT_STALL_PROBE_INTERVAL * 4).await;
+        let all = events(&store, &thread_key).await;
+        assert!(stall_reasons(&all).is_empty(), "unexpected stall: {all:?}");
+        assert_eq!(backend.opens(), 1);
         reset_test_store(&store).await;
     }
 
