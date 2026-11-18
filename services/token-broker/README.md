@@ -47,9 +47,16 @@ Outcomes:
   OAuth error, malformed successful responses, and credentials or apps missing
   or misconfiguring a value the request needs are retried with exponential
   backoff from 5 seconds to 5 minutes.
-- Other responses with an OAuth error (RFC 6749 section 5.2, or Slack's
-  `"ok": false`), and Preqin 4xx responses without one, mark the credential
-  dead until it is re-authorized.
+- OAuth errors `temporarily_unavailable` and `server_error` also retry with
+  backoff, even when sent as a 4xx or Slack's `"ok": false`. App/request
+  configuration errors (`invalid_request`, `invalid_client`,
+  `unauthorized_client`, `unsupported_grant_type`, `invalid_scope`, and
+  `invalid_target`) retry too: correcting the configuration lets refresh
+  resume without asking the user to reconnect. These failures preserve the
+  stored tokens and do not extend the access token's expiry.
+- Other OAuth errors, including `invalid_grant` and `invalid_refresh_token`,
+  and Preqin 4xx responses without an OAuth error, mark the credential dead
+  until it is re-authorized.
 - Credentials token-broker cannot read (decryption fails, or
   `token_endpoint_headers` or `scopes` are malformed) are left unchanged, logged,
   and counted as `error` on every poll.

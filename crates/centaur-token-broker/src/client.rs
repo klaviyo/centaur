@@ -88,6 +88,31 @@ impl RefreshError {
         }
     }
 
+    fn oauth(code: String, status: u16) -> Self {
+        // A provider outage or an invalid app/request configuration does not
+        // invalidate the user's refresh token. Keep retrying with backoff so
+        // recovery (or an operator's configuration fix) needs no new consent.
+        // Grant rejections, including invalid_grant and provider-specific
+        // revocation errors, still require re-authorization.
+        let retryable = matches!(
+            code.as_str(),
+            "temporarily_unavailable"
+                | "server_error"
+                | "invalid_request"
+                | "invalid_client"
+                | "unauthorized_client"
+                | "unsupported_grant_type"
+                | "invalid_scope"
+                | "invalid_target"
+        );
+        Self {
+            stage: "oauth",
+            code: Some(code),
+            status: Some(status),
+            retryable,
+        }
+    }
+
     /// A credential or OAuth app that cannot build a request, such as a missing
     /// client secret. Retried with backoff so fixing the app revives it.
     pub fn config(code: &str) -> Self {
@@ -204,7 +229,7 @@ fn interpret(status: u16, body: &[u8], strict_4xx: bool) -> Result<TokenResponse
             });
         }
         return match error_code {
-            Some(code) => Err(RefreshError::dead("oauth", code, status)),
+            Some(code) => Err(RefreshError::oauth(code, status)),
             None if strict_4xx => Err(RefreshError::dead("http", format!("http_{status}"), status)),
             // Most likely a gateway or rate limiter rather than the IdP.
             None => Err(RefreshError::retryable("http", Some(status))),
@@ -221,7 +246,7 @@ fn interpret(status: u16, body: &[u8], strict_4xx: bool) -> Result<TokenResponse
     if body.get("ok") == Some(&Value::Bool(false))
         && let Some(code) = error_code
     {
-        return Err(RefreshError::dead("oauth", code, status));
+        return Err(RefreshError::oauth(code, status));
     }
     let access_token = present_string(body.get("access_token")).ok_or_else(malformed)?;
     let expires_in = match body.get("expires_in") {
@@ -251,7 +276,7 @@ fn present_string(value: Option<&Value>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RefreshError, TokenResponse, interpret};
+    use super::{RefreshError, TokenResponse, interpret, request_result};
 
     fn retryable(stage: &'static str, status: u16) -> RefreshError {
         RefreshError {
@@ -349,6 +374,37 @@ mod tests {
             br#"{"access_token":"AT","expires_in":"soon"}"#,
         ] {
             assert_eq!(interpret(200, body, false), Err(retryable("parse", 200)));
+        }
+    }
+
+    #[test]
+    fn recoverable_oauth_errors_do_not_require_reauthorization() {
+        for code in [
+            "temporarily_unavailable",
+            "server_error",
+            "invalid_request",
+            "invalid_client",
+            "unauthorized_client",
+            "unsupported_grant_type",
+            "invalid_scope",
+            "invalid_target",
+        ] {
+            // Providers may report transient failures as a 400, or use Slack's
+            // 200/ok:false envelope. Neither means the refresh token is revoked.
+            for (status, body) in [
+                (400, serde_json::json!({"error": code})),
+                (401, serde_json::json!({"error": code})),
+                (200, serde_json::json!({"ok": false, "error": code})),
+            ] {
+                for strict_4xx in [false, true] {
+                    let error = interpret(status, &serde_json::to_vec(&body).unwrap(), strict_4xx)
+                        .unwrap_err();
+                    assert!(error.retryable, "{status} {code} strict={strict_4xx}");
+                    assert_eq!(error.code.as_deref(), Some(code));
+                    assert_eq!(error.status, Some(status));
+                    assert_ne!(request_result(&Err(error)), "rejected");
+                }
+            }
         }
     }
 }

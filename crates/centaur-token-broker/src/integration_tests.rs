@@ -632,6 +632,89 @@ async fn custom_app_credentials_refresh_with_the_apps_resource_indicator() {
 }
 
 #[tokio::test]
+async fn custom_app_recovers_from_oauth_errors_and_keeps_rotating_without_reconnect() {
+    let fixture = fixture![
+        (
+            200,
+            json!({"access_token": "AT-1", "refresh_token": "RT-2", "expires_in": 7200})
+        ),
+        (400, json!({"error": "temporarily_unavailable"})),
+        (401, json!({"error": "invalid_client"})),
+        (
+            200,
+            json!({"access_token": "AT-2", "refresh_token": "RT-3", "expires_in": 7200})
+        ),
+        (
+            200,
+            json!({"access_token": "AT-3", "refresh_token": "RT-4", "expires_in": 7200})
+        ),
+    ];
+    let id = fixture
+        .credential("refresh_token", &[("refresh_token", "RT-1")])
+        .await;
+    fixture.link_oauth_app(id, "custom", "cid", "secret").await;
+    sqlx::query(
+        "UPDATE oauth_apps SET owner_only = true, \
+             provider_config = '{\"resource\": \"https://api.example.test/mcp\"}' \
+         WHERE id = (SELECT oauth_app_id FROM broker_credentials WHERE id = $1)",
+    )
+    .bind(id)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    let [direct, _] = fixture.grantees(id).await;
+
+    let stored = fixture.refresh(id).await;
+    assert_eq!(stored.access_token.as_deref(), Some("AT-1"));
+    assert_eq!(stored.refresh_token.as_deref(), Some("RT-2"));
+    assert!(within(stored.next_attempt_in, 5760));
+
+    for failures in 1..=2 {
+        fixture.update(id, "next_attempt_at = now()").await;
+        let stored = fixture.refresh(id).await;
+        assert!(
+            !stored.dead,
+            "a recoverable error must not require reconnect"
+        );
+        assert_eq!(stored.dead_reason, None);
+        assert_eq!(stored.failure_count, failures);
+        assert!(within(stored.next_attempt_in, 5 * failures as i64));
+        assert_eq!(stored.access_token.as_deref(), Some("AT-1"));
+        assert_eq!(stored.refresh_token.as_deref(), Some("RT-2"));
+        assert_eq!(fixture.cache_versions(&[direct]).await, [1]);
+    }
+
+    for (access_token, refresh_token, version) in [("AT-2", "RT-3", 2), ("AT-3", "RT-4", 3)] {
+        fixture.update(id, "next_attempt_at = now()").await;
+        let stored = fixture.refresh(id).await;
+        assert!(!stored.dead);
+        assert_eq!(stored.failure_count, 0);
+        assert_eq!(stored.access_token.as_deref(), Some(access_token));
+        assert_eq!(stored.refresh_token.as_deref(), Some(refresh_token));
+        assert!(within(stored.next_attempt_in, 5760));
+        assert_eq!(fixture.cache_versions(&[direct]).await, [version]);
+    }
+
+    let requests = fixture.requests();
+    assert_eq!(requests.len(), 5);
+    for (request, refresh_token) in requests
+        .iter()
+        .zip(["RT-1", "RT-2", "RT-2", "RT-2", "RT-3"])
+    {
+        assert_eq!(
+            request.form(),
+            form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+                ("client_id", "cid"),
+                ("client_secret", "secret"),
+                ("resource", "https://api.example.test/mcp"),
+            ])
+        );
+    }
+}
+
+#[tokio::test]
 async fn credentials_that_cannot_build_a_request_back_off() {
     let fixture = fixture![];
     let unknown_provider = fixture

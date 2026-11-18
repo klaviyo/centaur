@@ -1520,6 +1520,99 @@ async fn owner_only_credentials_follow_the_owner_and_stop_after_revocation() {
 }
 
 #[tokio::test]
+async fn existing_watchers_receive_rotated_owner_tokens_without_a_new_turn() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    sqlx::query("UPDATE users SET status = 'active' WHERE id = $1")
+        .bind(f.admin)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let channel = f.principal("watcher-channel").await;
+    let actor = f.principal("watcher-owner").await;
+    sqlx::query("UPDATE principals SET kind = 'console_user', console_user_id = $1 WHERE id = $2")
+        .bind(f.admin)
+        .bind(actor)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let app = f.oauth_app("watcher-mcp", true).await;
+    sqlx::query("UPDATE oauth_apps SET owner_only = true WHERE id = $1")
+        .bind(app)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let credential = f.broker_credential("watcher-owner", Some(app), true).await;
+    let secret = f
+        .wrapper_secret("watcher-owner", credential, credential, "tenant.mcp.test")
+        .await;
+    f.grant(
+        Grantee::Principal(actor),
+        "static_secret_id",
+        secret,
+        DIRECT,
+    )
+    .await;
+    let token = f.proxy(Some(channel), Some(actor), json!({})).await;
+    // A watcher keeps its original requester assignment over multiple token
+    // lifetimes. Rotation must reach that proxy without another user turn.
+    sqlx::query(
+        "UPDATE proxies SET principal_assigned_at = now() - interval '6 hours', \
+             requester_principal_assigned_at = now() - interval '6 hours' \
+         WHERE bearer_token_hash = $1",
+    )
+    .bind(hex::encode(Sha256::digest(token.as_bytes())))
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let mut previous = f.sync(&token).await;
+    assert_eq!(secret_hosts(&previous), ["tenant.mcp.test"]);
+
+    for rotated in ["rotated-access-1", "rotated-access-2", "rotated-access-3"] {
+        // If refresh was delayed past expiry, stop serving the old token and
+        // recover automatically when the broker writes the next one.
+        sqlx::query(
+            "UPDATE broker_credentials SET expires_at = now() - interval '1 minute' WHERE id = $1",
+        )
+        .bind(credential)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let (_, expired) = f
+            .post(
+                "/api/v1/proxy/sync",
+                Some(&token),
+                json!({ "config_hash": previous["config_hash"] }),
+            )
+            .await;
+        assert!(secret_hosts(&expired).is_empty());
+        previous = expired;
+        sqlx::query(
+            "UPDATE broker_credentials SET access_token = $2, last_refresh = now(), \
+                 expires_at = now() + interval '2 hours' WHERE id = $1",
+        )
+        .bind(credential)
+        .bind(f.state.encryption.encrypt(rotated).unwrap())
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let (status, current) = f
+            .post(
+                "/api/v1/proxy/sync",
+                Some(&token),
+                json!({ "config_hash": previous["config_hash"] }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_ne!(current["config_hash"], previous["config_hash"]);
+        assert_eq!(secret_hosts(&current), ["tenant.mcp.test"]);
+        assert_eq!(current["secrets"][0]["source"]["value"], rotated);
+        previous = current;
+    }
+}
+
+#[tokio::test]
 async fn owner_only_requires_the_owners_verified_slack_team_and_active_account() {
     let Some(f) = Fixture::new().await else {
         return;
