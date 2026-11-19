@@ -92,6 +92,19 @@ const STDOUT_STALL_LOG_SKEW: Duration = Duration::from_secs(5);
 const STDOUT_INPUT_GRACE: Duration = Duration::from_secs(120);
 #[cfg(test)]
 const STDOUT_INPUT_GRACE: Duration = Duration::from_millis(500);
+/// Waits before each retry of a failed end-of-turn requester unbind.
+#[cfg(not(test))]
+const REQUESTER_RELEASE_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+];
+#[cfg(test)]
+const REQUESTER_RELEASE_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(20),
+    Duration::from_millis(20),
+    Duration::from_millis(20),
+];
 const SESSION_PIPE_MAX_REATTACH_ATTEMPTS: u32 = 3;
 const SESSION_PIPE_REATTACH_DELAY: Duration = Duration::from_millis(500);
 const SESSION_PIPE_CREATED_REATTACH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -6011,6 +6024,7 @@ async fn record_terminal_output(
             else {
                 return Ok(());
             };
+            spawn_turn_requester_release(ctx.clone(), thread_key.clone());
             let mut payload = json!({
                 "execution_id": execution_id,
                 "thread_key": thread_key.as_str(),
@@ -6043,6 +6057,7 @@ async fn record_terminal_output(
             else {
                 return Ok(());
             };
+            spawn_turn_requester_release(ctx.clone(), thread_key.clone());
             ctx.store
                 .append_event(
                     thread_key,
@@ -6070,6 +6085,7 @@ async fn record_terminal_output(
             else {
                 return Ok(());
             };
+            spawn_turn_requester_release(ctx.clone(), thread_key.clone());
             ctx.store
                 .append_event(
                     thread_key,
@@ -6111,7 +6127,6 @@ async fn record_terminal_output(
         failure_class,
     )
     .await;
-    spawn_turn_requester_release(ctx.clone(), thread_key.clone());
     if let Some(idle_timeout) = idle_timeout_from_execution(&terminal_execution) {
         spawn_idle_pause(
             ctx.clone(),
@@ -6190,6 +6205,7 @@ async fn record_max_duration_failure(
     else {
         return Ok(());
     };
+    spawn_turn_requester_release(ctx.clone(), thread_key.clone());
     if let Some(span) = ctx.execution_spans.lock().await.remove(execution_id) {
         finish_execution_trace_span(&span, "failed");
     }
@@ -6225,7 +6241,6 @@ async fn record_max_duration_failure(
         Some("timeout"),
     )
     .await;
-    spawn_turn_requester_release(ctx.clone(), thread_key.clone());
     if let Some(idle_timeout) = idle_timeout.or_else(|| idle_timeout_from_execution(&execution))
         && let Some(sandbox_id) = ctx.store.get_session(thread_key).await?.sandbox_id
     {
@@ -6250,19 +6265,39 @@ async fn record_max_duration_failure(
 /// when no requester is bound. If the next turn starts while this runs, the
 /// last rebind wins, so that turn can lose its requester (it runs on the
 /// conversation's grants alone) but never gains someone else's.
+///
+/// A failed unbind retries with backoff. If every attempt fails, the binding
+/// lasts until the thread's next turn rebinds the proxy or the idle pause
+/// stops the sandbox's processes.
 fn spawn_turn_requester_release(ctx: RuntimeContext, thread_key: ThreadKey) {
     if !thread_key.as_str().starts_with("linear:") {
         return;
     }
     tokio::spawn(async move {
-        if let Err(error) = release_turn_requester(&ctx, &thread_key).await {
-            warn!(
+        let mut delays = REQUESTER_RELEASE_RETRY_DELAYS.iter();
+        loop {
+            let Err(error) = release_turn_requester(&ctx, &thread_key).await else {
+                return;
+            };
+            let Some(delay) = delays.next() else {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_requester_release_failed",
+                    thread_key = %thread_key,
+                    %error,
+                    "failed to unbind the turn requester from the sandbox proxy"
+                );
+                return;
+            };
+            info!(
                 component = COMPONENT_SESSION_RUNTIME,
-                event = "session_requester_release_failed",
+                event = "session_requester_release_retry",
                 thread_key = %thread_key,
                 %error,
-                "failed to unbind the turn requester from the sandbox proxy"
+                retry_in_ms = duration_millis_u64(*delay),
+                "retrying the turn requester unbind"
             );
+            sleep(*delay).await;
         }
     });
 }
@@ -10115,6 +10150,7 @@ mod adoption_tests {
         stop_fails: AtomicBool,
         stopped: std::sync::Mutex<Vec<String>>,
         proxy_ensures: std::sync::Mutex<Vec<ProxyEnsure>>,
+        proxy_ensure_failures: AtomicUsize,
         missing_on_stop: std::sync::Mutex<BTreeSet<String>>,
         observability_enabled: std::sync::Mutex<Vec<String>>,
         observability_fails: AtomicBool,
@@ -10145,6 +10181,7 @@ mod adoption_tests {
                 stop_fails: AtomicBool::new(false),
                 stopped: std::sync::Mutex::new(Vec::new()),
                 proxy_ensures: std::sync::Mutex::new(Vec::new()),
+                proxy_ensure_failures: AtomicUsize::new(0),
                 missing_on_stop: std::sync::Mutex::new(BTreeSet::new()),
                 observability_enabled: std::sync::Mutex::new(Vec::new()),
                 observability_fails: AtomicBool::new(false),
@@ -10236,6 +10273,10 @@ mod adoption_tests {
 
         fn proxy_ensures(&self) -> Vec<ProxyEnsure> {
             self.proxy_ensures.lock().unwrap().clone()
+        }
+
+        fn fail_next_proxy_ensures(&self, count: usize) {
+            self.proxy_ensure_failures.store(count, Ordering::SeqCst);
         }
 
         fn created_specs(&self) -> Vec<SandboxSpec> {
@@ -10356,6 +10397,15 @@ mod adoption_tests {
                 requester_principal_id.map(ToOwned::to_owned),
                 labels.clone(),
             ));
+            if self
+                .proxy_ensure_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(SandboxError::backend("injected proxy ensure failure"));
+            }
             Ok(())
         }
 
@@ -12233,6 +12283,64 @@ mod adoption_tests {
             );
             sleep(Duration::from_millis(20)).await;
         }
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn linear_turn_end_retries_a_failed_requester_unbind() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+        execute_with_metadata(&runtime, &thread_key, json!({})).await;
+        assert!(backend.proxy_ensures().is_empty());
+        backend.fail_next_proxy_ensures(2);
+
+        stdout
+            .write_all(&completed_output_bytes("Done."))
+            .await
+            .expect("write terminal output");
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        let session = store.get_session(&thread_key).await.expect("load session");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while backend.proxy_ensures().len() < 3 {
+            assert!(
+                Instant::now() < deadline,
+                "the failed unbind was never retried"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+        let ensures = backend.proxy_ensures();
+        assert!(
+            ensures.iter().all(|(sandbox_id, _, requester, _)| {
+                Some(sandbox_id.as_str()) == session.sandbox_id.as_deref() && requester.is_none()
+            }),
+            "every attempt unbinds the requester"
+        );
         server.abort();
         reset_test_store(&store).await;
     }
