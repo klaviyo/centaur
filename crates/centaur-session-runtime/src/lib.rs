@@ -36,7 +36,7 @@ use centaur_session_sqlx::{
 use centaur_telemetry::{
     record_sandbox_warm_pool_claim, record_session_execution_finished,
     record_session_execution_started, record_session_failure, record_session_first_token_latency,
-    set_span_parent_from_traceparent,
+    record_session_stdout_line_dropped, set_span_parent_from_traceparent,
 };
 use dashmap::{DashMap, DashSet};
 use futures_util::{FutureExt, SinkExt, Stream, StreamExt, future::BoxFuture, stream};
@@ -512,6 +512,36 @@ pub struct ExecuteSessionInput {
     pub input_lines: Vec<String>,
     pub idle_timeout_ms: Option<u64>,
     pub max_duration_ms: Option<u64>,
+}
+
+/// Whether appended user messages reached a running execution as a steer.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SteeringStatus {
+    /// Written to the active execution's sandbox input.
+    Delivered,
+    /// No execution was queued or running, so no harness saw the messages.
+    NoActiveExecution,
+    /// Nothing was written (lookup failed, no pipe, or the execution ended
+    /// first), so no harness saw the messages.
+    NotDelivered,
+    /// Writing to the sandbox failed partway or with an ambiguous transport
+    /// error; the harness may have seen some or all of the messages.
+    DeliveryUnknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SteeringOutcome {
+    pub status: SteeringStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AppendMessagesOutcome {
+    pub message_ids: Vec<String>,
+    /// `None` when the append held no user message to steer with.
+    pub steering: Option<SteeringOutcome>,
 }
 
 #[derive(Clone, Debug)]
@@ -1849,6 +1879,19 @@ impl SessionRuntime {
         thread_key: &ThreadKey,
         messages: &[SessionMessageInput],
     ) -> Result<Vec<String>, SessionRuntimeError> {
+        Ok(self
+            .append_messages_with_steering(thread_key, messages)
+            .await?
+            .message_ids)
+    }
+
+    /// Appends messages and forwards user messages to the thread's active
+    /// execution, reporting whether that steer was delivered.
+    pub async fn append_messages_with_steering(
+        &self,
+        thread_key: &ThreadKey,
+        messages: &[SessionMessageInput],
+    ) -> Result<AppendMessagesOutcome, SessionRuntimeError> {
         let span = info_span!(
             "centaur.api_rs.session.messages.append",
             component = COMPONENT_SESSION_RUNTIME,
@@ -1907,10 +1950,14 @@ impl SessionRuntime {
                 return Err(error);
             }
         };
-        self.forward_messages_to_active_execution(thread_key, messages, &message_ids)
+        let steering = self
+            .forward_messages_to_active_execution(thread_key, messages, &message_ids)
             .await;
         self.spawn_session_title_generation(thread_key);
-        Ok(message_ids)
+        Ok(AppendMessagesOutcome {
+            message_ids,
+            steering,
+        })
     }
 
     fn spawn_session_title_generation(&self, thread_key: &ThreadKey) {
@@ -2779,20 +2826,39 @@ impl SessionRuntime {
         thread_key: &ThreadKey,
         messages: &[SessionMessageInput],
         message_ids: &[String],
-    ) {
+    ) -> Option<SteeringOutcome> {
         let input_lines = steering_input_lines(thread_key, messages, message_ids);
         if input_lines.is_empty() {
-            return;
+            return None;
         }
 
         let Some(execution) = (match self.store.active_execution_for_thread(thread_key).await {
             Ok(execution) => execution,
             Err(error) => {
                 warn!(%thread_key, %error, "active execution lookup failed during message append");
-                return;
+                return Some(SteeringOutcome {
+                    status: SteeringStatus::NotDelivered,
+                    execution_id: None,
+                });
             }
         }) else {
-            return;
+            info!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "session_messages_append_no_active_execution",
+                thread_key = %thread_key,
+                message_count = input_lines.len(),
+                "no active execution to steer; appended messages were stored only"
+            );
+            return Some(SteeringOutcome {
+                status: SteeringStatus::NoActiveExecution,
+                execution_id: None,
+            });
+        };
+        let failed = |status, execution_id: &str| {
+            Some(SteeringOutcome {
+                status,
+                execution_id: Some(execution_id.to_owned()),
+            })
         };
 
         // A steer that lands after the turn ends starts a new turn, which must
@@ -2844,7 +2910,7 @@ impl SessionRuntime {
             Err(error) => {
                 self.record_steering_failure(thread_key, &execution.execution_id, error)
                     .await;
-                return;
+                return failed(SteeringStatus::NotDelivered, &execution.execution_id);
             }
         };
 
@@ -2859,7 +2925,9 @@ impl SessionRuntime {
         {
             self.record_steering_failure(thread_key, &execution.execution_id, error.to_string())
                 .await;
-            return;
+            // Lines are sent one at a time, and a transport error can follow
+            // a write that landed, so the harness may already have the steer.
+            return failed(SteeringStatus::DeliveryUnknown, &execution.execution_id);
         }
 
         if let Err(error) = self
@@ -2879,6 +2947,10 @@ impl SessionRuntime {
         {
             warn!(%thread_key, %error, "failed to record steering delivery");
         }
+        Some(SteeringOutcome {
+            status: SteeringStatus::Delivered,
+            execution_id: Some(execution.execution_id),
+        })
     }
 
     pub async fn interrupt_active_execution(
@@ -5300,6 +5372,31 @@ async fn run_stdout_pump(
                 .map(|execution| execution.execution_id.as_str());
             let Some(output_execution_id) = output_state.execution_for_line(execution_id, &line)
             else {
+                // Output no execution owns never reaches a client: a harness
+                // turn that ran after its execution ended, or a finished
+                // turn's late output while a newer execution runs.
+                let reason = if execution_id.is_some() {
+                    "stale_execution"
+                } else {
+                    "no_active_execution"
+                };
+                record_session_stdout_line_dropped(reason);
+                let turn_id = output_value
+                    .as_ref()
+                    .and_then(|value| turn_ids(value).into_iter().next())
+                    .unwrap_or_default();
+                if output_state.first_drop_for_turn(&turn_id) {
+                    warn!(
+                        component = COMPONENT_SESSION_RUNTIME,
+                        event = "session_stdout_line_dropped",
+                        thread_key = %thread_key,
+                        sandbox_id,
+                        reason,
+                        harness_turn_id = %turn_id,
+                        active_execution_id = execution_id.unwrap_or(""),
+                        "dropped sandbox output no execution owns"
+                    );
+                }
                 continue;
             };
             if output_value.as_ref().is_some_and(is_harness_output_line) {
@@ -5770,9 +5867,20 @@ struct StdoutPumpState {
     turn_execution_by_id: HashMap<String, String>,
     item_execution_by_id: HashMap<String, String>,
     stdout_span_by_execution: HashMap<String, Span>,
+    /// Harness turns whose dropped output was already logged.
+    dropped_turn_ids: HashSet<String>,
 }
 
 impl StdoutPumpState {
+    /// Whether this is the first dropped line of `turn_id`, so each orphaned
+    /// turn logs once rather than once per streamed delta.
+    fn first_drop_for_turn(&mut self, turn_id: &str) -> bool {
+        if self.dropped_turn_ids.len() >= 1024 {
+            self.dropped_turn_ids.clear();
+        }
+        self.dropped_turn_ids.insert(turn_id.to_owned())
+    }
+
     fn execution_for_line(
         &mut self,
         active_execution_id: Option<&str>,
@@ -7427,6 +7535,9 @@ fn steering_input_line(
             "message_id": message_id,
             "metadata": message.metadata.clone(),
         },
+        // The harness names the steer's userMessage item with it, tying the
+        // item in the execution's output to the session message.
+        "client_user_message_id": message_id,
         "message": {
             "role": message.role.as_ref(),
             "content": message.parts.clone(),
@@ -9135,7 +9246,16 @@ mod tests {
         assert_eq!(value["thread_key"], "cli:test-steering");
         assert_eq!(value["trace_metadata"]["action"], "steer_active_execution");
         assert_eq!(value["trace_metadata"]["message_id"], "msg-user");
+        assert_eq!(value["client_user_message_id"], "msg-user");
         assert_eq!(value["message"]["content"][0]["text"], "steer now");
+    }
+
+    #[test]
+    fn stdout_pump_logs_each_dropped_turn_once() {
+        let mut state = StdoutPumpState::default();
+        assert!(state.first_drop_for_turn("turn-1"));
+        assert!(!state.first_drop_for_turn("turn-1"));
+        assert!(state.first_drop_for_turn("turn-2"));
     }
 
     #[test]
@@ -11079,6 +11199,54 @@ mod adoption_tests {
         // Already suspended: nothing left to pause.
         assert!(!runtime.pause_idle_session(&thread_key).await.unwrap());
         reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn append_messages_reports_no_active_execution_to_steer() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key =
+            ThreadKey::parse(format!("test:steer-none-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .expect("create session");
+        let runtime = runtime_with(
+            &store,
+            Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+        );
+        let message = |role| SessionMessageInput {
+            client_message_id: None,
+            role,
+            parts: vec![json!({"type": "text", "text": "after the turn ended"})],
+            metadata: json!({}),
+        };
+
+        let outcome = runtime
+            .append_messages_with_steering(&thread_key, &[message(MessageRole::User)])
+            .await
+            .expect("append user message");
+        assert_eq!(
+            outcome.steering,
+            Some(SteeringOutcome {
+                status: SteeringStatus::NoActiveExecution,
+                execution_id: None,
+            })
+        );
+
+        let outcome = runtime
+            .append_messages_with_steering(&thread_key, &[message(MessageRole::Assistant)])
+            .await
+            .expect("append assistant message");
+        assert_eq!(outcome.steering, None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

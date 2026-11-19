@@ -285,9 +285,21 @@ jobs:
       - name: Start Test Postgres
         run: .github/scripts/start-test-postgres.sh company-context-test-postgres 5432 postgres
 
+      # On ParadeDB, tests use the paradedb text-search backend; migration
+      # tests also cover postgres there.
       - name: Test
         env:
           COMPANY_CONTEXT_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: cargo test --locked -p centaur-company-context
+
+      # Stock PostgreSQL plus pgvector, as on RDS and Cloud SQL: every test runs
+      # on the postgres text-search backend without pg_search.
+      - name: Start Plain Test Postgres
+        run: .github/scripts/start-test-postgres.sh company-context-plain-postgres 5433 postgres pgvector
+
+      - name: Test on plain Postgres
+        env:
+          COMPANY_CONTEXT_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5433/postgres
         run: cargo test --locked -p centaur-company-context
 
   proxy-sync-checks:
@@ -580,7 +592,7 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "24.22.2"
+          node-version: "24.22.3"
 
       - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
@@ -606,7 +618,7 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "24.22.2"
+          node-version: "24.22.3"
 
       - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
@@ -638,7 +650,7 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "24.22.2"
+          node-version: "24.22.3"
 
       - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
@@ -672,7 +684,7 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "24.22.2"
+          node-version: "24.22.3"
 
       - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
@@ -706,7 +718,7 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "24.22.2"
+          node-version: "24.22.3"
 
       - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
@@ -727,7 +739,7 @@ jobs:
         run: bun run test
 
   connector-checks:
-    name: Code Mode connectors typecheck and tests
+    name: Code Mode connectors lint, typecheck, and tests
     runs-on: depot-ubuntu-24.04-16
     needs: ci_changes
     if: needs.ci_changes.outputs.connector_checks == 'true'
@@ -738,7 +750,7 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "24.22.2"
+          node-version: "24.22.3"
 
       - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
@@ -753,6 +765,10 @@ jobs:
       - name: Typecheck connectors
         working-directory: connectors
         run: pnpm run typecheck
+
+      - name: Lint connectors
+        working-directory: connectors
+        run: pnpm run lint
 
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
