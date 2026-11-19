@@ -7,6 +7,7 @@
 // the latest earlier messages, bot replies included, oldest first. An optional `rules` var (a list of {name, when}) runs a
 // rule-match decision with those proactivity rules instead of the
 // mentioned-thread rules; the output's `rule` names the first rule matched.
+// The first entry starts the thread; subsequent entries are thread replies.
 // An optional `burst` var (default 1) counts the trailing entries sent in quick
 // succession that slackbotv2's debounce judges together as the newest message.
 import type { ApiProvider, CallApiContextParams, ProviderOptions, ProviderResponse } from 'promptfoo'
@@ -91,7 +92,7 @@ function threadMessages(thread: unknown): ThreadMessage[] {
   if (!Array.isArray(thread) || thread.length === 0) {
     throw new Error('thread must be a non-empty list of {author: text} entries')
   }
-  return thread.map(entry => {
+  return thread.map((entry, index) => {
     const pairs = entry && typeof entry === 'object' ? Object.entries(entry) : []
     const [author, text] = pairs[0] ?? []
     if (pairs.length !== 1 || typeof text !== 'string') {
@@ -100,6 +101,8 @@ function threadMessages(thread: unknown): ThreadMessage[] {
     const isMe = author === BOT_NAME
     return proactiveThreadMessage({
       author: { fullName: author, isBot: isMe, isMe, userId: author, userName: author },
+      id: String(index + 1),
+      raw: index === 0 ? { ts: '1' } : { thread_ts: '1', ts: String(index + 1) },
       text
     })
   })

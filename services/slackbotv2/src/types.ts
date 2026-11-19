@@ -261,6 +261,8 @@ export type ProactiveThreadMessage = {
   author: string
   /** Whether this bot wrote the message. */
   fromBot: boolean
+  /** Whether the message replies within a thread rather than starting one. */
+  isThreadReply: boolean
   text: string
 }
 

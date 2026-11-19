@@ -6,7 +6,7 @@ import type {
   ProactiveDecision,
   ProactiveThreadMessage
 } from './types'
-import { isJsonObject } from './utils'
+import { isJsonObject, isSlackThreadReply } from './utils'
 
 // Backends share the instructions and transcript so that swapping the model
 // changes only the transport. Tune both with evals/proactive-response.
@@ -142,11 +142,12 @@ function firstMatchingRule(rules: ProactivityRule[], probabilities: number[]): P
 
 /** A Chat SDK message as the classifier sees it. */
 export function proactiveThreadMessage(
-  message: Pick<ChatMessage, 'author' | 'text'>
+  message: Pick<ChatMessage, 'author' | 'id' | 'raw' | 'text'>
 ): ProactiveThreadMessage {
   return {
     author: message.author.fullName || message.author.userName || message.author.userId,
     fromBot: message.author.isMe === true,
+    isThreadReply: isSlackThreadReply(message),
     text: message.text
   }
 }
@@ -156,5 +157,6 @@ function transcriptLine(botName: string, message: ProactiveThreadMessage): strin
   const text = message.text.length > MAX_MESSAGE_CHARS
     ? `${message.text.slice(0, MAX_MESSAGE_CHARS)}…`
     : message.text
-  return `[${author}]: ${text}`
+  const position = message.isThreadReply ? 'thread reply' : 'top-level message'
+  return `[${author}] (${position}): ${text}`
 }

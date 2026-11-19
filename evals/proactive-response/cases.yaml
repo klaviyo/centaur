@@ -499,3 +499,50 @@
     thread:
       - Dana Park: lunch at noon?
       - Dana Park: the usual place
+
+
+# Message position is independent of the topic and who wrote earlier messages.
+- description: opening build question matches a top-level intake rule
+  vars:
+    respond: true
+    rule: intake
+    rules:
+      - name: intake
+        when: A top-level request for help with a failing build. Exclude thread replies.
+    thread:
+      - Morgan: The build fails during compilation. Can someone help?
+- description: identical build question in a thread does not match top-level intake
+  vars:
+    respond: false
+    rules:
+      - name: intake
+        when: A top-level request for help with a failing build. Exclude thread replies.
+    thread:
+      - Riley: This thread tracks the compiler upgrade.
+      - Morgan: The build fails during compilation. Can someone help?
+- description: top-level status update does not match an intake request
+  vars:
+    respond: false
+    rules:
+      - name: intake
+        when: A top-level request for help with a failing build. Exclude thread replies.
+    thread:
+      - Morgan: The build passed after the compiler upgrade.
+- description: operator rule can explicitly accept a thread reply
+  vars:
+    respond: true
+    rule: follow-up
+    rules:
+      - name: follow-up
+        when: A thread reply asking for the next step in a deployment.
+    thread:
+      - Riley: The release is ready for staging.
+      - Morgan: What is the next deployment step?
+- description: operator rule excludes opening messages when only replies qualify
+  vars:
+    respond: false
+    rules:
+      - name: follow-up
+        when: A thread reply asking for the next step in a deployment.
+    thread:
+      - Morgan: What is the next deployment step?

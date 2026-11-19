@@ -9,10 +9,10 @@ import type { ProactiveClassifierInput } from '../src/types'
 const input: ProactiveClassifierInput = {
   botName: 'centaur',
   history: [
-    { author: 'Test User', fromBot: false, text: '@centaur why did the deploy fail?' },
-    { author: 'centaur', fromBot: true, text: 'The migration timed out.' }
+    { author: 'Test User', fromBot: false, isThreadReply: false, text: '@centaur why did the deploy fail?' },
+    { author: 'centaur', fromBot: true, isThreadReply: true, text: 'The migration timed out.' }
   ],
-  message: { author: 'Test User', fromBot: false, text: 'can you retry it?' }
+  message: { author: 'Test User', fromBot: false, isThreadReply: true, text: 'can you retry it?' }
 }
 
 function classifierReturning(response: () => Response, requests: unknown[] = []) {
@@ -49,40 +49,58 @@ describe('OpenAI proactive classifier', () => {
     expect(messages.map(message => message.role)).toEqual(['developer', 'user'])
     expect(messages[1]!.content).toBe([
       'Latest thread messages, oldest first:',
-      '[Test User]: @centaur why did the deploy fail?',
-      '[centaur (assistant)]: The migration timed out.',
+      '[Test User] (top-level message): @centaur why did the deploy fail?',
+      '[centaur (assistant)] (thread reply): The migration timed out.',
       '',
       'Newest message:',
-      '[Test User]: can you retry it?'
+      '[Test User] (thread reply): can you retry it?'
     ].join('\n'))
   })
 
   test('presents a burst as one newest message', () => {
     expect(proactiveDecisionTranscript({
       botName: 'centaur',
-      burst: [{ author: 'Investor', fromBot: false, text: 'Acme Robotics' }],
+      burst: [{ author: 'Investor', fromBot: false, isThreadReply: false, text: 'Acme Robotics' }],
       history: [],
-      message: { author: 'Investor', fromBot: false, text: 'Series B, founder ex-Stripe' }
+      message: { author: 'Investor', fromBot: false, isThreadReply: false, text: 'Series B, founder ex-Stripe' }
     })).toBe([
       'Latest thread messages, oldest first:',
       '(no earlier messages)',
       '',
       'Newest message, sent in parts in quick succession, oldest first:',
-      '[Investor]: Acme Robotics',
-      '[Investor]: Series B, founder ex-Stripe'
+      '[Investor] (top-level message): Acme Robotics',
+      '[Investor] (top-level message): Series B, founder ex-Stripe'
     ].join('\n'))
   })
 
   test('labels Chat SDK messages by display name and whether the bot wrote them', () => {
     const author = { fullName: 'Dana Reyes', isBot: false, isMe: false, userId: 'U07LV5J6PA', userName: 'dana' }
-    expect(proactiveThreadMessage({ author, text: '@U03CTR8YKE hi' })).toEqual({
+    expect(proactiveThreadMessage({ author, id: '1', raw: {}, text: '@U03CTR8YKE hi' })).toEqual({
       author: 'Dana Reyes',
       fromBot: false,
+      isThreadReply: false,
       text: '@U03CTR8YKE hi'
     })
-    expect(proactiveThreadMessage({ author: { ...author, fullName: '', userName: '' }, text: 'x' }).author)
+    expect(proactiveThreadMessage({ author: { ...author, fullName: '', userName: '' }, id: '1', raw: {}, text: 'x' }).author)
       .toBe('U07LV5J6PA')
-    expect(proactiveThreadMessage({ author: { ...author, isMe: true }, text: 'x' }).fromBot).toBe(true)
+    expect(proactiveThreadMessage({ author: { ...author, isMe: true }, id: '1', raw: {}, text: 'x' }).fromBot).toBe(true)
+  })
+
+  test.each([
+    [{ ts: '1' }, false],
+    [{ thread_ts: '1', ts: '1' }, false],
+    [{ thread_ts: '1', ts: '2' }, true],
+    [{ thread_ts: '1' }, true],
+    [{ thread_ts: '', ts: '2' }, false],
+    [null, false]
+  ])('derives thread position from Slack metadata %j', (raw, expected) => {
+    const message = proactiveThreadMessage({
+      author: { fullName: 'Dana', isBot: false, isMe: false, userId: 'U1', userName: 'dana' },
+      id: '2',
+      raw,
+      text: 'Can you help?'
+    })
+    expect(message.isThreadReply).toBe(expected)
   })
 
   test('picks the first rule, in order, that the message meets', async () => {
@@ -127,6 +145,7 @@ describe('OpenAI proactive classifier', () => {
     // Rule context is for the agent, not the classifier.
     expect(messages[0]!.content).not.toContain('Link the runbook.')
     expect(messages[1]!.content).not.toContain('Questions about deploys.')
+    expect(messages[1]!.content).toBe(proactiveDecisionTranscript(input))
   })
 
   test('declines below the probability threshold', async () => {
