@@ -596,13 +596,24 @@
         },
         "extraEnv": {
           "type": "object",
-          "additionalProperties": { "type": "string" }
+          "additionalProperties": {
+            "oneOf": [
+              { "type": "string" },
+              {
+                "type": "object",
+                "required": ["valueFrom"],
+                "additionalProperties": false,
+                "properties": { "valueFrom": { "type": "object", "minProperties": 1 } }
+              }
+            ]
+          }
         }
       }
     },
     "slackbotv2": {
       "type": "object",
       "properties": {
+        "extraCaCertificates": { "type": "string" },
         "agentViewEnabled": { "type": "boolean" },
         "mcpPublicUrl": { "type": "string" },
         "responseMetadataMode": {
