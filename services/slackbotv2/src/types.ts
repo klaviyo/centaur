@@ -259,6 +259,8 @@ export type SlackbotV2ProactivityOptions = {
 
 export type ProactiveThreadMessage = {
   author: string
+  /** Slack sender ID, independent of the display name and mentions in the text. */
+  userId?: string
   /** Whether this bot wrote the message. */
   fromBot: boolean
   text: string

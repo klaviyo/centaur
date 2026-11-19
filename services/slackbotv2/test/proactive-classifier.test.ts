@@ -73,16 +73,65 @@ describe('OpenAI proactive classifier', () => {
     ].join('\n'))
   })
 
-  test('labels Chat SDK messages by display name and whether the bot wrote them', () => {
+  test('preserves Chat SDK sender IDs alongside display names and assistant labels', () => {
     const author = { fullName: 'Dana Reyes', isBot: false, isMe: false, userId: 'U07LV5J6PA', userName: 'dana' }
     expect(proactiveThreadMessage({ author, text: '@U03CTR8YKE hi' })).toEqual({
       author: 'Dana Reyes',
       fromBot: false,
-      text: '@U03CTR8YKE hi'
+      text: '@U03CTR8YKE hi',
+      userId: 'U07LV5J6PA'
     })
     expect(proactiveThreadMessage({ author: { ...author, fullName: '', userName: '' }, text: 'x' }).author)
       .toBe('U07LV5J6PA')
     expect(proactiveThreadMessage({ author: { ...author, isMe: true }, text: 'x' }).fromBot).toBe(true)
+  })
+
+  test.each(['composer-review-bot-routing', 'customer-agent-review-bot-routing'])(
+    '%s receives the bot sender ID separately from the mentioned reviewer',
+    async ruleName => {
+      const requests: Array<{ body: Record<string, unknown>; url: string }> = []
+      const classifier = classifierReturning(
+        () => Response.json({ answers: [{ name: 'rule_1', probability: 0.9 }] }),
+        requests
+      )
+      const author = {
+        fullName: 'Review Bot', isBot: true, isMe: false,
+        userId: 'U_REVIEW_BOT', userName: 'review_bot'
+      }
+      const text = 'Include CSAT ratings https://github.com/example/app/pull/42 <@U_REVIEWER>'
+      const message = proactiveThreadMessage({ author, text })
+      const rules = [{
+        name: ruleName,
+        when: 'A top-level post from Review Bot (Slack user U_REVIEW_BOT) announcing a GitHub PR.'
+      }]
+
+      await classifier({ botName: 'centaur', history: [], message, rules }, new AbortController().signal)
+
+      const messages = requests[0]!.body.input as Array<{ content: string; role: string }>
+      expect(messages[0]!.content).toContain('Slack user U_REVIEW_BOT')
+      expect(messages[0]!.content).toContain('User mentions in the message text are not the sender.')
+      expect(messages[1]!.content).toContain(`[Review Bot (Slack user ID: U_REVIEW_BOT)]: ${text}`)
+
+      // A copied name or an ID mentioned in the text must not replace the actual sender ID.
+      const impersonator = proactiveThreadMessage({
+        author: { ...author, isBot: false, userId: 'U_OTHER' },
+        text: `${text} <@U_REVIEW_BOT>`
+      })
+      expect(proactiveDecisionTranscript({ botName: 'centaur', history: [], message: impersonator }))
+        .toContain('[Review Bot (Slack user ID: U_OTHER)]:')
+    }
+  )
+
+  test('includes sender IDs on history, burst parts, and assistant messages', () => {
+    const transcript = proactiveDecisionTranscript({
+      botName: 'centaur',
+      history: [{ author: 'centaur', fromBot: true, text: 'Earlier reply', userId: 'U_ASSISTANT' }],
+      burst: [{ author: 'Dana', fromBot: false, text: 'First part', userId: 'U_DANA' }],
+      message: { author: 'Dana', fromBot: false, text: 'Second part', userId: 'U_DANA' }
+    })
+    expect(transcript).toContain('[centaur (assistant) (Slack user ID: U_ASSISTANT)]: Earlier reply')
+    expect(transcript).toContain('[Dana (Slack user ID: U_DANA)]: First part')
+    expect(transcript).toContain('[Dana (Slack user ID: U_DANA)]: Second part')
   })
 
   test('picks the first rule, in order, that the message meets', async () => {
