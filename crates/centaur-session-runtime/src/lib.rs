@@ -2628,8 +2628,12 @@ impl SessionRuntime {
         let session = self.store.get_session(thread_key).await?;
         validate_input_lines(&input.input_lines)?;
         let _ = duration_options(input.idle_timeout_ms, input.max_duration_ms)?;
-        self.refuse_unlinked_requester(thread_key, input.metadata.as_ref())
-            .await?;
+        self.refuse_unlinked_requester(
+            thread_key,
+            input.idempotency_key.as_deref(),
+            input.metadata.as_ref(),
+        )
+        .await?;
         // The persisted request keeps the caller's lines; the driver pins
         // them to the persona model when it writes them to the sandbox.
         let persona_model = self.persona_model(&session);
@@ -3520,13 +3524,25 @@ impl SessionRuntime {
     /// before the turn is queued, so the caller gets the refusal on its request
     /// instead of a queued execution that fails later. Any other lookup outcome
     /// admits the turn; dispatch resolves the requester again, which also
-    /// catches an account unlinked in between.
+    /// catches an account unlinked in between. A retry whose idempotency key
+    /// already created an execution skips the check and gets that execution
+    /// back, as any retry does.
     async fn refuse_unlinked_requester(
         &self,
         thread_key: &ThreadKey,
+        idempotency_key: Option<&str>,
         metadata: Option<&Value>,
     ) -> Result<(), SessionRuntimeError> {
         if self.linked_requester_policy != LinkedRequesterPolicy::Required {
+            return Ok(());
+        }
+        if let Some(idempotency_key) = idempotency_key
+            && self
+                .store
+                .execution_for_idempotency_key(thread_key, idempotency_key)
+                .await?
+                .is_some()
+        {
             return Ok(());
         }
         match self
@@ -12256,6 +12272,70 @@ mod adoption_tests {
             "a refused turn is never queued"
         );
         assert!(backend.created_specs().is_empty());
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn required_linked_requester_returns_an_accepted_retry() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url))
+                .with_linked_requester_policy(LinkedRequesterPolicy::Required);
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+        // Accepted earlier, e.g. before the person unlinked their account.
+        let accepted = store
+            .create_execution_with_request(
+                &thread_key,
+                Some("comment-1"),
+                json!({"linear_user_id": "lin-user-1"}),
+                json!({"input_lines": []}),
+            )
+            .await
+            .expect("record accepted execution")
+            .execution;
+        store
+            .complete_execution(&accepted.execution_id)
+            .await
+            .expect("complete execution");
+
+        let retried = runtime
+            .enqueue_session_execution(
+                &thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: Some("comment-1".to_owned()),
+                    metadata: Some(json!({"linear_user_id": "lin-user-1"})),
+                    input_lines: vec![
+                        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#
+                            .to_owned(),
+                    ],
+                    idle_timeout_ms: None,
+                    max_duration_ms: None,
+                },
+            )
+            .await
+            .expect("a retry gets its existing execution back");
+        assert_eq!(retried.execution_id, accepted.execution_id);
         server.abort();
         reset_test_store(&store).await;
     }
