@@ -5191,8 +5191,12 @@ describe('proactive replies', () => {
     await reply('what about staging?', threadTs)
 
     expect(calls).toHaveLength(1)
-    expect(calls[0]!.message).toMatchObject({ fromBot: false, text: 'what about staging?' })
-    expect(calls[0]!.history.map(item => item.text)).toContain('Proactive accept context.')
+    expect(calls[0]!.message).toMatchObject({
+      fromBot: false, isThreadReply: true, text: 'what about staging?'
+    })
+    expect(calls[0]!.history).toContainEqual(expect.objectContaining({
+      isThreadReply: false, text: 'Proactive accept context.'
+    }))
     // Chat SDK resolves mentions to display names, as the proactive-response
     // eval's thread texts assume.
     expect(calls[0]!.history.map(item => item.text)).toContain('@centaur check the deploy')
@@ -5320,7 +5324,9 @@ describe('proactive replies', () => {
     await waitFor(async () => (await threadText(message.ts)).includes('Executed request 1.'))
 
     expect(calls).toHaveLength(1)
-    expect(calls[0]).toMatchObject({ history: [], rules: deployRules })
+    expect(calls[0]).toMatchObject({
+      history: [], message: { isThreadReply: false }, rules: deployRules
+    })
     // A top-level message has no earlier thread messages to read.
     expect(repliesRequestsWhenClassified).toBe(repliesRequestsBefore)
     expect(codexApi.executes).toHaveLength(1)

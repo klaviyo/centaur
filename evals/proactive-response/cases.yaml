@@ -499,3 +499,48 @@
     thread:
       - Dana Park: lunch at noon?
       - Dana Park: the usual place
+
+# Automated handoffs do not invite the bot into subsequent human conversation.
+- description: provider question between people after an automated handoff
+  vars:
+    respond: false
+    thread:
+      - Alex: Where are notification emails sent from? A customer is not receiving them.
+      - centaur: Hey @notifications, could you take a look?
+      - Blair: Notifications come from our shared sending domain.
+      - Alex: So would that be sent through our email provider?
+- description: customer details supplied to a person after an automated handoff
+  vars:
+    respond: false
+    thread:
+      - Alex: A customer is not receiving notification emails.
+      - centaur: Hey @notifications, could you take a look?
+      - Blair: Alex, which company and notification?
+      - Alex: The company is EXAMPLE. They enabled new-message email notifications but receive nothing.
+- description: request directed at the assistant after an automated handoff
+  vars:
+    respond: true
+    thread:
+      - Alex: A customer is not receiving notification emails.
+      - centaur: Hey @notifications, could you take a look?
+      - Alex: centaur, can you find the notification delivery runbook for me?
+
+# Identical text has a different position in the thread.
+- description: top-level notification question matches an intake rule
+  vars:
+    respond: true
+    rule: intake
+    rules:
+      - name: intake
+        when: A top-level request for help with notifications. Exclude replies to an existing thread.
+    thread:
+      - Alex: A customer is not receiving notification emails. Can someone help?
+- description: notification question inside an existing thread does not match intake
+  vars:
+    respond: false
+    rules:
+      - name: intake
+        when: A top-level request for help with notifications. Exclude replies to an existing thread.
+    thread:
+      - Blair: This thread tracks notification delivery issues.
+      - Alex: A customer is not receiving notification emails. Can someone help?

@@ -141,6 +141,7 @@ import {
   errorMessage,
   escapeRegExp,
   isJsonObject,
+  isSlackThreadReply,
   noopLogger,
   nowMs,
   startPendingOperationLog,
@@ -4490,15 +4491,6 @@ function slackWebhookLogFields(rawBody: string): JsonObject {
 function setStringField(fields: JsonObject, key: string, value: unknown): void {
   const text = stringField(value)
   if (text) fields[key] = text
-}
-
-function isSlackThreadReply(message: ChatMessage): boolean {
-  const raw = message.raw
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false
-  const item = raw as Record<string, unknown>
-  const threadTs = typeof item.thread_ts === 'string' ? item.thread_ts : ''
-  const ts = typeof item.ts === 'string' ? item.ts : message.id
-  return Boolean(threadTs && ts && threadTs !== ts)
 }
 
 async function collectSlackThreadContext(

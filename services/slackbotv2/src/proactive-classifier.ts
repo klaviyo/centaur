@@ -6,7 +6,7 @@ import type {
   ProactiveDecision,
   ProactiveThreadMessage
 } from './types'
-import { isJsonObject } from './utils'
+import { isJsonObject, isSlackThreadReply } from './utils'
 
 // Backends share the instructions and transcript so that swapping the model
 // changes only the transport. Tune both with evals/proactive-response.
@@ -15,13 +15,14 @@ const MAX_MESSAGE_CHARS = 2_000
 // Minimum probability that the bot should reply.
 const RESPOND_PROBABILITY_THRESHOLD = 0.5
 
-/** Instructions for a reply in a thread where the bot was mentioned. */
+/** Instructions for an unmentioned follow-up in an eligible thread. */
 export function proactiveDecisionInstructions(botName: string): string {
   return [
     `You decide whether ${botName}, an AI assistant in a Slack thread, should reply to the newest message.`,
-    `${botName} was mentioned earlier in this thread, possibly before the messages shown. The newest message does not mention ${botName}.`,
+    `The newest message does not mention ${botName}. ${botName} may have joined this thread through an explicit mention or an automated reply; do not assume it was mentioned.`,
+    `After an automated routing or handoff reply, do not reply to unaddressed follow-up questions or details exchanged between people. A follow-up must clearly address ${botName} or ask it to continue substantive work beyond routing.`,
     `Once mentioned, ${botName} is a participant in the thread: anyone in it can keep working with ${botName} without mentioning it again.`,
-    `Reply when the newest message asks for something ${botName} can do or answer: a question, request, or instruction with no other named addressee, a follow-up on ${botName}'s work, or a challenge or correction to ${botName}'s output.`,
+    `In a conversation with ${botName}, reply when the newest message asks for something it can do or answer: a question, request, or instruction with no other named addressee, a follow-up on ${botName}'s work, or a challenge or correction to ${botName}'s output.`,
     `Do not reply when the message is addressed to a person, as in "Bob, can you..." or an @-mention (merely naming someone is not addressing them), needs a person (a review, an approval, or what people decided, are doing, or are responsible for), or is conversation between people: acknowledgements, thanks, opinions, jokes, reactions, status updates, or remarks about ${botName}.`,
     `A message that @-mentions a person is for that person unless it clearly asks ${botName} to act and only copies the person in, such as "do X, cc @name".`,
     `Messages that share a view, argue a point, or speculate are conversation between people even when phrased as questions, such as "I wonder if..." or "...unless you think...". In such a message, "you" means the person whose point it answers, even right after a reply from ${botName}. Questions that ask for facts, figures, or work are requests, and arguing with ${botName}'s own output is a challenge to ${botName}.`,
@@ -142,11 +143,12 @@ function firstMatchingRule(rules: ProactivityRule[], probabilities: number[]): P
 
 /** A Chat SDK message as the classifier sees it. */
 export function proactiveThreadMessage(
-  message: Pick<ChatMessage, 'author' | 'text'>
+  message: Pick<ChatMessage, 'author' | 'id' | 'raw' | 'text'>
 ): ProactiveThreadMessage {
   return {
     author: message.author.fullName || message.author.userName || message.author.userId,
     fromBot: message.author.isMe === true,
+    isThreadReply: isSlackThreadReply(message),
     text: message.text
   }
 }
@@ -156,5 +158,6 @@ function transcriptLine(botName: string, message: ProactiveThreadMessage): strin
   const text = message.text.length > MAX_MESSAGE_CHARS
     ? `${message.text.slice(0, MAX_MESSAGE_CHARS)}…`
     : message.text
-  return `[${author}]: ${text}`
+  const position = message.isThreadReply ? 'thread reply' : 'top-level message'
+  return `[${author}] (${position}): ${text}`
 }

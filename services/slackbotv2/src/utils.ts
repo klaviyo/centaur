@@ -1,4 +1,4 @@
-import type { Logger } from 'chat'
+import type { Logger, Message as ChatMessage } from 'chat'
 import type { JsonObject, SlackbotV2Options, SlackbotV2Trace } from './types'
 
 const PENDING_OPERATION_WARN_AFTER_MS = 5_000
@@ -115,4 +115,13 @@ export async function* toAsyncIterable<T>(source: Iterable<T>): AsyncIterable<T>
   for await (const item of source) {
     yield item
   }
+}
+
+export function isSlackThreadReply(message: Pick<ChatMessage, 'id' | 'raw'>): boolean {
+  const raw = message.raw
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false
+  const item = raw as Record<string, unknown>
+  const threadTs = typeof item.thread_ts === 'string' ? item.thread_ts : ''
+  const ts = typeof item.ts === 'string' ? item.ts : message.id
+  return Boolean(threadTs && ts && threadTs !== ts)
 }
