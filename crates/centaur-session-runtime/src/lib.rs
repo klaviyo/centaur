@@ -2758,6 +2758,9 @@ impl SessionRuntime {
             Some(runtime_error_failure_class(error)),
         )
         .await;
+        // A dispatch can fail after the sandbox's proxy was bound to this
+        // turn's requester (writing input, opening the pipe).
+        spawn_turn_requester_release(self.context(), thread_key.clone());
     }
 
     async fn handle_stdout_claim_failure(
@@ -6108,7 +6111,7 @@ async fn record_terminal_output(
         failure_class,
     )
     .await;
-    spawn_turn_requester_release(ctx.clone(), thread_key.clone(), sandbox_id.to_owned());
+    spawn_turn_requester_release(ctx.clone(), thread_key.clone());
     if let Some(idle_timeout) = idle_timeout_from_execution(&terminal_execution) {
         spawn_idle_pause(
             ctx.clone(),
@@ -6222,6 +6225,7 @@ async fn record_max_duration_failure(
         Some("timeout"),
     )
     .await;
+    spawn_turn_requester_release(ctx.clone(), thread_key.clone());
     if let Some(idle_timeout) = idle_timeout.or_else(|| idle_timeout_from_execution(&execution))
         && let Some(sandbox_id) = ctx.store.get_session(thread_key).await?.sandbox_id
     {
@@ -6237,7 +6241,8 @@ async fn record_max_duration_failure(
 }
 
 /// Unbind the turn's requester from a Linear thread's proxy once the turn
-/// ends. Everyone who comments on an issue shares its sandbox, so a process one
+/// ends, however it ends: every path that records a terminal execution calls
+/// this. Everyone who comments on an issue shares its sandbox, so a process one
 /// person's turn left running must not keep making proxied calls with that
 /// person's credentials. Slack threads keep the binding: their requester is
 /// already rebound per turn, and an unbind there would add a proxy round trip
@@ -6245,17 +6250,16 @@ async fn record_max_duration_failure(
 /// when no requester is bound. If the next turn starts while this runs, the
 /// last rebind wins, so that turn can lose its requester (it runs on the
 /// conversation's grants alone) but never gains someone else's.
-fn spawn_turn_requester_release(ctx: RuntimeContext, thread_key: ThreadKey, sandbox_id: String) {
+fn spawn_turn_requester_release(ctx: RuntimeContext, thread_key: ThreadKey) {
     if !thread_key.as_str().starts_with("linear:") {
         return;
     }
     tokio::spawn(async move {
-        if let Err(error) = release_turn_requester(&ctx, &thread_key, &sandbox_id).await {
+        if let Err(error) = release_turn_requester(&ctx, &thread_key).await {
             warn!(
                 component = COMPONENT_SESSION_RUNTIME,
                 event = "session_requester_release_failed",
                 thread_key = %thread_key,
-                sandbox_id,
                 %error,
                 "failed to unbind the turn requester from the sandbox proxy"
             );
@@ -6266,18 +6270,19 @@ fn spawn_turn_requester_release(ctx: RuntimeContext, thread_key: ThreadKey, sand
 async fn release_turn_requester(
     ctx: &RuntimeContext,
     thread_key: &ThreadKey,
-    sandbox_id: &str,
 ) -> Result<(), SessionRuntimeError> {
     let session = ctx.store.get_session(thread_key).await?;
-    let Some(principal_id) = session.iron_control_principal.as_deref() else {
+    let (Some(principal_id), Some(sandbox_id)) = (
+        session.iron_control_principal.as_deref(),
+        session.sandbox_id.as_deref(),
+    ) else {
         return Ok(());
     };
-    if session.sandbox_id.as_deref() != Some(sandbox_id)
-        || ctx
-            .store
-            .active_execution_for_thread(thread_key)
-            .await?
-            .is_some()
+    if ctx
+        .store
+        .active_execution_for_thread(thread_key)
+        .await?
+        .is_some()
     {
         return Ok(());
     }
@@ -12099,6 +12104,75 @@ mod adoption_tests {
             .find(|event| event.event_type == "session.requester_unresolved")
             .expect("the refusal is recorded on the thread");
         assert_eq!(unresolved.payload["refused"], json!(true));
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn linear_turn_past_max_duration_unbinds_the_requester_from_the_proxy() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, _stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+        runtime
+            .execute_session(
+                &thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: None,
+                    metadata: Some(json!({})),
+                    input_lines: vec![
+                        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#
+                            .to_owned(),
+                    ],
+                    idle_timeout_ms: None,
+                    max_duration_ms: Some(50),
+                },
+            )
+            .await
+            .expect("execute session");
+
+        // No terminal output ever arrives: the max-duration timer ends the turn.
+        wait_for_event(&store, &thread_key, "session.execution_failed").await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some((_sandbox_id, _principal_id, requester, _labels)) =
+                backend.proxy_ensures().first()
+            {
+                assert_eq!(
+                    requester, &None,
+                    "the timed-out turn's requester is unbound"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "max duration never unbound the requester"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
         server.abort();
         reset_test_store(&store).await;
     }

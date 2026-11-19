@@ -913,6 +913,56 @@ describe("linearbot unlinked requester", () => {
     expect(second.body).not.toContain("isn't connected to Centaur");
   });
 
+  it("shows the note again on the next turn when its reply failed to post", async () => {
+    bot = createTestBot({ consolePublicUrl: CONSOLE_URL });
+    const threadKey = `linear:${ISSUE_ID}:c:comment-lost`;
+    linearApi.failNextCommentWrite("isn't connected to Centaur");
+    await postWebhook(
+      commentCreatedPayload({ id: "comment-lost", body: "@centaur first?" }),
+    );
+    await waitFor(() =>
+      codexApi.executes.some((e) => e.threadKey === threadKey),
+    );
+    codexApi.emitSessionEvent(threadKey, "session.requester_unresolved", {
+      refused: false,
+    });
+    codexApi.emitOutputLines(threadKey, sampleCodexOutputLines("Lost."));
+    await waitFor(() =>
+      codexApi.eventRequests.some((r) => r.threadKey === threadKey),
+    );
+    await Bun.sleep(300);
+    // The reply carrying the note never landed.
+    expect(
+      linearApi.botComments.some(
+        (c) => c.parentId === "comment-lost" && c.body.includes("Lost."),
+      ),
+    ).toBe(false);
+
+    await postWebhook(
+      commentCreatedPayload({
+        id: "comment-lost-2",
+        parentId: "comment-lost",
+        body: "@centaur second?",
+      }),
+    );
+    await waitFor(
+      () => codexApi.executes.filter((e) => e.threadKey === threadKey).length > 1,
+    );
+    codexApi.emitSessionEvent(threadKey, "session.requester_unresolved", {
+      refused: false,
+    });
+    codexApi.emitOutputLines(threadKey, sampleCodexOutputLines("Found."));
+    await waitFor(() =>
+      linearApi.botComments.some(
+        (c) => c.parentId === "comment-lost" && c.body.includes("Found."),
+      ),
+    );
+    const second = linearApi.botComments.find(
+      (c) => c.parentId === "comment-lost" && c.body.includes("Found."),
+    )!;
+    expect(second.body).toContain("isn't connected to Centaur");
+  });
+
   it("adds no note when the requester was bound", async () => {
     const threadKey = `linear:${ISSUE_ID}:c:comment-linked`;
     await postWebhook(
@@ -1324,6 +1374,8 @@ type FakeLinearApi = {
   addUserComment(input: { body: string; parentId?: string }): string;
   botComments: RecordedBotComment[];
   close(): void;
+  /** Fail the next comment write whose body contains `text`. */
+  failNextCommentWrite(text: string): void;
   issueStateUpdates: Array<{ issueId: string; stateId: string }>;
   reactions: RecordedReaction[];
   removedReactionIds: string[];
@@ -1351,6 +1403,7 @@ function startFakeLinearApi(): FakeLinearApi {
   const issueStateUpdates: Array<{ issueId: string; stateId: string }> = [];
   let issueDelegateId: string | null = null;
   let issueStateId = "st-todo";
+  const failingCommentWrites: string[] = [];
   let idCounter = 0;
   const nextId = (prefix: string) => `${prefix}-${++idCounter}`;
 
@@ -1611,6 +1664,17 @@ function startFakeLinearApi(): FakeLinearApi {
         query: string;
         variables?: Record<string, unknown>;
       };
+      const writeBody = String(body.variables?.body ?? "");
+      const failing = /LinearbotComment(Create|Update)/.test(body.query)
+        ? failingCommentWrites.findIndex((text) => writeBody.includes(text))
+        : -1;
+      if (failing >= 0) {
+        failingCommentWrites.splice(failing, 1);
+        return Response.json(
+          { errors: [{ message: "comment write failed" }] },
+          { status: 500 },
+        );
+      }
       const data = handle(body.query, body.variables ?? {});
       if (data === undefined) {
         const operation =
@@ -1636,6 +1700,9 @@ function startFakeLinearApi(): FakeLinearApi {
     url: `http://127.0.0.1:${server.port}/graphql`,
     setIssueDelegate(userId) {
       issueDelegateId = userId;
+    },
+    failNextCommentWrite(text) {
+      failingCommentWrites.push(text);
     },
     addUserComment(input) {
       const id = nextId("comment");
@@ -1664,6 +1731,7 @@ function startFakeLinearApi(): FakeLinearApi {
       issueStateUpdates.length = 0;
       issueDelegateId = null;
       issueStateId = "st-todo";
+      failingCommentWrites.length = 0;
       idCounter = 0;
     },
   };

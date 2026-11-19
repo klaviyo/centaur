@@ -935,6 +935,8 @@ async function runThreadTurn(input: {
   let body: string | undefined;
   let marker: LinearStatusMarker | undefined;
   let failed = false;
+  // Set when this reply carries the one-time "connect Linear" note.
+  let noticeUserId: string | undefined;
   for (let attempt = 0; attempt <= THREAD_TURN_MAX_RETRIES; attempt++) {
     try {
       // create + append context (idempotent), then execute + stream.
@@ -977,15 +979,18 @@ async function runThreadTurn(input: {
           collector.answer || fallback.text(),
         );
         marker = extracted.marker;
-        const note = requesterUnresolved
-          ? await claimRequesterNotice(thread, executeMessage.author.userId)
-          : false;
+        noticeUserId =
+          requesterUnresolved &&
+          (await requesterNoticeDue(thread, executeMessage.author.userId))
+            ? executeMessage.author.userId
+            : undefined;
         body = buildCommentReplyBody({
-          answer: note
-            ? `${extracted.text}\n\n${requesterUnlinkedNote(options.consolePublicUrl)}`
-            : extracted.text,
+          answer: extracted.text,
           cotLines: collector.cotLines,
           fallback: fallback.text(),
+          note: noticeUserId
+            ? requesterUnlinkedNote(options.consolePublicUrl)
+            : undefined,
         });
       }
       break;
@@ -1017,6 +1022,8 @@ async function runThreadTurn(input: {
       } else {
         await postIssueReply(client, { body, issueId, parentCommentId });
       }
+      // Only a delivered note counts, so a failed write shows it next turn.
+      if (noticeUserId) await recordRequesterNotice(thread, noticeUserId);
     } catch (error) {
       logger.warn("linearbot_thread_reply_failed", {
         error: errorMessage(error),
@@ -1053,20 +1060,28 @@ async function runThreadTurn(input: {
 }
 
 /**
- * Claims this thread's one-time "connect your Linear account" note for a
- * person, so their later turns in the thread don't repeat it. Re-reads the
- * state because the turn's start-of-run snapshot is stale by now.
+ * Whether this thread still owes a person its one-time "connect your Linear
+ * account" note. Re-reads the state because the turn's start-of-run snapshot
+ * is stale by now.
  */
-async function claimRequesterNotice(
+async function requesterNoticeDue(
   thread: Thread<LinearbotThreadState>,
   userId: string,
 ): Promise<boolean> {
   const noticed = ((await thread.state) ?? {}).requesterNoticeUserIds ?? [];
-  if (noticed.includes(userId)) return false;
+  return !noticed.includes(userId);
+}
+
+/** Records the note as delivered so the person's later turns skip it. */
+async function recordRequesterNotice(
+  thread: Thread<LinearbotThreadState>,
+  userId: string,
+): Promise<void> {
+  const noticed = ((await thread.state) ?? {}).requesterNoticeUserIds ?? [];
+  if (noticed.includes(userId)) return;
   await thread.setState({
     requesterNoticeUserIds: [...noticed, userId].slice(-200),
   });
-  return true;
 }
 
 /**

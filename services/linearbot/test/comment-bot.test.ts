@@ -107,4 +107,14 @@ describe("buildCommentReplyBody", () => {
     expect(body.startsWith("About a day.")).toBe(true);
     expect(body).toContain(">>> Chain of thought");
   });
+
+  it("keeps the note when the answer is truncated", () => {
+    const body = buildCommentReplyBody({
+      answer: "x".repeat(60_000),
+      cotLines: [],
+      note: "_Connect Linear._",
+    });
+    expect(body).toContain("[truncated]");
+    expect(body.endsWith("_Connect Linear._")).toBe(true);
+  });
 });
