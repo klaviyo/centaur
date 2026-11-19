@@ -283,6 +283,10 @@ spec:
             - name: CENTAUR_SESSION_PRINCIPAL_ADMISSION
               value: {{ .Values.apiRs.sessionPrincipalAdmission | quote }}
 {{- end }}
+{{- if not (hasKey .Values.apiRs.extraEnv "CENTAUR_LINKED_REQUESTER_POLICY") }}
+            - name: CENTAUR_LINKED_REQUESTER_POLICY
+              value: {{ .Values.apiRs.linkedRequesterPolicy | quote }}
+{{- end }}
             - name: CENTAUR_API_CLIENTS_ENABLED
               value: {{ .Values.apiClients.enabled | quote }}
 {{- if not (hasKey .Values.apiRs.extraEnv "CENTAUR_MCP_V2_ENABLED") }}

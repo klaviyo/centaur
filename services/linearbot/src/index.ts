@@ -47,6 +47,10 @@ import {
 } from "./linear-reactions";
 import { postIssueReply, updateIssueReply } from "./linear-reply";
 import {
+  requesterRefusedReply,
+  requesterUnlinkedNote,
+} from "./requester-notice";
+import {
   extractStatusMarker,
   fetchIssueStatus,
   kickoffTargetState,
@@ -59,6 +63,7 @@ import { extractMessageOverrides, resolveStickyProvider } from "./overrides";
 import {
   executeSessionTurn,
   forwardToSessionApi,
+  isRequesterNotLinkedError,
   isRetryableSessionApiError,
   LINEAR_ASSIGNMENT_AUTHOR_ID,
   openSessionEventStream,
@@ -76,6 +81,7 @@ import type {
   LinearbotThreadState,
   LinearbotTrace,
   LinearSessionCapableAdapter,
+  RequesterUnresolvedEvent,
 } from "./types";
 import {
   errorMessage,
@@ -841,6 +847,7 @@ async function runThreadTurn(input: {
     ? (issueContext.identifier ?? issueContext.title)
     : undefined;
   let lastEventId = threadState.lastEventId ?? 0;
+  let requesterUnresolved: RequesterUnresolvedEvent | undefined;
   const forwardInput: ForwardSessionInput = {
     afterEventId: lastEventId,
     contextPreamble,
@@ -856,6 +863,9 @@ async function runThreadTurn(input: {
       // Keep afterEventId in sync so a mid-stream retry resumes after the last
       // event seen instead of replaying the turn from the original watermark.
       forwardInput.afterEventId = lastEventId;
+    },
+    onRequesterUnresolved: (event) => {
+      requesterUnresolved = event;
     },
     openStream: false,
     threadId: threadKey,
@@ -953,7 +963,10 @@ async function runThreadTurn(input: {
         // failed first fetch re-seeds (not just the compact header) next time.
         ...(seededFullContext ? { contextSeeded: true } : {}),
       });
-      if (collector.failed) {
+      if (collector.failed && requesterUnresolved?.refused) {
+        failed = true;
+        body = requesterRefusedReply(options.consolePublicUrl);
+      } else if (collector.failed) {
         failed = true;
         body = buildCommentReplyBody({
           answer: `⚠️ I ran into an error before finishing:\n\n${collector.errorText || "unknown error"}`,
@@ -964,8 +977,13 @@ async function runThreadTurn(input: {
           collector.answer || fallback.text(),
         );
         marker = extracted.marker;
+        const note = requesterUnresolved
+          ? await claimRequesterNotice(thread, executeMessage.author.userId)
+          : false;
         body = buildCommentReplyBody({
-          answer: extracted.text,
+          answer: note
+            ? `${extracted.text}\n\n${requesterUnlinkedNote(options.consolePublicUrl)}`
+            : extracted.text,
           cotLines: collector.cotLines,
           fallback: fallback.text(),
         });
@@ -1032,6 +1050,23 @@ async function runThreadTurn(input: {
     chars: body?.length ?? 0,
     failed,
   });
+}
+
+/**
+ * Claims this thread's one-time "connect your Linear account" note for a
+ * person, so their later turns in the thread don't repeat it. Re-reads the
+ * state because the turn's start-of-run snapshot is stale by now.
+ */
+async function claimRequesterNotice(
+  thread: Thread<LinearbotThreadState>,
+  userId: string,
+): Promise<boolean> {
+  const noticed = ((await thread.state) ?? {}).requesterNoticeUserIds ?? [];
+  if (noticed.includes(userId)) return false;
+  await thread.setState({
+    requesterNoticeUserIds: [...noticed, userId].slice(-200),
+  });
+  return true;
 }
 
 /**
@@ -1220,6 +1255,9 @@ async function* streamSessionAfterHandoff(
         error: errorMessage(error),
       });
       if (isRetryableSessionApiError(error)) throw error;
+      if (isRequesterNotLinkedError(error)) {
+        input.onRequesterUnresolved?.({ refused: true });
+      }
       yield sessionStreamError(error);
       return;
     }

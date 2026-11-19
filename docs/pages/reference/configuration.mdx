@@ -80,6 +80,7 @@ for the operator workflow.
 | `CENTAUR_CONSOLE_OKTA_CLIENT_ID`, `CENTAUR_CONSOLE_OKTA_CLIENT_SECRET` | `secretManager.existingSecretName` when Okta login is enabled. | Okta OIDC web application credentials. |
 | `apiClients.enabled`, `CENTAUR_API_CLIENTS_ENABLED`, `CENTAUR_CONSOLE_API_CLIENTS_ENABLED` | Helm value, default `false`. | Enables [API clients](/operate/api-clients): the Console's **API Clients** page and api-rs `/oauth/token`. Off, api-rs also rejects API client tokens. |
 | `apiRs.syncInfraSecrets`, `IRON_CONTROL_SYNC_INFRA_SECRETS` | Helm value, default `true`. | Upserts the shared `infra` role and its harness/platform secrets. Set false only when another process owns that shared Console state. |
+| `apiRs.linkedRequesterPolicy`, `CENTAUR_LINKED_REQUESTER_POLICY` | Helm value, default `optional`. | What a Linear turn does when no Console user has linked the triggering Linear account: `optional` runs it with only the issue principal's grants, and `required` refuses it. See [Turn Requesters](/secrets/advanced-permissioning#turn-requesters). |
 | `IRON_CONTROL_URL`, `IRON_CONTROL_API_KEY` | Chart-rendered for api-rs; operator shell for `centaur-perms`. | Connects the runtime or CLI to the Console. |
 
 Default roles and default sandbox capabilities are stored in the Console, not

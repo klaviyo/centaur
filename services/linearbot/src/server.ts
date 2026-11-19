@@ -48,6 +48,7 @@ if (!postgresUrl) {
 const options: LinearbotOptions = {
   apiUrl,
   apiKey: optionalEnv("LINEARBOT_API_KEY"),
+  consolePublicUrl: optionalEnv("CENTAUR_CONSOLE_PUBLIC_URL"),
   defaultHarnessType: optionalEnv("LINEARBOT_DEFAULT_HARNESS"),
   idleTimeoutMs: optionalNumberEnv("SESSION_IDLE_TIMEOUT_MS"),
   linearAccessToken,

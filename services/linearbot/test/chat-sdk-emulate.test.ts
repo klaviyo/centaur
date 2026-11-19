@@ -853,6 +853,112 @@ function agentSessionCreatedPayload(input: {
   };
 }
 
+describe("linearbot unlinked requester", () => {
+  const CONSOLE_URL = "https://console.example.test";
+
+  it("tells an unlinked person once per thread how to connect Linear", async () => {
+    bot = createTestBot({ consolePublicUrl: CONSOLE_URL });
+    const threadKey = `linear:${ISSUE_ID}:c:comment-unlinked`;
+    await postWebhook(
+      commentCreatedPayload({
+        id: "comment-unlinked",
+        body: "@centaur what's left here?",
+      }),
+    );
+    await waitFor(() =>
+      codexApi.executes.some((e) => e.threadKey === threadKey),
+    );
+    codexApi.emitSessionEvent(threadKey, "session.requester_unresolved", {
+      provider: "linear",
+      reason: "not_linked",
+      refused: false,
+    });
+    codexApi.emitOutputLines(threadKey, sampleCodexOutputLines("Two tests."));
+    await waitFor(() =>
+      linearApi.botComments.some(
+        (c) =>
+          c.parentId === "comment-unlinked" && c.body.includes("Two tests."),
+      ),
+    );
+    const first = linearApi.botComments.find(
+      (c) => c.parentId === "comment-unlinked" && c.body.includes("Two tests."),
+    )!;
+    expect(first.body).toContain("isn't connected to Centaur");
+    expect(first.body).toContain(`${CONSOLE_URL}/console/integrations`);
+
+    await postWebhook(
+      commentCreatedPayload({
+        id: "comment-unlinked-2",
+        parentId: "comment-unlinked",
+        body: "@centaur and after that?",
+      }),
+    );
+    await waitFor(
+      () => codexApi.executes.filter((e) => e.threadKey === threadKey).length > 1,
+    );
+    codexApi.emitSessionEvent(threadKey, "session.requester_unresolved", {
+      provider: "linear",
+      reason: "not_linked",
+      refused: false,
+    });
+    codexApi.emitOutputLines(threadKey, sampleCodexOutputLines("Ship it."));
+    await waitFor(() =>
+      linearApi.botComments.some(
+        (c) => c.parentId === "comment-unlinked" && c.body.includes("Ship it."),
+      ),
+    );
+    const second = linearApi.botComments.find(
+      (c) => c.parentId === "comment-unlinked" && c.body.includes("Ship it."),
+    )!;
+    expect(second.body).not.toContain("isn't connected to Centaur");
+  });
+
+  it("adds no note when the requester was bound", async () => {
+    const threadKey = `linear:${ISSUE_ID}:c:comment-linked`;
+    await postWebhook(
+      commentCreatedPayload({ id: "comment-linked", body: "@centaur status?" }),
+    );
+    await waitFor(() =>
+      codexApi.executes.some((e) => e.threadKey === threadKey),
+    );
+    codexApi.emitOutputLines(threadKey, sampleCodexOutputLines("On track."));
+    await waitFor(() =>
+      linearApi.botComments.some(
+        (c) => c.parentId === "comment-linked" && c.body.includes("On track."),
+      ),
+    );
+    const reply = linearApi.botComments.find(
+      (c) => c.parentId === "comment-linked" && c.body.includes("On track."),
+    )!;
+    expect(reply.body).not.toContain("isn't connected to Centaur");
+  });
+
+  it("replies with the connect instructions when api-rs refuses the turn", async () => {
+    bot = createTestBot({ consolePublicUrl: CONSOLE_URL });
+    const threadKey = `linear:${ISSUE_ID}:c:comment-refused`;
+    codexApi.refuseExecutes(threadKey);
+    await postWebhook(
+      commentCreatedPayload({ id: "comment-refused", body: "@centaur fix it" }),
+    );
+    await waitFor(() =>
+      linearApi.botComments.some(
+        (c) =>
+          c.parentId === "comment-refused" &&
+          c.body.includes("I can't work on this yet"),
+      ),
+    );
+    const reply = linearApi.botComments.find(
+      (c) => c.parentId === "comment-refused",
+    )!;
+    expect(reply.body).toContain(`${CONSOLE_URL}/console/integrations`);
+    expect(reply.body).not.toContain("I ran into an error");
+    // A refusal is final: no retry storm against api-rs.
+    expect(
+      codexApi.executes.filter((e) => e.threadKey === threadKey),
+    ).toHaveLength(1);
+  });
+});
+
 function commentCreatedPayload(input: {
   body: string;
   id: string;
@@ -1590,6 +1696,8 @@ type MockSessionApi = {
     threadKey: string;
   }>;
   executes: MockSessionRequest<LinearbotExecuteSessionRequest>[];
+  /** Answer this thread's executes like api-rs refusing an unlinked requester. */
+  refuseExecutes(threadKey: string): void;
   reset(): void;
   url: string;
 };
@@ -1604,6 +1712,7 @@ function startMockCodexApi(): MockSessionApi {
     threadKey: string;
   }> = [];
   const idempotentExecutions = new Map<string, string>();
+  const refusedThreads = new Set<string>();
   type StreamHandle = {
     controller: ReadableStreamDefaultController<Uint8Array>;
     executionId?: string;
@@ -1672,6 +1781,17 @@ function startMockCodexApi(): MockSessionApi {
       if (request.method === "POST" && suffix === "execute") {
         const body = (await request.json()) as LinearbotExecuteSessionRequest;
         executes.push({ body, threadKey });
+        if (refusedThreads.has(threadKey)) {
+          return Response.json(
+            {
+              code: "requester_not_linked",
+              error: "no Console user has linked linear account user-1",
+              ok: false,
+              provider: "linear",
+            },
+            { status: 403 },
+          );
+        }
         const idempotencyKey = `${threadKey}:${body.idempotency_key ?? ""}`;
         let executionId = idempotentExecutions.get(idempotencyKey);
         if (!executionId) {
@@ -1732,6 +1852,9 @@ function startMockCodexApi(): MockSessionApi {
     emitSessionEvent(threadKey, event, data, executionId) {
       emit(threadKey, event, JSON.stringify(data), executionId);
     },
+    refuseExecutes(threadKey) {
+      refusedThreads.add(threadKey);
+    },
     close() {
       server.stop(true);
     },
@@ -1741,6 +1864,7 @@ function startMockCodexApi(): MockSessionApi {
       eventRequests.length = 0;
       executes.length = 0;
       idempotentExecutions.clear();
+      refusedThreads.clear();
       pendingEvents.clear();
       for (const handles of streams.values()) {
         for (const handle of handles) {
