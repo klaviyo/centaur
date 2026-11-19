@@ -2628,6 +2628,8 @@ impl SessionRuntime {
         let session = self.store.get_session(thread_key).await?;
         validate_input_lines(&input.input_lines)?;
         let _ = duration_options(input.idle_timeout_ms, input.max_duration_ms)?;
+        self.refuse_unlinked_requester(thread_key, input.metadata.as_ref())
+            .await?;
         // The persisted request keeps the caller's lines; the driver pins
         // them to the persona model when it writes them to the sandbox.
         let persona_model = self.persona_model(&session);
@@ -3512,6 +3514,45 @@ impl SessionRuntime {
             );
         }
         result
+    }
+
+    /// Under [`LinkedRequesterPolicy::Required`], refuse an unlinked requester
+    /// before the turn is queued, so the caller gets the refusal on its request
+    /// instead of a queued execution that fails later. Any other lookup outcome
+    /// admits the turn; dispatch resolves the requester again, which also
+    /// catches an account unlinked in between.
+    async fn refuse_unlinked_requester(
+        &self,
+        thread_key: &ThreadKey,
+        metadata: Option<&Value>,
+    ) -> Result<(), SessionRuntimeError> {
+        if self.linked_requester_policy != LinkedRequesterPolicy::Required {
+            return Ok(());
+        }
+        match self
+            .iron_control
+            .register_requester(
+                thread_key.as_str(),
+                metadata,
+                self.session_principal_admission.create_if_missing(),
+            )
+            .await
+        {
+            Err(IronControlError::RequesterNotLinked { provider, subject }) => {
+                info!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_requester_not_linked",
+                    thread_key = %thread_key,
+                    provider,
+                    refused = true,
+                    "requester has not linked their account; refusing the turn"
+                );
+                Err(SessionRuntimeError::IronControl(
+                    IronControlError::RequesterNotLinked { provider, subject },
+                ))
+            }
+            Ok(_) | Err(_) => Ok(()),
+        }
     }
 
     /// Resolve and upsert the principal of the human requesting this turn from
@@ -12154,6 +12195,67 @@ mod adoption_tests {
             .find(|event| event.event_type == "session.requester_unresolved")
             .expect("the refusal is recorded on the thread");
         assert_eq!(unresolved.payload["refused"], json!(true));
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn required_linked_requester_refuses_before_enqueueing() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url))
+                .with_linked_requester_policy(LinkedRequesterPolicy::Required);
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+
+        let error = runtime
+            .enqueue_session_execution(
+                &thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: None,
+                    metadata: Some(json!({"linear_user_id": "lin-user-1"})),
+                    input_lines: vec![
+                        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#
+                            .to_owned(),
+                    ],
+                    idle_timeout_ms: None,
+                    max_duration_ms: None,
+                },
+            )
+            .await
+            .expect_err("the HTTP path refuses an unlinked requester up front");
+        assert!(matches!(
+            error,
+            SessionRuntimeError::IronControl(IronControlError::RequesterNotLinked { .. })
+        ));
+        assert!(
+            store
+                .latest_execution_for_thread(&thread_key)
+                .await
+                .expect("load latest execution")
+                .is_none(),
+            "a refused turn is never queued"
+        );
+        assert!(backend.created_specs().is_empty());
         server.abort();
         reset_test_store(&store).await;
     }
