@@ -613,6 +613,7 @@ dependencies = [
  "clap",
  "eyre",
  "flate2",
+ "futures-util",
  "hex",
  "oxc",
  "reqwest",
@@ -622,6 +623,7 @@ dependencies = [
  "sha2 0.11.1",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "toml",
  "tower",
  "tracing",
@@ -3741,6 +3743,7 @@ checksum = "0a278f8bfd48b5f7eab27690679616e94d9d316a4f09dd2e57710a0d9bc37cbd"
 dependencies = [
  "oxc_allocator",
  "oxc_ast",
+ "oxc_ast_visit",
  "oxc_codegen",
  "oxc_diagnostics",
  "oxc_isolated_declarations",

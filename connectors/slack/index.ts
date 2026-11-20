@@ -385,6 +385,23 @@ export async function thread_replies(
   return { messages: body.messages ?? [], has_more: Boolean(body.has_more), next_cursor: nextCursor(body) };
 }
 
+/**
+ * Member user IDs of a conversation (C…, G… or D…), as Slack's `conversations.members` returns
+ * them; resolve each with `user_details` or match against `users`. Through Centaur this needs
+ * the caller's history grant on the channel. Follow `next_cursor` as `cursor`; `limit` at most
+ * 1000.
+ */
+export async function channel_members(
+  args: { channel: string; limit?: number; cursor?: string },
+  ctx: Ctx,
+): Promise<{ members: string[]; next_cursor: string | null }> {
+  const params: Params = { limit: args.limit === undefined ? undefined : Math.min(args.limit, 1000), cursor: args.cursor };
+  const body = access(ctx) === "centaur"
+    ? await centaur(ctx, `/api/slack/channels/${seg(args.channel)}/members`, params)
+    : await slackGet(ctx, "conversations.members", { ...params, channel: args.channel.trim() });
+  return { members: body.members ?? [], next_cursor: nextCursor(body) };
+}
+
 /** A message's permalink by conversation ID and ts. */
 export async function permalink(args: { channel: string; ts: string }, ctx: Ctx): Promise<{ permalink: string }> {
   const body = access(ctx) === "centaur"
@@ -432,6 +449,8 @@ export async function user_details(args: { user: string }, ctx: Ctx): Promise<{ 
  * `channel` is the conversation the file is shared in, required through the Centaur API. `path`
  * defaults to `downloads/slack/<file name>`. Read it back with `files.read` or hand it to another
  * tool.
+ *
+ * @requires files
  */
 export async function download_file(
   args: { file: string; channel?: string; path?: string },
@@ -500,6 +519,8 @@ export async function add_reaction(
  * Write: upload a file from the sandbox (`path`, for example one saved by `download_file` or
  * `files.write`) and share it into `channel`, optionally in a thread. `filename` defaults to the
  * path's last segment; the file is streamed from disk, not read into the cell.
+ *
+ * @requires files
  */
 export async function upload_file(
   args: { channel: string; path: string; filename?: string; title?: string; initial_comment?: string; thread_ts?: string },
