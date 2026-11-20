@@ -1,8 +1,8 @@
 module CredentialProfiles
   # GitHub API clients authenticate with Bearer/token while Git-over-HTTPS uses
   # HTTP Basic. Replacing a placeholder preserves the scheme selected by each
-  # client and confines the credential to GitHub's API, Git, and hosted MCP
-  # server hosts.
+  # client and confines the credential to GitHub's API, Git, hosted MCP server,
+  # and the pull request attachment upload endpoint.
   module GithubToken
     KIND = "github_token"
     REPLACE_CONFIG = {
@@ -10,10 +10,17 @@ module CredentialProfiles
       "match_headers" => [ "Authorization" ],
       "require" => false
     }.freeze
+    ATTACHMENT_UPLOAD_RULE = {
+      host: "uploads.github.com",
+      http_methods: [ "POST" ],
+      paths: [ "/user-attachments/assets" ],
+      position: 3
+    }.freeze
     RULE_ATTRIBUTES = [
       { host: "api.github.com", http_methods: [], paths: [], position: 0 },
       { host: "github.com", http_methods: [], paths: [], position: 1 },
-      { host: "api.githubcopilot.com", http_methods: [], paths: [], position: 2 }
+      { host: "api.githubcopilot.com", http_methods: [], paths: [], position: 2 },
+      ATTACHMENT_UPLOAD_RULE
     ].freeze
     ALLOWED_HOSTS = RULE_ATTRIBUTES.map { |attributes| attributes[:host] }.freeze
 
@@ -40,8 +47,10 @@ module CredentialProfiles
     def validate_rules(secret, rules:)
       actual = Array(rules)
       confined = actual.present? && actual.all? do |rule|
-        ALLOWED_HOSTS.include?(rule.host) &&
-          rule.cidr.blank? && rule.http_methods.blank? && rule.paths.blank?
+        RULE_ATTRIBUTES.any? do |allowed|
+          rule.host == allowed[:host] && rule.cidr.blank? &&
+            rule.http_methods == allowed[:http_methods] && rule.paths == allowed[:paths]
+        end
       end
       return if confined
 

@@ -573,7 +573,9 @@ module Oauth
       assert_equal "gho-user-token", cred.access_token
       assert_nil cred.refresh_token
       assert_nil cred.next_attempt_at
-      assert_equal [ "api.github.com", "github.com", "api.githubcopilot.com" ], cred.static_secret.rules.map(&:host)
+      assert_equal %w[api.github.com github.com api.githubcopilot.com uploads.github.com], cred.static_secret.rules.map(&:host)
+      assert_equal({ "host" => "uploads.github.com", "methods" => [ "POST" ], "paths" => [ "/user-attachments/assets" ] },
+                   cred.static_secret.rules.last.to_proxy_rule)
       assert_equal "GitHub – Octo Cat token", cred.static_secret.name
       assert_equal "github_token", cred.static_secret.kind
       assert_nil cred.static_secret.inject_config
