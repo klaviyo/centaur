@@ -90,6 +90,11 @@ export type LinearbotFetch = (
 
 export type LinearbotOptions = {
   apiKey?: string;
+  /**
+   * Console's public base URL, used to link people to the page where they
+   * connect their Linear account. Unset falls back to naming the page.
+   */
+  consolePublicUrl?: string;
   apiUrl: string;
   /**
    * Reasoning effort per turn type. This bot's turns are mostly autonomous, so
@@ -165,9 +170,18 @@ export type LinearbotThreadState = {
    * bot ran a turn for, so a redelivered Issue webhook doesn't re-run.
    */
   lastAssignmentTrigger?: string;
+  /**
+   * Linear user ids already told, in this thread, that their turns run without
+   * their own permissions until they connect Linear. Capped FIFO.
+   */
+  requesterNoticeUserIds?: string[];
 };
 
 export type LinearbotRendererSource = RustSessionStreamEvent | JsonObject;
+
+export type RequesterUnresolvedEvent = {
+  refused: boolean;
+};
 
 export type LinearbotTrace = {
   includeContext: boolean;
@@ -204,6 +218,12 @@ export type ForwardSessionInput = {
   /** Per-turn model provider override parsed from message flags (--meta). */
   provider?: string;
   onEventId(eventId: number): void;
+  /**
+   * Fires when api-rs could not bind the triggering person as the turn's
+   * requester because they have not linked their Linear account. `refused`
+   * means the deployment refused the turn instead of running it without them.
+   */
+  onRequesterUnresolved?(event: RequesterUnresolvedEvent): void;
   openStream: boolean;
   threadId: string;
   trace?: LinearbotTrace;

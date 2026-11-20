@@ -143,6 +143,7 @@ async fn initialize_runtime(args: Args, app_state: AppState) -> Result<(), Serve
     let iron_control = args.iron_control_runtime().await?;
     let mut runtime = SessionRuntime::new(store.clone(), sandbox_runtime, iron_control.registrar)
         .with_session_principal_admission(args.session_principal_admission())
+        .with_linked_requester_policy(args.linked_requester_policy())
         .with_openai_session_title_generator_from_env();
     runtime = runtime.with_personas(args.persona_registry()?);
     if centaur_api_server::mcp_codemode_enabled() {

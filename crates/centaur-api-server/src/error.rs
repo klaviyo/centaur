@@ -75,7 +75,8 @@ impl IntoResponse for ApiError {
                 centaur_iron_control::IronControlError::PrincipalDerivation(_),
             )) => StatusCode::BAD_REQUEST,
             Self::Runtime(SessionRuntimeError::IronControl(
-                centaur_iron_control::IronControlError::SessionPrincipalNotPreapproved { .. },
+                centaur_iron_control::IronControlError::SessionPrincipalNotPreapproved { .. }
+                | centaur_iron_control::IronControlError::RequesterNotLinked { .. },
             )) => StatusCode::FORBIDDEN,
             Self::Workflow(WorkflowRuntimeError::BadRequest(_)) => StatusCode::BAD_REQUEST,
             Self::Workflow(WorkflowRuntimeError::Disabled(_)) => StatusCode::FORBIDDEN,
@@ -131,6 +132,15 @@ impl IntoResponse for ApiError {
         )) = &self
         {
             body["code"] = json!("session_principal_not_preapproved");
+        }
+        // Lets the ingress tell the person how to link their account instead of
+        // surfacing a generic failure.
+        if let Self::Runtime(SessionRuntimeError::IronControl(
+            centaur_iron_control::IronControlError::RequesterNotLinked { provider, .. },
+        )) = &self
+        {
+            body["code"] = json!("requester_not_linked");
+            body["provider"] = json!(provider);
         }
         let mut response = (status, Json(body)).into_response();
         if status == StatusCode::UNAUTHORIZED {
@@ -189,6 +199,25 @@ mod tests {
             .expect("read response body");
         let body: serde_json::Value = serde_json::from_slice(&body).expect("decode response body");
         assert_eq!(body["code"], "session_principal_not_preapproved");
+    }
+
+    #[tokio::test]
+    async fn unlinked_requesters_are_forbidden_with_a_stable_code() {
+        let response = ApiError::Runtime(SessionRuntimeError::IronControl(
+            IronControlError::RequesterNotLinked {
+                provider: "linear",
+                subject: "lin-user-1".to_owned(),
+            },
+        ))
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("decode response body");
+        assert_eq!(body["code"], "requester_not_linked");
+        assert_eq!(body["provider"], "linear");
     }
 
     #[tokio::test]

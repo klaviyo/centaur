@@ -15,6 +15,7 @@ import type {
   LinearbotOptions,
   LinearbotRendererSource,
   LinearbotSessionMessage,
+  RequesterUnresolvedEvent,
 } from "./types";
 import {
   elapsedMs,
@@ -51,6 +52,17 @@ export class SessionApiError extends Error {
     this.retryable = input.retryable;
     this.status = input.status;
     this.statusText = input.statusText;
+  }
+}
+
+/** api-rs refused the turn because its requester has not linked their account. */
+export function isRequesterNotLinkedError(error: unknown): boolean {
+  if (!(error instanceof SessionApiError) || error.status !== 403) return false;
+  try {
+    const body = JSON.parse(error.body) as { code?: unknown };
+    return body.code === "requester_not_linked";
+  } catch {
+    return false;
   }
 }
 
@@ -237,7 +249,12 @@ export async function openSessionEventStream(
   options: LinearbotOptions,
   input: Pick<
     ForwardSessionInput,
-    "afterEventId" | "executionId" | "onEventId" | "threadId" | "trace"
+    | "afterEventId"
+    | "executionId"
+    | "onEventId"
+    | "onRequesterUnresolved"
+    | "threadId"
+    | "trace"
   >,
 ): Promise<AsyncIterable<LinearbotRendererSource>> {
   const streamStartedAtMs = nowMs();
@@ -247,6 +264,7 @@ export async function openSessionEventStream(
     input.afterEventId,
     input.executionId,
     input.onEventId,
+    input.onRequesterUnresolved,
   );
   traceLog(options, "linearbot_session_events_opened", input.trace, {
     after_event_id: input.afterEventId,
@@ -598,6 +616,7 @@ async function streamSessionNotifications(
   afterEventId: number,
   executionId: string | undefined,
   onEventId: (eventId: number) => void,
+  onRequesterUnresolved?: (event: RequesterUnresolvedEvent) => void,
 ): Promise<AsyncIterable<LinearbotRendererSource>> {
   const fetchFn = options.fetch ?? fetch;
   const url = new URL(apiSessionUrl(options.apiUrl, threadId, "events"));
@@ -609,7 +628,11 @@ async function streamSessionNotifications(
   });
   await ensureApiOk(response, "stream events", options);
   if (!response.body) return toAsyncIterable([]);
-  return parseSessionEventStream(response.body, onEventId);
+  return parseSessionEventStream(
+    response.body,
+    onEventId,
+    onRequesterUnresolved,
+  );
 }
 
 function apiSessionUrl(
@@ -904,9 +927,20 @@ type ParsedSessionEvent = {
 async function* parseSessionEventStream(
   stream: ReadableStream<Uint8Array>,
   onEventId: (eventId: number) => void,
+  onRequesterUnresolved?: (event: RequesterUnresolvedEvent) => void,
 ): AsyncIterable<LinearbotRendererSource> {
   for await (const event of parseSseEvents(stream)) {
     if (typeof event.id === "number") onEventId(event.id);
+    if (event.event === "session.requester_unresolved") {
+      const data = sessionEventData(event);
+      onRequesterUnresolved?.({
+        refused:
+          typeof data === "object" &&
+          data !== null &&
+          (data as { refused?: unknown }).refused === true,
+      });
+      continue;
+    }
     if (event.event === "session.output.line") {
       yield {
         data: event.data,

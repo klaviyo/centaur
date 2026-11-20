@@ -33,8 +33,9 @@ use centaur_sandbox_core::{Mount, MountKind, ResourceRequirements, SandboxSpec};
 use centaur_sandbox_manager::{SandboxReaperConfig, WarmPoolConfig};
 use centaur_session_core::{HarnessType, SandboxRepoCacheAccess};
 use centaur_session_runtime::{
-    PersonaRegistry, SandboxCapacityConfig, SandboxWorkloadMode, SessionEventRetentionConfig,
-    SessionPrincipalAdmission, SessionSandboxCleanupConfig, WarmPoolTarget,
+    LinkedRequesterPolicy, PersonaRegistry, SandboxCapacityConfig, SandboxWorkloadMode,
+    SessionEventRetentionConfig, SessionPrincipalAdmission, SessionSandboxCleanupConfig,
+    WarmPoolTarget,
 };
 use centaur_session_sqlx::TextSearchBackend;
 use centaur_workflows::{WorkflowHostSandboxRuntime, WorkflowPrincipalRegistrar};
@@ -85,6 +86,16 @@ pub(crate) struct Args {
         value_enum
     )]
     session_principal_admission: SessionPrincipalAdmissionArg,
+    /// What a turn does when its ingress names a linked requester (a Linear
+    /// user) whom no Console user has linked: run on the conversation
+    /// principal's grants alone (`optional`) or refuse the turn (`required`).
+    #[arg(
+        long = "linked-requester-policy",
+        env = "CENTAUR_LINKED_REQUESTER_POLICY",
+        default_value = "optional",
+        value_enum
+    )]
+    linked_requester_policy: LinkedRequesterPolicyArg,
     #[command(flatten)]
     activity_summary: ActivitySummaryArgs,
 }
@@ -153,6 +164,13 @@ impl Args {
         }
     }
 
+    pub(crate) fn linked_requester_policy(&self) -> LinkedRequesterPolicy {
+        match self.linked_requester_policy {
+            LinkedRequesterPolicyArg::Optional => LinkedRequesterPolicy::Optional,
+            LinkedRequesterPolicyArg::Required => LinkedRequesterPolicy::Required,
+        }
+    }
+
     pub(crate) async fn workflow_host_sandbox_runtime(
         &self,
         bootstrap_iron_control_principal: &str,
@@ -180,6 +198,12 @@ impl Args {
 enum SessionPrincipalAdmissionArg {
     Automatic,
     Preapproved,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LinkedRequesterPolicyArg {
+    Optional,
+    Required,
 }
 
 pub(crate) struct IronControlRuntime {
