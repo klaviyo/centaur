@@ -79,8 +79,8 @@ module Api
         assert_equal CredentialProfiles::GithubToken::REPLACE_CONFIG, data["replace_config"]
         assert_equal %w[api.github.com github.com api.githubcopilot.com uploads.github.com],
                      data["rules"].map { |rule| rule["host"] }
-        assert_equal [ "POST" ], data["rules"].last["http_methods"]
-        assert_equal [ "/user-attachments/assets" ], data["rules"].last["paths"]
+        assert_empty data["rules"].last["http_methods"]
+        assert_empty data["rules"].last["paths"]
       end
 
       test "POST rejects configuration that conflicts with the selected profile" do

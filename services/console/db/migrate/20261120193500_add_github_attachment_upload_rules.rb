@@ -15,9 +15,8 @@ class AddGithubAttachmentUploadRules < ActiveRecord::Migration[8.1]
             AND cidr IS NULL AND http_methods = '[]'::jsonb AND paths = '[]'::jsonb
           )
       ), added AS (
-        INSERT INTO request_rules (static_secret_id, position, host, http_methods, paths, created_at, updated_at)
-        SELECT static_secret_id, position, 'uploads.github.com', '["POST"]'::jsonb,
-          '["/user-attachments/assets"]'::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+        INSERT INTO request_rules (static_secret_id, position, host, created_at, updated_at)
+        SELECT static_secret_id, position, 'uploads.github.com', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
         FROM eligible
         RETURNING static_secret_id
       ), affected_grants AS (

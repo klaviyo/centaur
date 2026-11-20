@@ -34,12 +34,12 @@ module CredentialProfiles
                       "github_token credentials must target only api.github.com, github.com, api.githubcopilot.com, uploads.github.com"
     end
 
-    test "does not allow credentials on the entire upload host" do
+    test "allows credentials on the exact upload host" do
       secret = StaticSecret.new(kind: "github_token")
       secret.rules = secret.apply_kind_defaults(rules: [ RequestRule.new(host: "uploads.github.com") ])
 
-      assert_not secret.valid?
-      assert secret.errors[:rules].present?
+      assert secret.valid?, secret.errors.full_messages.inspect
+      assert_equal({ "host" => "uploads.github.com" }, secret.rules.first.to_proxy_rule)
     end
 
     test "accepts secrets seeded before a host was added to the canonical set" do
