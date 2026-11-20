@@ -40,6 +40,163 @@ class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
     assert_equal [ skills(:admin_shared).oid ], ids
   end
 
+  test "channel requester creates private and shared skills as its linked user" do
+    @channel_proxy.update!(requester_principal: slack_requester(users(:member_user)))
+
+    %w[private shared].each do |visibility|
+      with_token(@channel_proxy) do |headers|
+        post "/api/v1/sandbox/skills",
+             params: { data: { name: "channel-#{visibility}", description: "Requested in a channel.",
+                               instructions: "# Channel checks", visibility: visibility } },
+             headers: headers,
+             as: :json
+      end
+      assert_response :created
+      skill = users(:member_user).skills.find_by!(name: "channel-#{visibility}")
+      assert_equal visibility, skill.visibility
+      assert_equal visibility == "shared", skill.shared_at.present?
+    end
+  end
+
+  test "channel requester uses its private skill catalog and existing editor permissions" do
+    @channel_proxy.update!(requester_principal: slack_requester(users(:member_user)))
+    editable = skills(:other_private)
+    editable.editors << users(:member_user)
+
+    with_token(@channel_proxy) do |headers|
+      get "/api/v1/sandbox/skills", params: { scope: "private" }, headers: headers
+      assert_response :ok
+      assert_equal [ skills(:member_private).oid, editable.oid ].sort,
+                   json_body.fetch("data").pluck("id").sort
+
+      get "/api/v1/sandbox/skills/search", params: { q: "production incidents" }, headers: headers
+      assert_response :ok
+      assert_equal [ skills(:member_private).oid ], json_body.fetch("data").pluck("id")
+
+      [ editable.name, editable.oid ].each do |identifier|
+        get "/api/v1/sandbox/skills/#{identifier}", headers: headers
+        assert_response :ok
+        assert_equal editable.skill_document, json_body.dig("data", "document")
+      end
+
+      patch "/api/v1/sandbox/skills/#{editable.oid}",
+            params: { data: { instructions: "Updated by the current requester." } }, headers: headers, as: :json
+      assert_response :ok
+      assert_equal "Updated by the current requester.", editable.reload.content
+
+      delete "/api/v1/sandbox/skills/#{editable.oid}", headers: headers
+      assert_response :not_found
+      assert_nil editable.reload.archived_at
+    end
+  end
+
+  test "switching and clearing channel requesters changes access with the same token" do
+    original = users(:member_user)
+    next_user = users(:acme_admin)
+    @channel_proxy.update!(requester_principal: slack_requester(original))
+
+    with_token(@channel_proxy) do |headers|
+      get "/api/v1/sandbox/skills/#{skills(:member_private).oid}", headers: headers
+      assert_response :ok
+
+      @channel_proxy.update!(requester_principal: slack_requester(next_user, slack_user_id: "U2222222222"))
+      get "/api/v1/sandbox/skills", headers: headers
+      assert_response :ok
+      refute_includes json_body.fetch("data").pluck("id"), skills(:member_private).oid
+      assert_includes json_body.fetch("data").pluck("id"), skills(:other_private).oid
+
+      get "/api/v1/sandbox/skills/search", params: { q: "production incidents" }, headers: headers
+      assert_response :ok
+      assert_empty json_body.fetch("data")
+
+      [ skills(:member_private).name, skills(:member_private).oid ].each do |identifier|
+        get "/api/v1/sandbox/skills/#{identifier}", headers: headers
+        assert_response :not_found
+      end
+      patch "/api/v1/sandbox/skills/#{skills(:member_private).oid}",
+            params: { data: { instructions: "Cannot edit the previous requester's skill." } }, headers: headers, as: :json
+      assert_response :not_found
+
+      post "/api/v1/sandbox/skills",
+           params: { data: { name: "next-requester-skill", description: "Owned by the next requester.",
+                             instructions: "# Checks", visibility: "private" } }, headers: headers, as: :json
+      assert_response :created
+      assert_equal next_user, Skill.find_by!(name: "next-requester-skill").user
+
+      @channel_proxy.update!(requester_principal: nil)
+      get "/api/v1/sandbox/skills", headers: headers
+      assert_response :ok
+      assert_equal [ skills(:admin_shared).oid ], json_body.fetch("data").pluck("id")
+
+      patch "/api/v1/sandbox/skills/#{skills(:other_private).oid}",
+            params: { data: { instructions: "No requester remains." } }, headers: headers, as: :json
+      assert_response :forbidden
+    end
+  end
+
+  test "channel skill access never falls back to the channel's linked user" do
+    @channel_proxy.principal.update!(console_user: users(:acme_admin))
+    requesters = [
+      nil,
+      @member_proxy.principal,
+      slack_requester(users(:member_user), team_id: "T0EXTERNAL1"),
+      slack_requester(users(:member_user), team_id: nil),
+      slack_requester(users(:member_user), slack_user_id: nil),
+      slack_requester(nil),
+      slack_requester(users(:pending_user)),
+      slack_requester(users(:disabled_user))
+    ]
+
+    requesters.each do |requester|
+      @channel_proxy.update!(requester_principal: requester)
+      with_token(@channel_proxy) do |headers|
+        get "/api/v1/sandbox/skills", headers: headers
+        assert_response :ok
+        assert_equal [ skills(:admin_shared).oid ], json_body.fetch("data").pluck("id")
+
+        assert_no_difference("Skill.count") do
+          post "/api/v1/sandbox/skills",
+               params: { data: { name: "forbidden-channel-skill", description: "Must not be created.",
+                                 instructions: "# Checks", visibility: "private" } }, headers: headers, as: :json
+        end
+        assert_response :forbidden
+      end
+    end
+  end
+
+  test "disabling a channel requester's linked user immediately revokes skill access" do
+    user = users(:member_user)
+    @channel_proxy.update!(requester_principal: slack_requester(user))
+
+    with_token(@channel_proxy) do |headers|
+      get "/api/v1/sandbox/skills/#{skills(:member_private).oid}", headers: headers
+      assert_response :ok
+
+      user.update!(status: :disabled)
+      get "/api/v1/sandbox/skills/#{skills(:member_private).oid}", headers: headers
+      assert_response :not_found
+
+      patch "/api/v1/sandbox/skills/#{skills(:member_private).oid}",
+            params: { data: { instructions: "Must not change." } }, headers: headers, as: :json
+      assert_response :forbidden
+    end
+  end
+
+  test "DM principal keeps its own user even when a requester is assigned" do
+    @member_proxy.update!(
+      principal: slack_requester(users(:member_user)),
+      requester_principal: slack_requester(users(:globex_admin))
+    )
+
+    with_token(@member_proxy) do |headers|
+      get "/api/v1/sandbox/skills/#{skills(:member_private).oid}", headers: headers
+      assert_response :ok
+
+      get "/api/v1/sandbox/skills/#{skills(:other_private).oid}", headers: headers
+      assert_response :not_found
+    end
+  end
+
   test "search is principal scoped and read returns current content" do
     with_token(@member_proxy) do |headers|
       get "/api/v1/sandbox/skills/search", params: { q: "production incidents" }, headers: headers
@@ -542,6 +699,19 @@ class Api::V1::SandboxSkillsControllerTest < ActionDispatch::IntegrationTest
   end
 
   private
+
+  def slack_requester(user, slack_user_id: "U0123456789", team_id: "T0123456789")
+    Principal.create!(
+      foreign_id: "channel-requester-#{SecureRandom.hex(8)}",
+      name: "Channel requester",
+      kind: :slack_dm,
+      slack_user_id: slack_user_id,
+      slack_team_id: team_id,
+      console_user: user,
+      labels: {},
+      created_by: users(:member_user)
+    )
+  end
 
   def with_token(proxy)
     with_env("CENTAUR_JWT_SIGNING_SECRET" => "test-secret") do

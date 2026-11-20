@@ -135,8 +135,19 @@ module Api
         end
 
         def linked_console_user
-          user = current_proxy.principal.console_user
+          principal = current_proxy.principal
+          principal = channel_requester if principal.kind == "slack_channel"
+          user = principal&.console_user
           user if user&.active?
+        end
+
+        # A channel keeps its own permissions, but personal skill access and
+        # authorship follow the human whose turn is currently running.
+        def channel_requester
+          requester = current_proxy.requester_principal
+          return unless requester&.kind == "slack_dm" && requester.slack_user_id.present?
+
+          requester if requester.slack_team_id.present? && SlackBotChannel.exists?(team_id: requester.slack_team_id)
         end
 
         def authoring_user

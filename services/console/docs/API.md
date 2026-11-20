@@ -1591,7 +1591,7 @@ Console stores and validates `name`, `description`, and Markdown `instructions` 
 
 ### Sandbox Operations
 
-These endpoints use the existing sandbox entitlement JWT injected by `iron-proxy`. Principals linked to an active Console user can see that user's private skills, private skills they have been added to as a reader or editor, and every public skill. Other principals can see public skills only. Mutations require an active Console user linked to the sandbox principal. Owners can perform every mutation on their skills, while editors can update skill content but cannot share, unshare, or archive the skill.
+These endpoints use the existing sandbox entitlement JWT injected by `iron-proxy`. Principals linked to an active Console user can see that user's private skills, private skills they have been added to as a reader or editor, and every public skill. In Slack channel sessions, skill access and authorship instead use the proxy's current requester principal: it must identify a Slack user in a workspace where the bot is installed and link to an active Console user. The channel's own linked user is never a fallback. The requester binding is read on every request, so switching or clearing it changes skill access immediately. Other principals can see public skills only. Mutations require an active Console user resolved this way. Owners can perform every mutation on their skills, while editors can update skill content but cannot share, unshare, or archive the skill.
 
 | Method | Path | Notes |
 | ------ | ---- | ----- |
