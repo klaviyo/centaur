@@ -53,6 +53,10 @@ use crate::{
     api_jwt::{bearer_jwt_from_headers, decode_jwt_payload, verify_console_jwt},
     auth::{ApiAuthConfig, AuthenticatedCaller, CallerClass, Capability, LINEARBOT_IDENTITY},
     mcp::{mcp_get, mcp_post, mcp_protected_resource_metadata},
+    pr_bindings::{
+        dispatch_pr_followup, enqueue_pr_followup, get_pr_binding, list_pr_followup_executions,
+        register_pr_binding, stream_pr_followup_events, update_pr_binding_state, verify_pr_binding,
+    },
     slack_external_teams::{get_slack_external_team_ids, replace_slack_external_team_ids},
     slack_proxy::slack_proxy_router,
     types::{
@@ -255,6 +259,38 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             "/api/session/{thread_key}/sandbox",
             delete(release_session_sandbox),
         )
+        .route(
+            "/api/session/{thread_key}/pr-bindings",
+            post(register_pr_binding),
+        )
+        .route(
+            "/api/pr-bindings/{owner}/{repo}/{number}",
+            get(get_pr_binding),
+        )
+        .route(
+            "/api/pr-bindings/{owner}/{repo}/{number}/verify",
+            post(verify_pr_binding),
+        )
+        .route(
+            "/api/pr-bindings/{owner}/{repo}/{number}/state",
+            post(update_pr_binding_state),
+        )
+        .route(
+            "/api/pr-bindings/{owner}/{repo}/{number}/followups",
+            post(enqueue_pr_followup),
+        )
+        .route(
+            "/api/pr-bindings/{owner}/{repo}/{number}/dispatch",
+            post(dispatch_pr_followup),
+        )
+        .route(
+            "/api/pr-bindings/{owner}/{repo}/{number}/executions/{execution_id}/events",
+            get(stream_pr_followup_events),
+        )
+        .route(
+            "/api/pr-followups/executions",
+            get(list_pr_followup_executions),
+        )
         .route("/api/sandboxes/drain", post(drain_sandboxes))
         .route(
             "/api/slack/external-team-ids",
@@ -426,6 +462,9 @@ async fn metrics(State(state): State<AppState>) -> Response {
 enum RouteAccess {
     Capability(Capability),
     PrincipalOnly,
+    /// A principal acting on its own session (the handler checks ownership),
+    /// or the Console operator.
+    PrincipalOrConsole,
     /// Session write access, held by an API client (confined to its own
     /// namespace) or an operator; ingress keys are excluded.
     ApiClientOrOperatorSessionWrite,
@@ -480,6 +519,12 @@ async fn authorize_api_request(
     let allowed = match access {
         RouteAccess::Capability(capability) => caller.has_capability(capability),
         RouteAccess::PrincipalOnly => caller.class() == CallerClass::Principal,
+        RouteAccess::PrincipalOrConsole => {
+            matches!(
+                caller.class(),
+                CallerClass::Principal | CallerClass::Console
+            )
+        }
         RouteAccess::ApiClientOrOperatorSessionWrite => {
             caller.has_capability(Capability::SessionsWrite)
                 && matches!(
@@ -571,6 +616,19 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
         | (&Method::POST, "/api/session/{thread_key}/interrupt") => {
             capability(Capability::SessionsWrite)
         }
+        (&Method::POST, "/api/session/{thread_key}/pr-bindings") => {
+            Some(RouteAccess::PrincipalOrConsole)
+        }
+        (&Method::GET, "/api/pr-bindings/{owner}/{repo}/{number}")
+        | (&Method::POST, "/api/pr-bindings/{owner}/{repo}/{number}/verify")
+        | (&Method::POST, "/api/pr-bindings/{owner}/{repo}/{number}/state")
+        | (&Method::POST, "/api/pr-bindings/{owner}/{repo}/{number}/followups")
+        | (&Method::POST, "/api/pr-bindings/{owner}/{repo}/{number}/dispatch")
+        | (
+            &Method::GET,
+            "/api/pr-bindings/{owner}/{repo}/{number}/executions/{execution_id}/events",
+        ) => capability(Capability::PrBindingsManage),
+        (&Method::GET, "/api/pr-followups/executions") => capability(Capability::PrFollowupsRead),
         (&Method::DELETE, "/api/session/{thread_key}/sandbox") => {
             Some(RouteAccess::ApiClientOrOperatorSessionWrite)
         }
@@ -893,6 +951,9 @@ async fn admit_api_client_execution(
 /// Likewise `linear_user_id` (and its display name) names the Linear user a
 /// turn runs as; only linearbot reads it from a signature-verified webhook, so
 /// it is stripped from every other caller.
+/// The PR follow-up fields name a dispatched turn's PR and its GitHub
+/// requester; only the PR dispatch route sets them, server-side, so they are
+/// stripped from every caller of this route.
 fn sanitize_execute_metadata(
     caller_class: CallerClass,
     caller_identity: &str,
@@ -901,6 +962,9 @@ fn sanitize_execute_metadata(
     let Some(Value::Object(fields)) = metadata.as_mut() else {
         return metadata;
     };
+    for key in PR_FOLLOWUP_METADATA_KEYS {
+        fields.remove(key);
+    }
     if caller_class != CallerClass::Console {
         fields.remove("requester_principal_foreign_id");
     }
@@ -910,6 +974,14 @@ fn sanitize_execute_metadata(
     }
     metadata
 }
+
+/// Execute metadata only the PR dispatch route may set.
+const PR_FOLLOWUP_METADATA_KEYS: [&str; 4] = [
+    "pr_followup",
+    "pr_followup_github_user_id",
+    "pr_followup_github_login",
+    "push_authorization",
+];
 
 async fn interrupt_session_execution(
     State(state): State<AppState>,
@@ -1004,12 +1076,30 @@ async fn stream_events(
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
     let runtime = state.runtime()?;
     authorize_principal_session_read(&runtime, &caller, &thread_key).await?;
+    session_events_sse(
+        &state,
+        &runtime,
+        &caller,
+        thread_key,
+        query.after_event_id.unwrap_or(0),
+        query.execution_id.as_deref(),
+    )
+    .await
+}
+
+/// The SSE response for a session's replayable events after
+/// `after_event_id`, optionally one execution's only. The caller has already
+/// authorized `caller` for `thread_key`.
+pub(crate) async fn session_events_sse(
+    state: &AppState,
+    runtime: &SessionRuntime,
+    caller: &AuthenticatedCaller,
+    thread_key: ThreadKey,
+    after_event_id: i64,
+    execution_id: Option<&str>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, ApiError> {
     let events = runtime
-        .stream_events(
-            &thread_key,
-            query.after_event_id.unwrap_or(0),
-            query.execution_id.as_deref(),
-        )
+        .stream_events(&thread_key, after_event_id, execution_id)
         .await?;
     let stream = events.map(move |result| {
         // Stream failures are server-side faults: log the details, send the
@@ -1058,7 +1148,10 @@ async fn authorize_principal_session_read(
     ))
 }
 
-fn principal_subject_owns_session(subject: Option<&str>, session_principal: Option<&str>) -> bool {
+pub(crate) fn principal_subject_owns_session(
+    subject: Option<&str>,
+    session_principal: Option<&str>,
+) -> bool {
     subject.is_none_or(|subject| session_principal == Some(subject))
 }
 
@@ -1141,6 +1234,32 @@ mod session_authorization_tests {
             assert_eq!(
                 sanitize_execute_metadata(caller_class, identity, Some(metadata.clone())),
                 Some(json!({ "source": "console" }))
+            );
+        }
+    }
+
+    #[test]
+    fn no_caller_may_set_pr_followup_metadata() {
+        let metadata = json!({
+            "source": "githubbot",
+            "pr_followup": {"repository": "acme/widgets", "number": 7, "followup_id": "prf_1"},
+            "pr_followup_github_user_id": "90210001",
+            "pr_followup_github_login": "ada",
+            "push_authorization": "prepare_and_ask"
+        });
+        for (caller_class, identity) in [
+            (CallerClass::Admin, "api-rs-admin"),
+            (CallerClass::Console, "centaur-console"),
+            (CallerClass::Ingress, "githubbot"),
+            (CallerClass::Ingress, "slackbot"),
+            (CallerClass::Ingress, LINEARBOT_IDENTITY),
+            (CallerClass::Principal, "prn_sandbox"),
+            (CallerClass::ApiClient, "acl_test"),
+        ] {
+            assert_eq!(
+                sanitize_execute_metadata(caller_class, identity, Some(metadata.clone())),
+                Some(json!({ "source": "githubbot" })),
+                "{caller_class:?} {identity}"
             );
         }
     }

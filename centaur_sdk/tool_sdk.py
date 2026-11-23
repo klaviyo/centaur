@@ -8,6 +8,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import urllib.request
 import uuid
 from contextvars import ContextVar
@@ -171,6 +172,34 @@ def current_session_context() -> dict[str, Any]:
     request = urllib.request.Request(
         f"{base_url}/api/session/{quote(thread_key, safe='')}",
         method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.loads(response.read())
+
+
+_PR_REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def register_pull_request(repository: str, number: int) -> dict[str, Any]:
+    """Register a pull request this session opened, for same-session follow-ups.
+
+    Records ``{repository, number}`` against :func:`current_thread_key` as a
+    ``registered`` binding. Registration is only a claim: githubbot verifies it
+    from a signed webhook before routing any follow-up here, and a binding
+    never grants GitHub write access. Returns the binding the API stored.
+    """
+    repository = repository.strip()
+    if not _PR_REPOSITORY_PATTERN.match(repository):
+        raise ValueError(f"repository must be 'owner/repo', got {repository!r}")
+    if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+        raise ValueError(f"number must be a positive integer, got {number!r}")
+    thread_key = current_thread_key()
+    base_url = secret("CENTAUR_API_URL", "http://api:8000").rstrip("/")
+    request = urllib.request.Request(
+        f"{base_url}/api/session/{quote(thread_key, safe='')}/pr-bindings",
+        data=json.dumps({"repository": repository.lower(), "number": number}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         return json.loads(response.read())

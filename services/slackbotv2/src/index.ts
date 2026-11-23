@@ -115,6 +115,11 @@ import {
 } from './slack-events'
 import { isSlackStopCommand } from './stop-command'
 import {
+  sweepPrFollowupExecutions,
+  type PrFollowupExecution,
+  type PrFollowupTurnResult
+} from './pr-followup'
+import {
   createSteeringReactionController,
   type SteeringReactionAck,
   type SteeringReactionController
@@ -799,6 +804,7 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
 
   if (options.recoverRenderObligationsOnStart !== false) {
     scheduleRenderObligationRecovery(chat, state, options, stateConnected)
+    schedulePrFollowupSweep(chat, state, options, stateConnected)
   }
 
   return { app, chat, drain: background.drain }
@@ -2906,6 +2912,75 @@ async function renderFallbackFinalAnswer(
   } finally {
     recordFallback(outcome, startedAtMs)
   }
+}
+
+const PR_FOLLOWUP_SWEEP_INTERVAL_MS = 30_000
+
+/**
+ * Poll for finished PR follow-up executions and post their one brief update.
+ * Stops quietly when api-rs doesn't serve the listing.
+ */
+function schedulePrFollowupSweep(
+  chat: Chat<Record<string, Adapter>, SlackbotV2ThreadState>,
+  state: StateAdapter,
+  options: SlackbotV2Options,
+  stateConnected: Promise<void>
+): void {
+  const intervalMs = options.prFollowupSweepIntervalMs ?? PR_FOLLOWUP_SWEEP_INTERVAL_MS
+  if (intervalMs <= 0) return
+  let running = false
+  let timer: ReturnType<typeof setInterval> | undefined
+  const sweep = async (): Promise<void> => {
+    if (running) return
+    running = true
+    try {
+      await chat.initialize()
+      const examined = await sweepPrFollowupExecutions({
+        options,
+        state,
+        thread: threadKey => chat.thread(threadKey),
+        collectResult: execution => collectPrFollowupResult(options, execution)
+      })
+      if (examined === null && timer) {
+        clearInterval(timer)
+        traceLog(options, 'slackbotv2_pr_followup_sweep_unsupported')
+      }
+    } catch (error) {
+      traceWarn(options, 'slackbotv2_pr_followup_sweep_failed', undefined, { error: errorMessage(error) })
+    } finally {
+      running = false
+    }
+  }
+  void stateConnected.then(() => {
+    timer = setInterval(() => void sweep(), intervalMs)
+    timer.unref?.()
+  })
+}
+
+/**
+ * The final text of a PR follow-up execution through the same event stream
+ * and renderer the fallback answer path uses. Nothing is posted here.
+ */
+async function collectPrFollowupResult(
+  options: SlackbotV2Options,
+  execution: PrFollowupExecution
+): Promise<PrFollowupTurnResult> {
+  const stream = await openSessionEventStream(options, {
+    afterEventId: 0,
+    executionId: execution.executionId,
+    onEventId: () => undefined,
+    threadId: execution.threadKey
+  })
+  const fallback = new SlackRenderFallback()
+  for await (const _chunk of fallback.collectChatSdk(
+    harnessToChatSdkStream(
+      fallback.collectSource(stream),
+      fallback.withRendererOptions(fallbackRendererOptions(options))
+    )
+  )) {
+    void _chunk
+  }
+  return { text: fallback.text(), failed: execution.status === 'failed' }
 }
 
 function scheduleRenderObligationRecovery(

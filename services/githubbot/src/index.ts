@@ -31,6 +31,15 @@ import {
   managementThreadKey,
   type PrManagerContext,
 } from "./pr-manager";
+import {
+  commentFollowup,
+  createPrBindingClient,
+  enqueueBoundFollowup,
+  handleBoundCommand,
+  prepareAndAskPreamble,
+  resolveBindingRoute,
+  startPrDispatchTimer,
+} from "./pr-session";
 import { handleReviewRequest } from "./review";
 import {
   forwardToSessionApi,
@@ -133,6 +142,9 @@ export function createGithubbot(options: GithubbotOptions): Githubbot {
   };
 
   const prManagerCtx: PrManagerContext = {
+    ...(options.prSessionBindings === false
+      ? {}
+      : { bindings: createPrBindingClient(options) }),
     octokit: github.octokit,
     options,
     state,
@@ -203,6 +215,8 @@ export function createGithubbot(options: GithubbotOptions): Githubbot {
 
   if (options.connectStateOnStart !== false) {
     void ensureStateConnected(state, options).then(ensureChatInitialized);
+    // Retries bindings with queued follow-ups (busy sessions, restarts).
+    startPrDispatchTimer(prManagerCtx);
   }
 
   return { app, chat };
@@ -249,6 +263,35 @@ async function handleMessage(
     return;
   }
   const threadKey = thread.id;
+
+  // A mention on a PR bound to the Centaur session that opened it: when the
+  // bot manages the PR, the request joins that session's durable queue (api-rs
+  // dedupes redeliveries) and the reply posts once it is dispatched. A bound
+  // PR is never routed to a `github-manage:` session.
+  let boundUnmanagedPreamble: string | undefined;
+  if (mode === "execute" && input.prManagerCtx.bindings) {
+    const ref = parseGithubThreadKey(threadKey);
+    if (ref?.type === "pr") {
+      const route = await resolveBindingRoute(
+        input.prManagerCtx,
+        ref.owner,
+        ref.repo,
+        ref.number,
+      );
+      if (route.kind === "unknown") {
+        // Fail closed: without the binding we can't tell which session owns it.
+        void reactSafe(adapter, threadKey, message.id, "confused", logger);
+        return;
+      }
+      if (route.kind === "bound" && route.binding.managed) {
+        await handleBoundMention(input, route, ref, message);
+        return;
+      }
+      if (route.kind === "bound") {
+        boundUnmanagedPreamble = prepareAndAskPreamble(route.binding);
+      }
+    }
+  }
   const threadState = (await thread.state) ?? {};
 
   if (mode === "execute") {
@@ -279,11 +322,9 @@ async function handleMessage(
         });
       }
     }
-    const sessionThreadKey = await resolveManagementSession(
-      thread,
-      threadKey,
-      input,
-    );
+    const sessionThreadKey = boundUnmanagedPreamble
+      ? undefined
+      : await resolveManagementSession(thread, threadKey, input);
     const serialized = await serializeMessage(message);
     const overrides = extractMessageOverrides(serialized.text);
     serialized.text = overrides.cleanedText;
@@ -299,7 +340,11 @@ async function handleMessage(
     backgroundWaitUntil(
       runSessionTurn({
         adapter,
-        contextPreamble: githubContextPreamble(threadKey, reviewComment),
+        contextPreamble: boundUnmanagedPreamble
+          ? [githubContextPreamble(threadKey, reviewComment), boundUnmanagedPreamble]
+              .filter(Boolean)
+              .join("\n\n")
+          : githubContextPreamble(threadKey, reviewComment),
         executeMessage: serialized,
         options,
         overrides: {
@@ -354,6 +399,41 @@ async function handleMessage(
     threadId: sessionKey,
   };
   backgroundWaitUntil(appendFollowup(options, serialized, sessionKey, trace));
+}
+
+/**
+ * Queue a mention on a managed bound PR (or run `resume` / `manage pushes as
+ * me`). The author gate and self-message guard already ran in handleMessage.
+ */
+async function handleBoundMention(
+  input: MessageHandlerInput,
+  route: Extract<
+    Awaited<ReturnType<typeof resolveBindingRoute>>,
+    { kind: "bound" }
+  >,
+  ref: { owner: string; repo: string; number: number },
+  message: ChatMessage,
+): Promise<void> {
+  const ctx = input.prManagerCtx;
+  const command = {
+    owner: ref.owner,
+    repo: ref.repo,
+    number: ref.number,
+    raw: message.raw,
+    text: message.text,
+  };
+  if (await handleBoundCommand(ctx, route, command)) return;
+  const headSha = route.binding.head_sha ?? undefined;
+  const draft = headSha
+    ? commentFollowup({ ...command, headSha })
+    : undefined;
+  if (!draft) {
+    traceLog(input.options, "githubbot_pr_followup_comment_unusable", undefined, {
+      message_id: message.id,
+    });
+    return;
+  }
+  await enqueueBoundFollowup(ctx, route, draft);
 }
 
 /**

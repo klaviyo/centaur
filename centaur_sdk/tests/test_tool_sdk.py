@@ -533,3 +533,92 @@ def test_company_context_database_url_reads_dsn_env(monkeypatch):
 
 def test_company_context_database_url_ignores_unresolved_placeholder():
     assert company_context_database_url("CENTAUR_POSTGRES_DSN") == ""
+
+
+def _capture_binding_request(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    requested: dict[str, object] = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self) -> bytes:
+            return b'{"repository":"acme/widgets","number":42,"state":"registered"}'
+
+    def fake_urlopen(request, timeout):
+        requested["url"] = request.full_url
+        requested["method"] = request.get_method()
+        requested["body"] = request.data
+        requested["timeout"] = timeout
+        requested["authorization"] = request.get_header("Authorization")
+        return FakeResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    return requested
+
+
+def test_register_pull_request_posts_binding_for_current_thread(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import json
+
+    from centaur_sdk import register_pull_request
+
+    requested = _capture_binding_request(monkeypatch)
+    token = set_tool_context(
+        ToolContext(
+            name="fake-tool",
+            thread_key="slack:C123:123.456",
+            secrets={"CENTAUR_API_URL": "http://api:8000/"},
+        )
+    )
+    try:
+        binding = register_pull_request("Acme/Widgets", 42)
+    finally:
+        reset_tool_context(token)
+
+    assert binding["state"] == "registered"
+    assert requested["method"] == "POST"
+    assert requested["url"] == "http://api:8000/api/session/slack%3AC123%3A123.456/pr-bindings"
+    assert json.loads(requested["body"]) == {"repository": "acme/widgets", "number": 42}
+    assert requested["timeout"] == 30
+    # The principal token is injected by the proxy, never by the sandbox.
+    assert requested["authorization"] is None
+
+
+@pytest.mark.parametrize(
+    ("repository", "number"),
+    [("widgets", 1), ("acme/widgets/extra", 1), ("acme/widgets", 0), ("acme/widgets", True)],
+)
+def test_register_pull_request_rejects_malformed_input(
+    monkeypatch: pytest.MonkeyPatch, repository: str, number: int
+):
+    from centaur_sdk import register_pull_request
+
+    requested = _capture_binding_request(monkeypatch)
+    token = set_tool_context(ToolContext(name="fake-tool", thread_key="slack:C1:1.2"))
+    try:
+        with pytest.raises(ValueError):
+            register_pull_request(repository, number)
+    finally:
+        reset_tool_context(token)
+    assert requested == {}
+
+
+def test_register_pull_request_cli_prints_binding(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    from centaur_sdk import pull_requests
+
+    requested = _capture_binding_request(monkeypatch)
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "slack:C123:123.456")
+    monkeypatch.setattr(
+        registry, "_backend", MappingBackend({"CENTAUR_API_URL": "http://api:8000"})
+    )
+
+    assert pull_requests.main(["register", "acme/widgets", "42"]) == 0
+    assert '"state":"registered"' in capsys.readouterr().out
+    assert str(requested["url"]).endswith("/api/session/slack%3AC123%3A123.456/pr-bindings")

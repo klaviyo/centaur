@@ -14,6 +14,13 @@ import type {
   GithubbotOptions,
   GithubbotRendererSource,
   GithubbotSessionMessage,
+  PrBinding,
+  PrBindingStateUpdate,
+  PrDispatchRequest,
+  PrDispatchResult,
+  PrFollowup,
+  PrFollowupInput,
+  PrVerification,
 } from "./types";
 import {
   elapsedMs,
@@ -662,6 +669,184 @@ function workflowEventRetryDelayMs(attempt: number): number {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---------------------------------------------------------------------------
+// PR session bindings (api-rs `/api/pr-bindings/*`, githubbot's
+// PrBindingsManage capability). The binding, its follow-up queue and dispatch
+// all live in api-rs; these are thin, typed calls over the same headers and
+// error handling as the session routes.
+// ---------------------------------------------------------------------------
+
+export type PrBindingRef = { repository: string; number: number };
+
+/** The binding for a PR, or null when none exists (404). */
+export async function getPrBinding(
+  options: GithubbotOptions,
+  ref: PrBindingRef,
+): Promise<PrBinding | null> {
+  const fetchFn = options.fetch ?? fetch;
+  const response = await fetchFn(prBindingUrl(options.apiUrl, ref), {
+    method: "GET",
+    headers: apiHeaders(options, false),
+  });
+  if (response.status === 404) return null;
+  await ensureApiOk(response, "get pr binding", options);
+  return parsePrBinding(await response.json());
+}
+
+export async function verifyPrBinding(
+  options: GithubbotOptions,
+  ref: PrBindingRef,
+  verification: PrVerification,
+): Promise<PrBinding> {
+  return parsePrBinding(
+    await postPrBinding(options, ref, "verify", verification, "verify pr binding"),
+  );
+}
+
+export async function updatePrBindingState(
+  options: GithubbotOptions,
+  ref: PrBindingRef,
+  update: PrBindingStateUpdate,
+): Promise<PrBinding> {
+  return parsePrBinding(
+    await postPrBinding(options, ref, "state", update, "update pr binding state"),
+  );
+}
+
+export async function enqueuePrFollowup(
+  options: GithubbotOptions,
+  ref: PrBindingRef,
+  followup: PrFollowupInput,
+): Promise<{ followup: PrFollowup; created: boolean }> {
+  const payload = await postPrBinding(
+    options,
+    ref,
+    "followups",
+    followup,
+    "enqueue pr followup",
+  );
+  if (!isJsonObject(payload) || !isJsonObject(payload.followup)) {
+    throw new Error("enqueue pr followup returned an unexpected body");
+  }
+  return {
+    followup: payload.followup as unknown as PrFollowup,
+    created: payload.created === true,
+  };
+}
+
+export async function dispatchPrFollowup(
+  options: GithubbotOptions,
+  ref: PrBindingRef,
+  request: PrDispatchRequest,
+): Promise<PrDispatchResult> {
+  const payload = await postPrBinding(
+    options,
+    ref,
+    "dispatch",
+    request,
+    "dispatch pr followup",
+  );
+  if (!isJsonObject(payload)) {
+    throw new Error("dispatch pr followup returned an unexpected body");
+  }
+  if (isJsonObject(payload.dispatched)) {
+    const executionId = stringValue(payload.execution_id);
+    if (!executionId) {
+      throw new Error("dispatch pr followup returned no execution_id");
+    }
+    return {
+      dispatched: payload.dispatched as unknown as PrFollowup,
+      execution_id: executionId,
+    };
+  }
+  return {
+    dispatched: null,
+    reason: stringValue(payload.reason) ?? "unknown",
+    blocker: stringValue(payload.blocker) ?? null,
+  };
+}
+
+/**
+ * Replayable events for one execution a binding dispatched. githubbot's key is
+ * scoped to `github*:` session keys, while a bound session usually lives under
+ * another platform's key, so it reads through the binding (which api-rs
+ * restricts to that binding's own dispatched executions) rather than
+ * `/api/session/{key}/events`.
+ */
+export async function streamPrFollowupEvents(
+  options: GithubbotOptions,
+  ref: PrBindingRef,
+  executionId: string,
+  afterEventId: number,
+  onEventId: (eventId: number) => void,
+): Promise<AsyncIterable<GithubbotRendererSource>> {
+  const fetchFn = options.fetch ?? fetch;
+  const url = new URL(
+    prBindingUrl(
+      options.apiUrl,
+      ref,
+      `executions/${encodeURIComponent(executionId)}/events`,
+    ),
+  );
+  url.searchParams.set("after_event_id", String(afterEventId));
+  const response = await fetchFn(url.toString(), {
+    method: "GET",
+    headers: apiHeaders(options, false),
+  });
+  await ensureApiOk(response, "stream pr followup events", options);
+  if (!response.body) return toAsyncIterable([]);
+  return parseSessionEventStream(response.body, onEventId);
+}
+
+async function postPrBinding(
+  options: GithubbotOptions,
+  ref: PrBindingRef,
+  suffix: string,
+  body: unknown,
+  action: string,
+): Promise<unknown> {
+  const fetchFn = options.fetch ?? fetch;
+  const response = await fetchFn(prBindingUrl(options.apiUrl, ref, suffix), {
+    method: "POST",
+    headers: apiHeaders(options),
+    body: JSON.stringify(body),
+  });
+  await ensureApiOk(response, action, options);
+  return response.json();
+}
+
+function parsePrBinding(payload: unknown): PrBinding {
+  // Accept both a flat binding and `{binding, session_exists, ...}`.
+  const binding =
+    isJsonObject(payload) && isJsonObject(payload.binding)
+      ? {
+          ...payload.binding,
+          session_exists: payload.session_exists,
+          active_execution: payload.active_execution,
+        }
+      : payload;
+  if (
+    !isJsonObject(binding) ||
+    typeof binding.thread_key !== "string" ||
+    typeof binding.state !== "string"
+  ) {
+    throw new Error("pr binding response has an unexpected shape");
+  }
+  return binding as unknown as PrBinding;
+}
+
+function prBindingUrl(
+  apiUrl: string,
+  ref: PrBindingRef,
+  suffix?: string,
+): string {
+  const [owner = "", repo = ""] = ref.repository.toLowerCase().split("/", 2);
+  const path =
+    `/api/pr-bindings/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${ref.number}` +
+    (suffix ? `/${suffix}` : "");
+  return new URL(path, ensureTrailingSlash(apiUrl)).toString();
 }
 
 function apiSessionUrl(

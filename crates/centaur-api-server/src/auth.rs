@@ -17,6 +17,8 @@ const CONSOLE_SERVICE_SUBJECT: &str = "centaur-console";
 const STATIC_ADMIN_IDENTITY: &str = "api-rs-admin";
 /// The linearbot ingress, the only caller that may name a turn's Linear user.
 pub(crate) const LINEARBOT_IDENTITY: &str = "linearbot";
+/// The githubbot ingress, the only caller that may drive PR session bindings.
+pub(crate) const GITHUBBOT_IDENTITY: &str = "githubbot";
 /// Issuer of the access tokens api-rs mints for API clients. Distinct from
 /// Console's issuer so neither kind of token can be read as the other.
 pub(crate) const API_CLIENT_TOKEN_ISSUER: &str = "centaur-api-rs";
@@ -35,9 +37,18 @@ pub(crate) enum Capability {
     AdminSync,
     SlackExternalTeamsRead,
     SlackExternalTeamsWrite,
+    /// Verify, drive and dispatch PR session bindings. Held only by the
+    /// githubbot ingress, which verifies PRs from signed webhooks; it is not
+    /// in [`Self::ALL`], so operators do not hold it either.
+    PrBindingsManage,
+    /// List finished PR follow-up executions on the caller's own platform's
+    /// sessions. Held only by the slackbot ingress, which posts their brief
+    /// updates; like [`Self::PrBindingsManage`] it is not in [`Self::ALL`].
+    PrFollowupsRead,
 }
 
 impl Capability {
+    /// Every operator capability, held by the static admin and Console.
     const ALL: [Self; 10] = [
         Self::SessionsRead,
         Self::SessionsWrite,
@@ -166,21 +177,7 @@ impl ApiAuthConfig {
             let Some(token) = optional_env(spec.env_var) else {
                 continue;
             };
-            let mut capabilities = vec![Capability::SessionsRead, Capability::SessionsWrite];
-            if spec.workflow_events {
-                capabilities.push(Capability::WorkflowsEvents);
-            }
-            if spec.identity == "slackbot" {
-                capabilities.push(Capability::WorkflowsActions);
-                capabilities.push(Capability::SlackExternalTeamsRead);
-            }
-            callers.push(static_caller(
-                spec.identity,
-                CallerClass::Ingress,
-                token,
-                capabilities,
-                Some(spec.platform_prefixes),
-            ));
+            callers.push(ingress_caller(spec, token));
         }
 
         validate_unique_tokens(&callers)?;
@@ -218,6 +215,20 @@ impl ApiAuthConfig {
             ],
             Some(&["slack:"]),
         )];
+        Self {
+            static_callers: Arc::new(callers),
+            jwt_secret: Arc::from(jwt_secret.into()),
+            api_clients_enabled: true,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn testing_with_ingresses(jwt_secret: impl Into<String>) -> Self {
+        let callers = INGRESS_SPECS
+            .iter()
+            .filter(|spec| matches!(spec.identity, "slackbot" | GITHUBBOT_IDENTITY))
+            .map(|spec| ingress_caller(spec, format!("test-{}-key", spec.identity)))
+            .collect();
         Self {
             static_callers: Arc::new(callers),
             jwt_secret: Arc::from(jwt_secret.into()),
@@ -459,7 +470,7 @@ const INGRESS_SPECS: &[IngressSpec] = &[
     },
     IngressSpec {
         env_var: "GITHUBBOT_API_KEY",
-        identity: "githubbot",
+        identity: GITHUBBOT_IDENTITY,
         platform_prefixes: &[
             "github:",
             "github-issue:",
@@ -488,6 +499,33 @@ struct IngressSpec {
     /// Every session thread-key prefix this ingress mints.
     platform_prefixes: &'static [&'static str],
     workflow_events: bool,
+}
+
+/// The capabilities an ingress key carries.
+fn ingress_capabilities(spec: &IngressSpec) -> Vec<Capability> {
+    let mut capabilities = vec![Capability::SessionsRead, Capability::SessionsWrite];
+    if spec.workflow_events {
+        capabilities.push(Capability::WorkflowsEvents);
+    }
+    if spec.identity == "slackbot" {
+        capabilities.push(Capability::WorkflowsActions);
+        capabilities.push(Capability::SlackExternalTeamsRead);
+        capabilities.push(Capability::PrFollowupsRead);
+    }
+    if spec.identity == GITHUBBOT_IDENTITY {
+        capabilities.push(Capability::PrBindingsManage);
+    }
+    capabilities
+}
+
+fn ingress_caller(spec: &IngressSpec, token: String) -> StaticCaller {
+    static_caller(
+        spec.identity,
+        CallerClass::Ingress,
+        token,
+        ingress_capabilities(spec),
+        Some(spec.platform_prefixes),
+    )
 }
 
 fn static_caller(
@@ -809,6 +847,49 @@ mod tests {
             assert!(
                 !thread_key_matches_platform(githubbot.platform_prefixes, thread_key),
                 "{thread_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_githubbot_ingress_may_manage_pr_bindings() {
+        for spec in INGRESS_SPECS {
+            assert_eq!(
+                ingress_capabilities(spec).contains(&Capability::PrBindingsManage),
+                spec.identity == GITHUBBOT_IDENTITY,
+                "{}",
+                spec.identity
+            );
+        }
+        // Operators hold every capability in `ALL`, which leaves this one out.
+        assert!(!Capability::ALL.contains(&Capability::PrBindingsManage));
+        assert!(!Capability::ALL.contains(&Capability::PrFollowupsRead));
+        let console = ApiAuthConfig::testing("jwt-secret")
+            .authenticate(&bearer(
+                &encode(
+                    &Header::new(Algorithm::HS256),
+                    &json!({
+                        "iss": "centaur-console", "sub": "centaur-console", "aud": "centaur-api",
+                        "iat": 1_700_000_000i64, "exp": 4_102_444_800i64,
+                        "token_use": "console_service",
+                    }),
+                    &EncodingKey::from_secret(b"jwt-secret"),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        assert!(!console.has_capability(Capability::PrBindingsManage));
+        assert!(!console.has_capability(Capability::PrFollowupsRead));
+    }
+
+    #[test]
+    fn only_the_slackbot_ingress_may_list_pr_followup_executions() {
+        for spec in INGRESS_SPECS {
+            assert_eq!(
+                ingress_capabilities(spec).contains(&Capability::PrFollowupsRead),
+                spec.identity == "slackbot",
+                "{}",
+                spec.identity
             );
         }
     }

@@ -25,8 +25,15 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 mod migrations;
+mod pr_bindings;
 
 pub use migrations::{TextSearchBackend, migrate, migration_list};
+pub use pr_bindings::{
+    NewPrFollowup, PR_FOLLOWUP_PUSH_AUTHORIZATION, PauseRequest, PrBinding, PrBindingLock,
+    PrBindingState, PrBindingStateUpdate, PrFollowup, PrFollowupDropReason, PrFollowupExecution,
+    PrFollowupExecutionCursor, PrFollowupKind, PrFollowupStatus, PrRef, PrVerification,
+    inactive_push_grant, pr_followup_execute_metadata,
+};
 
 pub const SESSION_EVENTS_CHANNEL: &str = "centaur_session_events";
 const DEFAULT_MAX_CONNECTIONS: u32 = 500;
@@ -2124,6 +2131,20 @@ pub enum SessionStoreError {
     },
     #[error("session {thread_key} sandbox is owned by its workflow run")]
     WorkflowOwnedSandbox { thread_key: String },
+    #[error("invalid PR binding request: {0}")]
+    InvalidPrBinding(String),
+    #[error("no PR binding for {repository}#{number}")]
+    PrBindingNotFound { repository: String, number: i64 },
+    #[error("PR binding conflict for {repository}#{number}: {reason}")]
+    PrBindingConflict {
+        repository: String,
+        number: i64,
+        reason: String,
+    },
+    #[error("PR binding for {repository}#{number} is not verified and managed")]
+    PrBindingInactive { repository: String, number: i64 },
+    #[error("PR {repository}#{number} is already verified with a different node id")]
+    PrNodeIdMismatch { repository: String, number: i64 },
     #[error("invalid notification payload on {channel}: {payload}: {error}")]
     InvalidNotification {
         channel: String,

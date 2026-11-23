@@ -69,8 +69,17 @@ impl IntoResponse for ApiError {
             })) => StatusCode::CONFLICT,
             Self::Runtime(SessionRuntimeError::Store(
                 SessionStoreError::ExecutionActive { .. }
-                | SessionStoreError::WorkflowOwnedSandbox { .. },
+                | SessionStoreError::WorkflowOwnedSandbox { .. }
+                | SessionStoreError::PrBindingConflict { .. }
+                | SessionStoreError::PrBindingInactive { .. }
+                | SessionStoreError::PrNodeIdMismatch { .. },
             )) => StatusCode::CONFLICT,
+            Self::Runtime(SessionRuntimeError::Store(SessionStoreError::InvalidPrBinding(_))) => {
+                StatusCode::BAD_REQUEST
+            }
+            Self::Runtime(SessionRuntimeError::Store(SessionStoreError::PrBindingNotFound {
+                ..
+            })) => StatusCode::NOT_FOUND,
             Self::Runtime(SessionRuntimeError::IronControl(
                 centaur_iron_control::IronControlError::PrincipalDerivation(_),
             )) => StatusCode::BAD_REQUEST,
@@ -141,6 +150,17 @@ impl IntoResponse for ApiError {
         {
             body["code"] = json!("requester_not_linked");
             body["provider"] = json!(provider);
+        }
+        if let Self::Runtime(SessionRuntimeError::Store(error)) = &self {
+            let code = match error {
+                SessionStoreError::PrBindingConflict { .. } => Some("binding_conflict"),
+                SessionStoreError::PrBindingInactive { .. } => Some("binding_inactive"),
+                SessionStoreError::PrNodeIdMismatch { .. } => Some("node_id_mismatch"),
+                _ => None,
+            };
+            if let Some(code) = code {
+                body["code"] = json!(code);
+            }
         }
         let mut response = (status, Json(body)).into_response();
         if status == StatusCode::UNAUTHORIZED {

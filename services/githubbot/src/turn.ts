@@ -256,6 +256,32 @@ async function runTurnStreamInner(
 }
 
 /**
+ * Render an already-running execution's event stream into a TurnResult with the
+ * same mapper, collector and fallback the conversational path uses. For work
+ * someone else started, such as a dispatched PR follow-up.
+ */
+export async function collectTurnOutput(
+  options: GithubbotOptions,
+  source: AsyncIterable<GithubbotRendererSource>,
+): Promise<TurnResult> {
+  const collector = new CommentReplyCollector();
+  const fallback = new GithubRenderFallback();
+  for await (const chunk of harnessToChatSdkStream(
+    fallback.collectSource(source),
+    rendererOptions(options),
+  )) {
+    collector.update(chunk);
+  }
+  return {
+    answer: collector.answer,
+    cotLines: collector.cotLines,
+    errorText: collector.errorText,
+    failed: collector.failed,
+    fallbackText: fallback.text(),
+  };
+}
+
+/**
  * Runs one conversational agent turn on a thread's sandbox and posts the result
  * as a single comment. A 👀 reaction acks the triggering comment while the bot
  * works, then settles to 🚀 (done) or 😕 (failed). The answer streams into a

@@ -2,6 +2,17 @@ import type { GitHubAdapter } from "@chat-adapter/github";
 import type { StateAdapter } from "chat";
 import { backgroundWaitUntil } from "./context";
 import { resolveAllowedAuthorAssociations } from "./authorization";
+import {
+  actorFrom,
+  ciFailureFollowup,
+  conflictFollowup,
+  enqueueBoundFollowup,
+  handleBoundPullRequestEvent,
+  resolveBindingRoute,
+  reviewFollowup,
+  type FollowupActor,
+  type PrBindingClient,
+} from "./pr-session";
 import { reactWorkingOnReview, settleReviewReaction } from "./reactions";
 import { runTurnStream, turnOutputChars } from "./turn";
 import {
@@ -34,6 +45,12 @@ import { errorMessage, noopLogger, nowMs, stringValue, traceLog } from "./utils"
 type Octokit = GitHubAdapter["octokit"];
 
 export type PrManagerContext = {
+  /**
+   * api-rs PR session bindings. When set, a PR bound to the Centaur session
+   * that opened it routes follow-ups to that session's durable queue instead
+   * of a `github-manage:` turn. Unset (or an unbound PR) keeps today's flow.
+   */
+  bindings?: PrBindingClient;
   octokit: Octokit;
   options: GithubbotOptions;
   state: StateAdapter;
@@ -178,8 +195,12 @@ function logger(ctx: PrManagerContext) {
 // Webhook handlers.
 // ---------------------------------------------------------------------------
 
-type PullRequestSummary = {
+export type PullRequestSummary = {
   assignees: string[];
+  /** PR author login (verification evidence for a session binding). */
+  authorLogin: string | null;
+  /** ISO creation time (verification evidence for a session binding). */
+  createdAt: string | null;
   draft: boolean;
   headRef: string;
   headRepoFullName: string | null;
@@ -187,6 +208,8 @@ type PullRequestSummary = {
   labels: string[];
   mergeableState: string;
   merged: boolean;
+  /** GraphQL node id, the PR's stable identity across renames. */
+  nodeId: string | null;
   number: number;
   state: string;
   title: string;
@@ -200,18 +223,23 @@ function assigneeLogins(
 }
 
 function summarizePr(pr: {
+  created_at?: string | null;
   draft?: boolean | null;
   head: { ref: string; repo?: { full_name?: string | null } | null; sha: string };
   labels: { name?: string }[];
   mergeable_state?: string;
   merged?: boolean;
+  node_id?: string | null;
   number: number;
   state: string;
   title: string;
   assignees?: ({ login?: string } | null)[] | null;
+  user?: { login?: string } | null;
 }): PullRequestSummary {
   return {
     assignees: assigneeLogins(pr.assignees),
+    authorLogin: pr.user?.login ?? null,
+    createdAt: pr.created_at ?? null,
     draft: pr.draft === true,
     headRef: pr.head.ref,
     headRepoFullName: pr.head.repo?.full_name ?? null,
@@ -219,13 +247,14 @@ function summarizePr(pr: {
     labels: pr.labels.map((l) => l.name ?? "").filter(Boolean),
     mergeableState: pr.mergeable_state ?? "unknown",
     merged: pr.merged === true,
+    nodeId: pr.node_id ?? null,
     number: pr.number,
     state: pr.state,
     title: pr.title,
   };
 }
 
-async function fetchPr(
+export async function fetchPr(
   ctx: PrManagerContext,
   owner: string,
   repo: string,
@@ -296,6 +325,36 @@ export async function handlePullRequestEvent(
   if (!repo || !isRecord(prNode)) return;
   const number = numberValue(prNode.number);
   if (number === undefined) return;
+  if (ctx.bindings) {
+    // A PR bound to the Centaur session that opened it never gets a
+    // `github-manage:` session; an unbound PR falls through unchanged.
+    const bound = await handleBoundPullRequestEvent(
+      ctx,
+      payload,
+      action,
+      repo.owner,
+      repo.repo,
+      number,
+    );
+    if (bound.next === "stop") return;
+    if (bound.next === "evaluate_ci") {
+      await processCi(
+        ctx,
+        repo.owner,
+        repo.repo,
+        number,
+        bound.headSha,
+        true,
+        undefined,
+        actorFrom(payload.sender),
+      );
+      return;
+    }
+    if (bound.next === "merge_gate") {
+      await tryMerge(ctx, repo.owner, repo.repo, number, actorFrom(payload.sender));
+      return;
+    }
+  }
   if (action === "closed") return; // nothing to drive once closed/merged.
 
   const pr = await fetchPr(ctx, repo.owner, repo.repo, number);
@@ -370,6 +429,38 @@ export async function handleReviewEvent(
     return;
   }
 
+  // A managed bound PR queues the review for the session that opened it. An
+  // approval still reaches the unchanged deterministic merge gate below.
+  if (ctx.bindings && reviewState !== "approved") {
+    const route = await resolveBindingRoute(ctx, repo.owner, repo.repo, number);
+    if (route.kind === "unknown") return;
+    if (route.kind === "bound") {
+      const actor = actorFrom(reviewNode.user);
+      if (
+        actor &&
+        reviewedHeadSha &&
+        (reviewState === "changes_requested" || reviewState === "commented")
+      ) {
+        await enqueueBoundFollowup(
+          ctx,
+          route,
+          reviewFollowup({
+            owner: repo.owner,
+            repo: repo.repo,
+            number,
+            reviewId,
+            reviewNodeId: stringValue(reviewNode.node_id),
+            reviewState,
+            reviewBody: stringValue(reviewNode.body),
+            headSha: reviewedHeadSha,
+            actor,
+          }),
+        );
+      }
+      return;
+    }
+  }
+
   if (
     !(await claim(
       ctx,
@@ -380,7 +471,7 @@ export async function handleReviewEvent(
   }
 
   if (reviewState === "approved") {
-    await tryMerge(ctx, repo.owner, repo.repo, number);
+    await tryMerge(ctx, repo.owner, repo.repo, number, actorFrom(reviewNode.user));
     return;
   }
   if (reviewState === "changes_requested" || reviewState === "commented") {
@@ -418,7 +509,16 @@ export async function handleCiEvent(
       : await fetchPrNumbersForCommit(ctx, repo.owner, repo.repo, target.headSha);
   await Promise.all(
     prNumbers.map((number) =>
-      processCi(ctx, repo.owner, repo.repo, number, target.headSha, false, evaluation),
+      processCi(
+        ctx,
+        repo.owner,
+        repo.repo,
+        number,
+        target.headSha,
+        false,
+        evaluation,
+        actorFrom(payload.sender),
+      ),
     ),
   );
 }
@@ -431,6 +531,7 @@ async function processCi(
   headSha: string,
   force = false,
   knownEvaluation?: CiEvaluation | null,
+  actor?: FollowupActor,
 ): Promise<void> {
   const pr = await fetchPr(ctx, owner, repo, number);
   if (!pr || !owns(ctx, pr)) return;
@@ -440,6 +541,29 @@ async function processCi(
   const evaluation =
     knownEvaluation ?? (await fetchCiEvaluation(ctx, owner, repo, headSha));
   if (!evaluation?.settled) return; // wait until *all* checks are done (and readable).
+  // Red CI on a managed bound PR queues one follow-up per head (api-rs
+  // collapses repeats); green still runs the unchanged merge path below.
+  if (ctx.bindings && evaluation.failed) {
+    const route = await resolveBindingRoute(ctx, owner, repo, number);
+    if (route.kind === "unknown") return;
+    if (route.kind === "bound") {
+      if (actor) {
+        await enqueueBoundFollowup(
+          ctx,
+          route,
+          ciFailureFollowup({
+            owner,
+            repo,
+            number,
+            headSha,
+            failingNames: evaluation.failingNames,
+            actor,
+          }),
+        );
+      }
+      return;
+    }
+  }
   // Act once per fully-settled SHA (the last-arriving check event wins).
   const firstSettle = await claim(
     ctx,
@@ -459,7 +583,7 @@ async function processCi(
       }
       traceLog(ctx.options, "githubbot_ci_green", trace, { pr: `${owner}/${repo}#${number}` });
     }
-    await tryMerge(ctx, owner, repo, number);
+    await tryMerge(ctx, owner, repo, number, actor);
     return;
   }
   if (!firstSettle) return;
@@ -497,6 +621,7 @@ async function tryMerge(
   owner: string,
   repo: string,
   number: number,
+  actor?: FollowupActor,
 ): Promise<void> {
   const pr = await fetchPr(ctx, owner, repo, number);
   if (!pr || !owns(ctx, pr)) return;
@@ -572,6 +697,20 @@ async function tryMerge(
     return;
   }
   if (decision === "resolve_conflict") {
+    if (ctx.bindings) {
+      const route = await resolveBindingRoute(ctx, owner, repo, number);
+      if (route.kind === "unknown") return;
+      if (route.kind === "bound") {
+        if (actor) {
+          await enqueueBoundFollowup(
+            ctx,
+            route,
+            conflictFollowup({ owner, repo, number, headSha: pr.headSha, actor }),
+          );
+        }
+        return;
+      }
+    }
     fireConflictTurn(ctx, owner, repo, pr);
   }
 }

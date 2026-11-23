@@ -314,6 +314,18 @@ pub fn derive_github_requester_principal(
     {
         return None;
     }
+    github_user_principal(github_user_id, display_name)
+}
+
+/// The per-user GitHub principal for a numeric GitHub user id, on any thread.
+/// Only callers holding a server-set GitHub identity may use it off GitHub
+/// threads: a dispatched PR follow-up carries its event actor as
+/// `pr_followup_github_user_id`, which the API strips from every caller.
+/// Returns `None` for non-numeric ids.
+pub fn github_user_principal(
+    github_user_id: &str,
+    display_name: Option<&str>,
+) -> Option<PrincipalRef> {
     let user = github_user_id.trim();
     if user.is_empty() || !user.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
