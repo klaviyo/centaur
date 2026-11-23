@@ -831,10 +831,7 @@ impl AgentSandboxBackend {
         if self.config.iron_proxy.is_none() {
             return Ok(());
         }
-        let proxy_id = self.proxy_id_for_sandbox(id).await?;
-        if let Some(proxy_id) = proxy_id
-            && self.has_usable_iron_proxy_resources(id).await?
-        {
+        if let Some(proxy_id) = self.live_iron_proxy_id(id).await? {
             let sandbox = self
                 .sandboxes()
                 .get(id.as_str())
@@ -849,6 +846,9 @@ impl AgentSandboxBackend {
                 return Ok(());
             }
 
+            if labels.is_empty() {
+                self.mark_proxy_binding_pending(id).await?;
+            }
             let iron_control = &self.config.iron_control;
             iron_control
                 .client
@@ -867,6 +867,9 @@ impl AgentSandboxBackend {
             principal_id,
             "iron-proxy resources are missing or not running; recreating before reuse"
         );
+        if labels.is_empty() {
+            self.mark_proxy_binding_pending(id).await?;
+        }
         self.recreate_iron_proxy_resources_for_principal(
             id,
             principal_id,
@@ -1170,6 +1173,36 @@ impl AgentSandboxBackend {
         Ok(None)
     }
 
+    /// The id of the proxy now serving the sandbox: its running, ready, not
+    /// terminating pod's, when the proxy service exists too. Read from the
+    /// cluster rather than this replica's cache, which goes stale once another
+    /// replica recreates the proxy, so a rebind always reaches the live proxy.
+    /// Refreshes the cache. `None` means the proxy needs repair.
+    async fn live_iron_proxy_id(&self, id: &SandboxId) -> SandboxResult<Option<String>> {
+        let params = ListParams::default().labels(&format!(
+            "{IRON_PROXY_LABEL}=true,{SANDBOX_ID_LABEL}={}",
+            id.as_str()
+        ));
+        let pods = self
+            .pods()
+            .list(&params)
+            .await
+            .map_err(|err| map_kube_error("list iron-proxy pods", err))?;
+        let Some(proxy_id) = live_proxy_id(&pods.items) else {
+            return Ok(None);
+        };
+        match self.services().get(&iron_proxy_service_name(id)).await {
+            Ok(_) => {}
+            Err(err) if is_not_found(&err) => return Ok(None),
+            Err(err) => return Err(map_kube_error("get iron-proxy service", err)),
+        }
+        self.proxy_ids
+            .lock()
+            .await
+            .insert(id.as_str().to_owned(), proxy_id.clone());
+        Ok(Some(proxy_id))
+    }
+
     async fn has_usable_iron_proxy_resources(&self, id: &SandboxId) -> SandboxResult<bool> {
         let params = ListParams::default().labels(&format!(
             "{IRON_PROXY_LABEL}=true,{SANDBOX_ID_LABEL}={}",
@@ -1240,12 +1273,13 @@ impl AgentSandboxBackend {
     ) -> SandboxResult<()> {
         // A merge-patch null removes the requester annotation, so "no
         // requester" and "absent annotation" stay indistinguishable for the
-        // binding comparison.
+        // binding comparison. It also clears any pending-rebind marker.
         let patch = Patch::Merge(json!({
             "metadata": {
                 "annotations": {
                     crate::IRON_CONTROL_PRINCIPAL_ANNOTATION: principal_id,
                     crate::IRON_CONTROL_REQUESTER_ANNOTATION: requester_principal_id,
+                    crate::IRON_CONTROL_BINDING_PENDING_ANNOTATION: null,
                 },
             },
         }));
@@ -1254,6 +1288,26 @@ impl AgentSandboxBackend {
             .await
             .map(|_| ())
             .map_err(|err| map_kube_error("patch sandbox iron-control principal", err))
+    }
+
+    /// Marks a proxy rebind as in flight before it touches the proxy. If the
+    /// rebind then fails before its annotations are written, the marker stays
+    /// and the next ensure reassigns instead of trusting stale annotations.
+    /// Only label-less bindings need it: a binding with labels always
+    /// reassigns, so it never trusts the annotations.
+    async fn mark_proxy_binding_pending(&self, id: &SandboxId) -> SandboxResult<()> {
+        let patch = Patch::Merge(json!({
+            "metadata": {
+                "annotations": {
+                    crate::IRON_CONTROL_BINDING_PENDING_ANNOTATION: "true",
+                },
+            },
+        }));
+        self.sandboxes()
+            .patch(id.as_str(), &PatchParams::default(), &patch)
+            .await
+            .map(|_| ())
+            .map_err(|err| map_kube_error("mark sandbox proxy rebind pending", err))
     }
 
     fn services(&self) -> Api<Service> {
@@ -1445,7 +1499,9 @@ async fn wait_for_proxy_ack(
 /// env (so env overrides are respected). `None` for pods that are not
 /// running or predate the management env wiring.
 fn proxy_management_endpoint_from_pod(pod: &Pod) -> Option<ProxyManagementEndpoint> {
-    if !pod_running(pod) {
+    // A pod being deleted may still report Ready while its replacement starts;
+    // the barrier must wait on the proxy that will serve.
+    if pod.metadata.deletion_timestamp.is_some() || !pod_running(pod) {
         return None;
     }
     let pod_ip = pod.status.as_ref()?.pod_ip.as_deref()?;
@@ -2263,6 +2319,21 @@ fn pod_running(pod: &Pod) -> bool {
             })
 }
 
+/// The proxy id recorded on a running, ready proxy pod that is not being
+/// deleted.
+fn live_proxy_id(pods: &[Pod]) -> Option<String> {
+    pods.iter()
+        .filter(|pod| pod.metadata.deletion_timestamp.is_none() && pod_running(pod))
+        .find_map(|pod| {
+            pod.metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(IRON_CONTROL_PROXY_ID_ANNOTATION))
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+        })
+}
+
 fn pod_stopped(pod: &Pod) -> bool {
     pod.status
         .as_ref()
@@ -2484,7 +2555,8 @@ fn iron_proxy_labels(id: &SandboxId, observability_enabled: bool) -> BTreeMap<St
 /// so the ensure path can skip a redundant reassignment. An absent requester
 /// annotation means "no requester" and compares equal to `None`, keeping
 /// label-less sessions (tool-host, non-Slack) on the skip path. Any label
-/// refresh always reassigns, mirroring the pre-requester behavior.
+/// refresh always reassigns, mirroring the pre-requester behavior, as does a
+/// rebind left pending by an earlier failure.
 fn proxy_binding_matches(
     annotations: Option<&BTreeMap<String, String>>,
     principal_id: &str,
@@ -2495,9 +2567,13 @@ fn proxy_binding_matches(
         .and_then(|annotations| annotations.get(crate::IRON_CONTROL_PRINCIPAL_ANNOTATION));
     let assigned_requester = annotations
         .and_then(|annotations| annotations.get(crate::IRON_CONTROL_REQUESTER_ANNOTATION));
+    let rebind_pending = annotations.is_some_and(|annotations| {
+        annotations.contains_key(crate::IRON_CONTROL_BINDING_PENDING_ANNOTATION)
+    });
     assigned_principal.map(String::as_str) == Some(principal_id)
         && assigned_requester.map(String::as_str) == requester_principal_id
         && labels.is_empty()
+        && !rebind_pending
 }
 
 fn unique_suffix() -> String {
@@ -2595,6 +2671,48 @@ mod tests {
         annotations
     }
 
+    fn proxy_pod(proxy_id: &str, ready: bool, terminating: bool) -> Pod {
+        use k8s_openapi::{
+            api::core::v1::{PodCondition, PodStatus},
+            apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time},
+        };
+
+        Pod {
+            metadata: ObjectMeta {
+                annotations: Some(BTreeMap::from([(
+                    IRON_CONTROL_PROXY_ID_ANNOTATION.to_owned(),
+                    proxy_id.to_owned(),
+                )])),
+                deletion_timestamp: terminating.then(|| Time(jiff::Timestamp::now())),
+                ..Default::default()
+            },
+            status: Some(PodStatus {
+                phase: Some("Running".to_owned()),
+                conditions: Some(vec![PodCondition {
+                    type_: "Ready".to_owned(),
+                    status: if ready { "True" } else { "False" }.to_owned(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn live_proxy_id_reads_the_serving_pod() {
+        // A recreated proxy replaces a terminating one: the rebind must reach
+        // the new proxy, not a replica's cached id for the old one.
+        let pods = [
+            proxy_pod("iprx_retired", true, true),
+            proxy_pod("iprx_starting", false, false),
+            proxy_pod("iprx_live", true, false),
+        ];
+        assert_eq!(live_proxy_id(&pods).as_deref(), Some("iprx_live"));
+        assert_eq!(live_proxy_id(&pods[..2]), None);
+        assert_eq!(live_proxy_id(&[]), None);
+    }
+
     #[test]
     fn proxy_binding_matches_compares_principal_requester_and_labels() {
         let no_labels = BTreeMap::new();
@@ -2651,6 +2769,20 @@ mod tests {
             &labels
         ));
         assert!(!proxy_binding_matches(None, "prn_conv", None, &no_labels));
+
+        // A rebind that failed partway leaves its marker, so even matching
+        // annotations reassign.
+        let mut pending = binding_annotations(Some("prn_conv"), None);
+        pending.insert(
+            crate::IRON_CONTROL_BINDING_PENDING_ANNOTATION.to_owned(),
+            "true".to_owned(),
+        );
+        assert!(!proxy_binding_matches(
+            Some(&pending),
+            "prn_conv",
+            None,
+            &no_labels
+        ));
     }
 
     fn control_target() -> ControlPlaneEgressTarget {
@@ -3462,6 +3594,16 @@ mod tests {
             vec![env_var("IRON_MANAGEMENT_API_KEY", "key-123")],
         );
         pod.status.as_mut().unwrap().phase = Some("Pending".to_owned());
+        assert!(proxy_management_endpoint_from_pod(&pod).is_none());
+
+        // A pod being deleted yields no endpoint, even while it reports Ready.
+        let mut pod = running_proxy_pod(
+            "10.1.2.3",
+            vec![env_var("IRON_MANAGEMENT_API_KEY", "key-123")],
+        );
+        pod.metadata.deletion_timestamp = Some(
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(jiff::Timestamp::now()),
+        );
         assert!(proxy_management_endpoint_from_pod(&pod).is_none());
     }
 

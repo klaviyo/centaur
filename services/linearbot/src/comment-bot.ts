@@ -219,15 +219,18 @@ export function buildCommentReplyBody(input: {
   answer: string;
   cotLines: string[];
   fallback?: string;
+  /** Shown after the answer and never truncated with it. */
+  note?: string;
 }): string {
   const raw =
     input.answer.trim() ||
     input.fallback?.trim() ||
     "Execution completed, but no final text was captured.";
-  const answer =
+  const truncated =
     raw.length > ANSWER_MAX_CHARS
       ? `${raw.slice(0, ANSWER_MAX_CHARS).trimEnd()}\n[truncated]`
       : raw;
+  const answer = input.note ? `${truncated}\n\n${input.note}` : truncated;
   if (input.cotLines.length === 0) return answer;
   const cot = input.cotLines.map((line) => `- ${line}`).join("\n");
   return `${answer}\n\n${collapsibleSection("Chain of thought", cot)}`;

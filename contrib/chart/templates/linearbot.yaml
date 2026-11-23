@@ -1,5 +1,6 @@
 {{- if .Values.linearbot.enabled }}
 {{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
+{{- $console := include "centaur.consoleValues" . | fromYaml -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -39,6 +40,11 @@ spec:
               value: "3001"
             - name: CENTAUR_API_URL
               value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}
+{{- if $console.publicUrl }}
+            # Where the bot sends people to connect their Linear account.
+            - name: CENTAUR_CONSOLE_PUBLIC_URL
+              value: {{ $console.publicUrl | quote }}
+{{- end }}
             # New threads without an explicit --claude/--amp/--codex flag run
             # the deployment's default harness.
             - name: LINEARBOT_DEFAULT_HARNESS

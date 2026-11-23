@@ -31,7 +31,7 @@ use centaur_session_core::{
     SessionMessageInput, ThreadKey,
 };
 use centaur_session_sqlx::{
-    PgSessionStore, SessionEventListener, SessionStoreError, default_metadata,
+    PgSessionStore, ProxyBindingLock, SessionEventListener, SessionStoreError, default_metadata,
 };
 use centaur_telemetry::{
     record_sandbox_warm_pool_claim, record_session_execution_finished,
@@ -92,6 +92,19 @@ const STDOUT_STALL_LOG_SKEW: Duration = Duration::from_secs(5);
 const STDOUT_INPUT_GRACE: Duration = Duration::from_secs(120);
 #[cfg(test)]
 const STDOUT_INPUT_GRACE: Duration = Duration::from_millis(500);
+/// Waits before each retry of a failed end-of-turn requester unbind.
+#[cfg(not(test))]
+const REQUESTER_RELEASE_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+];
+#[cfg(test)]
+const REQUESTER_RELEASE_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(20),
+    Duration::from_millis(20),
+    Duration::from_millis(20),
+];
 const SESSION_PIPE_MAX_REATTACH_ATTEMPTS: u32 = 3;
 const SESSION_PIPE_REATTACH_DELAY: Duration = Duration::from_millis(500);
 const SESSION_PIPE_CREATED_REATTACH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -185,6 +198,17 @@ impl SessionPrincipalAdmission {
     }
 }
 
+/// What a turn does when its ingress names a linked requester (today, the
+/// triggering Linear user) whom no Console user has linked.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LinkedRequesterPolicy {
+    /// Run without a requester, on the conversation principal's grants alone.
+    #[default]
+    Optional,
+    /// Refuse the turn, so it never runs without that person's own credentials.
+    Required,
+}
+
 #[derive(Clone)]
 pub struct SessionRuntime {
     store: PgSessionStore,
@@ -196,6 +220,7 @@ pub struct SessionRuntime {
     execution_spans: ExecutionSpanRegistry,
     iron_control: Arc<dyn SessionPrincipalRegistrar>,
     session_principal_admission: SessionPrincipalAdmission,
+    linked_requester_policy: LinkedRequesterPolicy,
     warm_pools: Option<WarmPools>,
     personas: Option<Arc<PersonaRegistry>>,
     session_title_generator: Option<SessionTitleGenerator>,
@@ -861,6 +886,7 @@ impl SessionRuntime {
             execution_spans: Arc::new(Mutex::new(HashMap::new())),
             iron_control: Arc::new(iron_control),
             session_principal_admission: SessionPrincipalAdmission::default(),
+            linked_requester_policy: LinkedRequesterPolicy::default(),
             warm_pools: None,
             personas: None,
             session_title_generator: None,
@@ -879,6 +905,11 @@ impl SessionRuntime {
         admission: SessionPrincipalAdmission,
     ) -> Self {
         self.session_principal_admission = admission;
+        self
+    }
+
+    pub fn with_linked_requester_policy(mut self, policy: LinkedRequesterPolicy) -> Self {
+        self.linked_requester_policy = policy;
         self
     }
 
@@ -2437,13 +2468,21 @@ impl SessionRuntime {
                     .await;
                 return Err(error);
             }
-            let requester_principal_id = self
+            let requester_principal_id = match self
                 .resolve_requester_principal(
                     thread_key,
                     &execution.execution_id,
                     requester_metadata.as_ref(),
                 )
-                .await;
+                .await
+            {
+                Ok(requester_principal_id) => requester_principal_id,
+                Err(error) => {
+                    self.record_execution_failure(thread_key, &execution.execution_id, &error)
+                        .await;
+                    return Err(error);
+                }
+            };
             let desired_capabilities = match pre_resolved_sandbox_capabilities {
                 Some(capabilities) => capabilities,
                 None => match self
@@ -2589,6 +2628,12 @@ impl SessionRuntime {
         let session = self.store.get_session(thread_key).await?;
         validate_input_lines(&input.input_lines)?;
         let _ = duration_options(input.idle_timeout_ms, input.max_duration_ms)?;
+        self.refuse_unlinked_requester(
+            thread_key,
+            input.idempotency_key.as_deref(),
+            input.metadata.as_ref(),
+        )
+        .await?;
         // The persisted request keeps the caller's lines; the driver pins
         // them to the persona model when it writes them to the sandbox.
         let persona_model = self.persona_model(&session);
@@ -2732,6 +2777,9 @@ impl SessionRuntime {
             Some(runtime_error_failure_class(error)),
         )
         .await;
+        // A dispatch can fail after the sandbox's proxy was bound to this
+        // turn's requester (writing input, opening the pipe).
+        spawn_turn_requester_release(self.context(), thread_key.clone());
     }
 
     async fn handle_stdout_claim_failure(
@@ -3131,6 +3179,13 @@ impl SessionRuntime {
                         "replacing existing sandbox whose capabilities do not match"
                     );
                 } else {
+                // Held from the status check through resume and rebind: resume
+                // recreates the proxy from the requester annotation, so a
+                // turn-end unbind must not interleave with either step.
+                let _binding = match iron_control_principal {
+                    Some(_) => lock_proxy_binding_for_unbind(&self.store, thread_key).await?,
+                    None => None,
+                };
                 match self.sandbox_runtime.manager.status(&id).await {
                     Ok(status) => match existing_sandbox_action(&status) {
                         ExistingSandboxAction::Reuse => {
@@ -3472,19 +3527,29 @@ impl SessionRuntime {
         result
     }
 
-    /// Resolve and upsert the principal of the human requesting this turn from
-    /// the execute metadata. `None` for DM and non-Slack threads (the
-    /// registrar decides) and on registrar failure: a broken requester lookup
-    /// must degrade to today's requester-less turn, never fail the execution.
-    /// A named requester who has not linked their account also runs without
-    /// one, but records `session.requester_unresolved` so the ingress and
-    /// operators can see why the turn lacked that person's credentials.
-    async fn resolve_requester_principal(
+    /// Under [`LinkedRequesterPolicy::Required`], refuse an unlinked requester
+    /// before the turn is queued, so the caller gets the refusal on its request
+    /// instead of a queued execution that fails later. Any other lookup outcome
+    /// admits the turn; dispatch resolves the requester again, which also
+    /// catches an account unlinked in between. A retry whose idempotency key
+    /// already created an execution skips the check and gets that execution
+    /// back, as any retry does. The key is checked again before refusing, in
+    /// case a concurrent request with it was accepted during the lookup.
+    async fn refuse_unlinked_requester(
         &self,
         thread_key: &ThreadKey,
-        execution_id: &str,
+        idempotency_key: Option<&str>,
         metadata: Option<&Value>,
-    ) -> Option<String> {
+    ) -> Result<(), SessionRuntimeError> {
+        if self.linked_requester_policy != LinkedRequesterPolicy::Required {
+            return Ok(());
+        }
+        if self
+            .idempotency_key_was_accepted(thread_key, idempotency_key)
+            .await?
+        {
+            return Ok(());
+        }
         match self
             .iron_control
             .register_requester(
@@ -3494,15 +3559,79 @@ impl SessionRuntime {
             )
             .await
         {
-            Ok(principal) => principal.map(|principal| principal.id),
             Err(IronControlError::RequesterNotLinked { provider, subject }) => {
+                if self
+                    .idempotency_key_was_accepted(thread_key, idempotency_key)
+                    .await?
+                {
+                    return Ok(());
+                }
+                info!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_requester_not_linked",
+                    thread_key = %thread_key,
+                    provider,
+                    refused = true,
+                    "requester has not linked their account; refusing the turn"
+                );
+                Err(SessionRuntimeError::IronControl(
+                    IronControlError::RequesterNotLinked { provider, subject },
+                ))
+            }
+            Ok(_) | Err(_) => Ok(()),
+        }
+    }
+
+    async fn idempotency_key_was_accepted(
+        &self,
+        thread_key: &ThreadKey,
+        idempotency_key: Option<&str>,
+    ) -> Result<bool, SessionRuntimeError> {
+        let Some(idempotency_key) = idempotency_key else {
+            return Ok(false);
+        };
+        Ok(self
+            .store
+            .execution_for_idempotency_key(thread_key, idempotency_key)
+            .await?
+            .is_some())
+    }
+
+    /// Resolve and upsert the principal of the human requesting this turn from
+    /// the execute metadata. `None` for DM and non-Slack threads (the
+    /// registrar decides) and on registrar failure: a broken requester lookup
+    /// must degrade to today's requester-less turn, never fail the execution.
+    /// A named requester who has not linked their account records
+    /// `session.requester_unresolved` so the ingress and operators can see why
+    /// the turn lacked that person's credentials. Under
+    /// [`LinkedRequesterPolicy::Optional`] the turn then runs without a
+    /// requester; under [`LinkedRequesterPolicy::Required`] it is refused.
+    async fn resolve_requester_principal(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        metadata: Option<&Value>,
+    ) -> Result<Option<String>, SessionRuntimeError> {
+        match self
+            .iron_control
+            .register_requester(
+                thread_key.as_str(),
+                metadata,
+                self.session_principal_admission.create_if_missing(),
+            )
+            .await
+        {
+            Ok(principal) => Ok(principal.map(|principal| principal.id)),
+            Err(IronControlError::RequesterNotLinked { provider, subject }) => {
+                let refused = self.linked_requester_policy == LinkedRequesterPolicy::Required;
                 info!(
                     component = COMPONENT_SESSION_RUNTIME,
                     event = "session_requester_not_linked",
                     thread_key = %thread_key,
                     execution_id,
                     provider,
-                    "requester has not linked their account; proceeding without a requester"
+                    refused,
+                    "requester has not linked their account"
                 );
                 if let Err(error) = self
                     .store
@@ -3515,6 +3644,7 @@ impl SessionRuntime {
                             "reason": "not_linked",
                             "provider": provider,
                             "subject": subject,
+                            "refused": refused,
                         }),
                     )
                     .await
@@ -3528,7 +3658,12 @@ impl SessionRuntime {
                         "failed to record the unresolved requester"
                     );
                 }
-                None
+                if refused {
+                    return Err(SessionRuntimeError::IronControl(
+                        IronControlError::RequesterNotLinked { provider, subject },
+                    ));
+                }
+                Ok(None)
             }
             Err(error) => {
                 warn!(
@@ -3538,7 +3673,7 @@ impl SessionRuntime {
                     %error,
                     "failed to register requester principal; proceeding without a requester"
                 );
-                None
+                Ok(None)
             }
         }
     }
@@ -5972,6 +6107,7 @@ async fn record_terminal_output(
             else {
                 return Ok(());
             };
+            spawn_turn_requester_release(ctx.clone(), thread_key.clone());
             let mut payload = json!({
                 "execution_id": execution_id,
                 "thread_key": thread_key.as_str(),
@@ -6004,6 +6140,7 @@ async fn record_terminal_output(
             else {
                 return Ok(());
             };
+            spawn_turn_requester_release(ctx.clone(), thread_key.clone());
             ctx.store
                 .append_event(
                     thread_key,
@@ -6031,6 +6168,7 @@ async fn record_terminal_output(
             else {
                 return Ok(());
             };
+            spawn_turn_requester_release(ctx.clone(), thread_key.clone());
             ctx.store
                 .append_event(
                     thread_key,
@@ -6150,6 +6288,7 @@ async fn record_max_duration_failure(
     else {
         return Ok(());
     };
+    spawn_turn_requester_release(ctx.clone(), thread_key.clone());
     if let Some(span) = ctx.execution_spans.lock().await.remove(execution_id) {
         finish_execution_trace_span(&span, "failed");
     }
@@ -6199,6 +6338,108 @@ async fn record_max_duration_failure(
     Ok(())
 }
 
+/// Unbind the turn's requester from a Linear thread's proxy once the turn
+/// ends, however it ends: every path that records a terminal execution calls
+/// this. Everyone who comments on an issue shares its sandbox, so a process one
+/// person's turn left running must not keep making proxied calls with that
+/// person's credentials. Slack threads keep the binding: their requester is
+/// already rebound per turn, and an unbind there would add a proxy round trip
+/// to every turn. Rebinding to the conversation principal alone is a no-op
+/// when no requester is bound. The unbind holds the thread's proxy-binding
+/// lock, as a dispatch's resume and rebind and an idle pause do, so none of
+/// them interleave across api-rs replicas: a turn that is already queued
+/// keeps its binding, and a turn queued while the unbind runs rebinds after
+/// it. A sandbox that is no longer running is left for resume to rebind.
+///
+/// A failed unbind retries with backoff. If every attempt fails, the binding
+/// lasts until the thread's next turn rebinds the proxy or the idle pause
+/// stops the sandbox's processes.
+fn spawn_turn_requester_release(ctx: RuntimeContext, thread_key: ThreadKey) {
+    if !unbinds_requester_at_turn_end(&thread_key) {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut delays = REQUESTER_RELEASE_RETRY_DELAYS.iter();
+        loop {
+            let Err(error) = release_turn_requester(&ctx, &thread_key).await else {
+                return;
+            };
+            let Some(delay) = delays.next() else {
+                warn!(
+                    component = COMPONENT_SESSION_RUNTIME,
+                    event = "session_requester_release_failed",
+                    thread_key = %thread_key,
+                    %error,
+                    "failed to unbind the turn requester from the sandbox proxy"
+                );
+                return;
+            };
+            info!(
+                component = COMPONENT_SESSION_RUNTIME,
+                event = "session_requester_release_retry",
+                thread_key = %thread_key,
+                %error,
+                retry_in_ms = duration_millis_u64(*delay),
+                "retrying the turn requester unbind"
+            );
+            sleep(*delay).await;
+        }
+    });
+}
+
+fn unbinds_requester_at_turn_end(thread_key: &ThreadKey) -> bool {
+    thread_key.as_str().starts_with("linear:")
+}
+
+/// The thread's proxy-binding lock, for threads whose requester is unbound at
+/// turn end; `None` elsewhere, where no unbind can interleave with a rebind.
+async fn lock_proxy_binding_for_unbind(
+    store: &PgSessionStore,
+    thread_key: &ThreadKey,
+) -> Result<Option<ProxyBindingLock>, SessionRuntimeError> {
+    if !unbinds_requester_at_turn_end(thread_key) {
+        return Ok(None);
+    }
+    Ok(Some(store.lock_proxy_binding(thread_key).await?))
+}
+
+async fn release_turn_requester(
+    ctx: &RuntimeContext,
+    thread_key: &ThreadKey,
+) -> Result<(), SessionRuntimeError> {
+    let _binding = ctx.store.lock_proxy_binding(thread_key).await?;
+    let session = ctx.store.get_session(thread_key).await?;
+    let (Some(principal_id), Some(sandbox_id)) = (
+        session.iron_control_principal.as_deref(),
+        session.sandbox_id.as_deref(),
+    ) else {
+        return Ok(());
+    };
+    if ctx
+        .store
+        .active_execution_for_thread(thread_key)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let id = SandboxId::new(sandbox_id);
+    // A paused or stopped sandbox has no process left to make proxied calls,
+    // and repairing its proxy here would recreate one for it. Resume rebinds
+    // the proxy before the next turn runs. Any other status, including one the
+    // backend cannot read, may still have processes running, so it unbinds.
+    match ctx.manager.status(&id).await {
+        Ok(SandboxStatus::Suspended | SandboxStatus::Stopped | SandboxStatus::Gone)
+        | Err(SandboxError::NotFound(_)) => return Ok(()),
+        Ok(SandboxStatus::Running | SandboxStatus::Created | SandboxStatus::Unknown(_)) => {}
+        Err(error) => return Err(SessionRuntimeError::Sandbox(error)),
+    }
+    ctx.manager
+        .ensure_iron_control_proxy_resources(&id, principal_id, None, &session.proxy_labels)
+        .await?;
+    Ok(())
+}
+
 fn spawn_idle_pause(
     ctx: RuntimeContext,
     thread_key: ThreadKey,
@@ -6233,6 +6474,9 @@ async fn record_idle_pause(
     sandbox_id: &str,
     idle_timeout: Option<Duration>,
 ) -> Result<bool, SessionRuntimeError> {
+    // Pausing tears down the sandbox's proxy, so it holds the thread's
+    // proxy-binding lock as rebinds and unbinds do.
+    let _binding = lock_proxy_binding_for_unbind(&ctx.store, thread_key).await?;
     let latest_execution = ctx.store.latest_execution_for_thread(thread_key).await?;
     let session = ctx.store.get_session(thread_key).await?;
     if !should_pause_idle_sandbox(
@@ -10017,6 +10261,7 @@ mod adoption_tests {
         stop_fails: AtomicBool,
         stopped: std::sync::Mutex<Vec<String>>,
         proxy_ensures: std::sync::Mutex<Vec<ProxyEnsure>>,
+        proxy_ensure_failures: AtomicUsize,
         missing_on_stop: std::sync::Mutex<BTreeSet<String>>,
         observability_enabled: std::sync::Mutex<Vec<String>>,
         observability_fails: AtomicBool,
@@ -10047,6 +10292,7 @@ mod adoption_tests {
                 stop_fails: AtomicBool::new(false),
                 stopped: std::sync::Mutex::new(Vec::new()),
                 proxy_ensures: std::sync::Mutex::new(Vec::new()),
+                proxy_ensure_failures: AtomicUsize::new(0),
                 missing_on_stop: std::sync::Mutex::new(BTreeSet::new()),
                 observability_enabled: std::sync::Mutex::new(Vec::new()),
                 observability_fails: AtomicBool::new(false),
@@ -10138,6 +10384,10 @@ mod adoption_tests {
 
         fn proxy_ensures(&self) -> Vec<ProxyEnsure> {
             self.proxy_ensures.lock().unwrap().clone()
+        }
+
+        fn fail_next_proxy_ensures(&self, count: usize) {
+            self.proxy_ensure_failures.store(count, Ordering::SeqCst);
         }
 
         fn created_specs(&self) -> Vec<SandboxSpec> {
@@ -10258,6 +10508,15 @@ mod adoption_tests {
                 requester_principal_id.map(ToOwned::to_owned),
                 labels.clone(),
             ));
+            if self
+                .proxy_ensure_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(SandboxError::backend("injected proxy ensure failure"));
+            }
             Ok(())
         }
 
@@ -11932,7 +12191,938 @@ mod adoption_tests {
                 "reason": "not_linked",
                 "provider": "linear",
                 "subject": "lin-user-1",
+                "refused": false,
             })
+        );
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn required_linked_requester_refuses_an_unlinked_linear_turn() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, _stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url))
+                .with_linked_requester_policy(LinkedRequesterPolicy::Required);
+
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+
+        let error = runtime
+            .execute_session(
+                &thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: None,
+                    metadata: Some(json!({"linear_user_id": "lin-user-1"})),
+                    input_lines: vec![
+                        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#
+                            .to_owned(),
+                    ],
+                    idle_timeout_ms: None,
+                    max_duration_ms: None,
+                },
+            )
+            .await
+            .expect_err("an unlinked requester is refused");
+        assert!(matches!(
+            error,
+            SessionRuntimeError::IronControl(IronControlError::RequesterNotLinked { .. })
+        ));
+        assert!(
+            backend.created_specs().is_empty(),
+            "a refused turn never starts a sandbox"
+        );
+        let latest = store
+            .latest_execution_for_thread(&thread_key)
+            .await
+            .expect("load latest execution")
+            .expect("execution exists");
+        assert_eq!(latest.status, ExecutionStatus::Failed);
+        let unresolved = events(&store, &thread_key)
+            .await
+            .into_iter()
+            .find(|event| event.event_type == "session.requester_unresolved")
+            .expect("the refusal is recorded on the thread");
+        assert_eq!(unresolved.payload["refused"], json!(true));
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn required_linked_requester_refuses_before_enqueueing() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url))
+                .with_linked_requester_policy(LinkedRequesterPolicy::Required);
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+
+        let error = runtime
+            .enqueue_session_execution(
+                &thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: None,
+                    metadata: Some(json!({"linear_user_id": "lin-user-1"})),
+                    input_lines: vec![
+                        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#
+                            .to_owned(),
+                    ],
+                    idle_timeout_ms: None,
+                    max_duration_ms: None,
+                },
+            )
+            .await
+            .expect_err("the HTTP path refuses an unlinked requester up front");
+        assert!(matches!(
+            error,
+            SessionRuntimeError::IronControl(IronControlError::RequesterNotLinked { .. })
+        ));
+        assert!(
+            store
+                .latest_execution_for_thread(&thread_key)
+                .await
+                .expect("load latest execution")
+                .is_none(),
+            "a refused turn is never queued"
+        );
+        assert!(backend.created_specs().is_empty());
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn required_linked_requester_returns_an_accepted_retry() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url))
+                .with_linked_requester_policy(LinkedRequesterPolicy::Required);
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+        // Accepted earlier, e.g. before the person unlinked their account.
+        let accepted = store
+            .create_execution_with_request(
+                &thread_key,
+                Some("comment-1"),
+                json!({"linear_user_id": "lin-user-1"}),
+                json!({"input_lines": []}),
+            )
+            .await
+            .expect("record accepted execution")
+            .execution;
+        store
+            .complete_execution(&accepted.execution_id)
+            .await
+            .expect("complete execution");
+
+        let retried = runtime
+            .enqueue_session_execution(
+                &thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: Some("comment-1".to_owned()),
+                    metadata: Some(json!({"linear_user_id": "lin-user-1"})),
+                    input_lines: vec![
+                        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#
+                            .to_owned(),
+                    ],
+                    idle_timeout_ms: None,
+                    max_duration_ms: None,
+                },
+            )
+            .await
+            .expect("a retry gets its existing execution back");
+        assert_eq!(retried.execution_id, accepted.execution_id);
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn linear_turn_past_max_duration_unbinds_the_requester_from_the_proxy() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, _stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+        runtime
+            .execute_session(
+                &thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: None,
+                    metadata: Some(json!({})),
+                    input_lines: vec![
+                        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#
+                            .to_owned(),
+                    ],
+                    idle_timeout_ms: None,
+                    max_duration_ms: Some(50),
+                },
+            )
+            .await
+            .expect("execute session");
+
+        // No terminal output ever arrives: the max-duration timer ends the turn.
+        wait_for_event(&store, &thread_key, "session.execution_failed").await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some((_sandbox_id, _principal_id, requester, _labels)) =
+                backend.proxy_ensures().first()
+            {
+                assert_eq!(
+                    requester, &None,
+                    "the timed-out turn's requester is unbound"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "max duration never unbound the requester"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn linear_turn_end_unbinds_the_requester_from_the_proxy() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+        execute_with_metadata(&runtime, &thread_key, json!({})).await;
+        assert!(backend.proxy_ensures().is_empty());
+
+        stdout
+            .write_all(&completed_output_bytes("Done."))
+            .await
+            .expect("write terminal output");
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        let session = store.get_session(&thread_key).await.expect("load session");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let ensures = backend.proxy_ensures();
+            if let Some((sandbox_id, principal_id, requester, _labels)) = ensures.first() {
+                assert_eq!(Some(sandbox_id.as_str()), session.sandbox_id.as_deref());
+                assert_eq!(
+                    Some(principal_id.as_str()),
+                    session.iron_control_principal.as_deref()
+                );
+                assert_eq!(requester, &None, "the turn's requester is unbound");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "turn end never unbound the requester"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn linear_turn_end_retries_a_failed_requester_unbind() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+        execute_with_metadata(&runtime, &thread_key, json!({})).await;
+        assert!(backend.proxy_ensures().is_empty());
+        backend.fail_next_proxy_ensures(2);
+
+        stdout
+            .write_all(&completed_output_bytes("Done."))
+            .await
+            .expect("write terminal output");
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        let session = store.get_session(&thread_key).await.expect("load session");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while backend.proxy_ensures().len() < 3 {
+            assert!(
+                Instant::now() < deadline,
+                "the failed unbind was never retried"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+        let ensures = backend.proxy_ensures();
+        assert!(
+            ensures.iter().all(|(sandbox_id, _, requester, _)| {
+                Some(sandbox_id.as_str()) == session.sandbox_id.as_deref() && requester.is_none()
+            }),
+            "every attempt unbinds the requester"
+        );
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    /// Reports every Linear requester as unlinked, and has a concurrent request
+    /// with the same idempotency key accepted during the first lookup.
+    struct AcceptedDuringLookupRegistrar {
+        store: PgSessionStore,
+        idempotency_key: &'static str,
+        accepted: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionPrincipalRegistrar for AcceptedDuringLookupRegistrar {
+        async fn register_session(
+            &self,
+            _thread_key: &str,
+            _metadata: Option<&Value>,
+            _create_if_missing: bool,
+        ) -> Result<Principal, IronControlError> {
+            Ok(test_principal("prn_test"))
+        }
+
+        async fn register_requester(
+            &self,
+            thread_key: &str,
+            _metadata: Option<&Value>,
+            _create_if_missing: bool,
+        ) -> Result<Option<Principal>, IronControlError> {
+            if !self.accepted.swap(true, Ordering::SeqCst) {
+                let thread_key = ThreadKey::parse(thread_key.to_owned()).unwrap();
+                let accepted = self
+                    .store
+                    .create_execution_with_request(
+                        &thread_key,
+                        Some(self.idempotency_key),
+                        json!({"linear_user_id": "lin-user-1"}),
+                        json!({"input_lines": []}),
+                    )
+                    .await
+                    .expect("accept the concurrent request")
+                    .execution;
+                self.store
+                    .complete_execution(&accepted.execution_id)
+                    .await
+                    .expect("complete execution");
+            }
+            Err(IronControlError::RequesterNotLinked {
+                provider: "linear",
+                subject: "lin-user-1".to_owned(),
+            })
+        }
+
+        async fn get_principal(&self, principal: &str) -> Result<Principal, IronControlError> {
+            Ok(test_principal(principal))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn required_linked_requester_returns_a_retry_accepted_during_the_lookup() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = SessionRuntime::new(
+            store.clone(),
+            SandboxRuntime::backend(backend.clone(), SandboxSpec::new("mock")),
+            AcceptedDuringLookupRegistrar {
+                store: store.clone(),
+                idempotency_key: "comment-1",
+                accepted: AtomicBool::new(false),
+            },
+        )
+        .with_linked_requester_policy(LinkedRequesterPolicy::Required);
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+
+        let retried = runtime
+            .enqueue_session_execution(
+                &thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: Some("comment-1".to_owned()),
+                    metadata: Some(json!({"linear_user_id": "lin-user-1"})),
+                    input_lines: vec![
+                        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#
+                            .to_owned(),
+                    ],
+                    idle_timeout_ms: None,
+                    max_duration_ms: None,
+                },
+            )
+            .await
+            .expect("a retry accepted during the lookup gets that execution back");
+        let accepted = store
+            .execution_for_idempotency_key(&thread_key, "comment-1")
+            .await
+            .expect("load accepted execution")
+            .expect("the concurrent request was accepted");
+        assert_eq!(retried.execution_id, accepted.execution_id);
+        assert!(backend.created_specs().is_empty());
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn linear_turn_end_unbind_waits_for_the_proxy_binding_lock() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+        execute_with_metadata(&runtime, &thread_key, json!({})).await;
+        assert!(backend.proxy_ensures().is_empty());
+
+        // Another replica is mid-binding for this thread.
+        let binding = store
+            .lock_proxy_binding(&thread_key)
+            .await
+            .expect("take the proxy-binding lock");
+        stdout
+            .write_all(&completed_output_bytes("Done."))
+            .await
+            .expect("write terminal output");
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        sleep(Duration::from_millis(300)).await;
+        assert!(
+            backend.proxy_ensures().is_empty(),
+            "the unbind waits while another binding holds the lock"
+        );
+
+        drop(binding);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some((_sandbox_id, _principal_id, requester, _labels)) =
+                backend.proxy_ensures().first()
+            {
+                assert_eq!(requester, &None, "the turn's requester is unbound");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the unbind never ran after the lock was released"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reused_sandbox_rebind_waits_for_the_proxy_binding_lock() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+        execute_with_metadata(&runtime, &thread_key, json!({})).await;
+        stdout
+            .write_all(&completed_output_bytes("Done."))
+            .await
+            .expect("write terminal output");
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while backend.proxy_ensures().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the first turn was never unbound"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+
+        // The next turn reuses the sandbox while another replica holds the lock.
+        let (io, _stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let binding = store
+            .lock_proxy_binding(&thread_key)
+            .await
+            .expect("take the proxy-binding lock");
+        runtime
+            .enqueue_session_execution(
+                &thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: None,
+                    metadata: Some(json!({})),
+                    input_lines: vec![
+                        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#
+                            .to_owned(),
+                    ],
+                    idle_timeout_ms: None,
+                    max_duration_ms: None,
+                },
+            )
+            .await
+            .expect("enqueue the next turn");
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            backend.proxy_ensures().len(),
+            1,
+            "the next turn's rebind waits while another binding holds the lock"
+        );
+
+        drop(binding);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while backend.proxy_ensures().len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the next turn never rebound after the lock was released"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    /// Runs one Linear turn to completion and waits for its turn-end unbind,
+    /// returning the session's sandbox id.
+    async fn complete_linear_turn_and_unbind(
+        runtime: &SessionRuntime,
+        store: &PgSessionStore,
+        backend: &MockBackend,
+        thread_key: &ThreadKey,
+    ) -> String {
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        runtime
+            .create_or_get_session(
+                thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+        execute_with_metadata(runtime, thread_key, json!({})).await;
+        stdout
+            .write_all(&completed_output_bytes("Done."))
+            .await
+            .expect("write terminal output");
+        wait_for_event(store, thread_key, "session.execution_completed").await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while backend.proxy_ensures().is_empty() {
+            assert!(Instant::now() < deadline, "the turn was never unbound");
+            sleep(Duration::from_millis(20)).await;
+        }
+        store
+            .get_session(thread_key)
+            .await
+            .expect("load session")
+            .sandbox_id
+            .expect("session has a sandbox")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resumed_sandbox_waits_for_the_proxy_binding_lock_before_resuming() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+        let sandbox_id =
+            complete_linear_turn_and_unbind(&runtime, &store, &backend, &thread_key).await;
+        backend.set_observed_status(&sandbox_id, SandboxStatus::Suspended);
+
+        // Resume recreates the proxy from the requester annotation, so it must
+        // not start while another replica holds the lock.
+        let (io, _stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let binding = store
+            .lock_proxy_binding(&thread_key)
+            .await
+            .expect("take the proxy-binding lock");
+        runtime
+            .enqueue_session_execution(
+                &thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: None,
+                    metadata: Some(json!({})),
+                    input_lines: vec![
+                        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#
+                            .to_owned(),
+                    ],
+                    idle_timeout_ms: None,
+                    max_duration_ms: None,
+                },
+            )
+            .await
+            .expect("enqueue the next turn");
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            backend.status_of(&sandbox_id),
+            Some(SandboxStatus::Suspended),
+            "resume waits while another binding holds the lock"
+        );
+        assert_eq!(backend.proxy_ensures().len(), 1);
+
+        drop(binding);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while backend.proxy_ensures().len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the resumed turn never rebound after the lock was released"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(backend.status_of(&sandbox_id), Some(SandboxStatus::Running));
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn linear_turn_end_unbind_skips_a_sandbox_that_is_no_longer_running() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+        execute_with_metadata(&runtime, &thread_key, json!({})).await;
+        let sandbox_id = store
+            .get_session(&thread_key)
+            .await
+            .expect("load session")
+            .sandbox_id
+            .expect("session has a sandbox");
+
+        // The sandbox is paused before the unbind gets the lock.
+        let binding = store
+            .lock_proxy_binding(&thread_key)
+            .await
+            .expect("take the proxy-binding lock");
+        stdout
+            .write_all(&completed_output_bytes("Done."))
+            .await
+            .expect("write terminal output");
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        backend.set_observed_status(&sandbox_id, SandboxStatus::Suspended);
+        drop(binding);
+        sleep(Duration::from_millis(300)).await;
+        assert!(
+            backend.proxy_ensures().is_empty(),
+            "a paused sandbox's proxy is left for resume to rebind"
+        );
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn linear_turn_end_unbinds_a_sandbox_whose_status_is_unknown() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+        execute_with_metadata(&runtime, &thread_key, json!({})).await;
+        let sandbox_id = store
+            .get_session(&thread_key)
+            .await
+            .expect("load session")
+            .sandbox_id
+            .expect("session has a sandbox");
+
+        // The backend loses sight of the pod, which may still be running.
+        let binding = store
+            .lock_proxy_binding(&thread_key)
+            .await
+            .expect("take the proxy-binding lock");
+        stdout
+            .write_all(&completed_output_bytes("Done."))
+            .await
+            .expect("write terminal output");
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        backend.set_observed_status(&sandbox_id, SandboxStatus::Unknown("unknown".to_owned()));
+        drop(binding);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some((_sandbox_id, _principal_id, requester, _labels)) =
+                backend.proxy_ensures().first()
+            {
+                assert_eq!(requester, &None, "the turn's requester is unbound");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "an unknown status skipped the unbind"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_pause_waits_for_the_proxy_binding_lock() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+        let sandbox_id =
+            complete_linear_turn_and_unbind(&runtime, &store, &backend, &thread_key).await;
+
+        // Pausing tears down the proxy, so it waits for a binding in flight.
+        let binding = store
+            .lock_proxy_binding(&thread_key)
+            .await
+            .expect("take the proxy-binding lock");
+        let pause = tokio::spawn({
+            let runtime = runtime.clone();
+            let thread_key = thread_key.clone();
+            async move { runtime.pause_idle_session(&thread_key).await }
+        });
+        sleep(Duration::from_millis(300)).await;
+        assert!(!pause.is_finished(), "the pause waits for the lock");
+        assert_ne!(
+            backend.status_of(&sandbox_id),
+            Some(SandboxStatus::Suspended)
+        );
+
+        drop(binding);
+        let paused = tokio::time::timeout(Duration::from_secs(5), pause)
+            .await
+            .expect("the pause runs once the lock is released")
+            .expect("join pause")
+            .expect("pause the sandbox");
+        assert!(paused);
+        assert_eq!(
+            backend.status_of(&sandbox_id),
+            Some(SandboxStatus::Suspended)
         );
         server.abort();
         reset_test_store(&store).await;

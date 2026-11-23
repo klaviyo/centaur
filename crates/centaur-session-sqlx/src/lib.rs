@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeMap,
     str::FromStr,
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -20,6 +21,7 @@ use sqlx::{
 };
 use thiserror::Error;
 use time::{Duration as TimeDuration, OffsetDateTime};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 mod migrations;
@@ -28,6 +30,10 @@ pub use migrations::{TextSearchBackend, migrate, migration_list};
 
 pub const SESSION_EVENTS_CHANNEL: &str = "centaur_session_events";
 const DEFAULT_MAX_CONNECTIONS: u32 = 500;
+/// Proxy-binding locks one replica may hold or wait for at once. Each takes a
+/// pool connection for as long as it is held or awaited, so the cap keeps a
+/// burst of slow bindings from crowding ordinary queries out of the pool.
+const PROXY_BINDING_LOCK_CONCURRENCY: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct CreateExecutionResult {
@@ -91,14 +97,25 @@ pub struct WorkflowOwnedSandbox {
     pub sandbox_id: String,
 }
 
+/// A thread's proxy-binding lock, returned by
+/// [`PgSessionStore::lock_proxy_binding`]. Dropping it releases the lock.
+pub struct ProxyBindingLock {
+    _tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    _permit: OwnedSemaphorePermit,
+}
+
 #[derive(Clone)]
 pub struct PgSessionStore {
     pool: PgPool,
+    proxy_binding_permits: Arc<Semaphore>,
 }
 
 impl PgSessionStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            proxy_binding_permits: Arc::new(Semaphore::new(PROXY_BINDING_LOCK_CONCURRENCY)),
+        }
     }
 
     pub async fn connect(database_url: &str) -> Result<Self, SessionStoreError> {
@@ -597,6 +614,56 @@ impl PgSessionStore {
                 })
             })
             .collect()
+    }
+
+    /// The execution an idempotency key already created on a thread, if any.
+    pub async fn execution_for_idempotency_key(
+        &self,
+        thread_key: &ThreadKey,
+        idempotency_key: &str,
+    ) -> Result<Option<SessionExecution>, SessionStoreError> {
+        let row = sqlx::query_as::<_, SessionExecutionRow>(
+            r#"
+            select execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
+            from session_executions
+            where thread_key = $1 and idempotency_key = $2
+            "#,
+        )
+        .bind(thread_key.as_str())
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(TryInto::try_into).transpose()
+    }
+
+    /// Waits for, then holds, the thread's proxy-binding lock until the
+    /// returned guard is dropped. Every api-rs replica shares the lock, so a
+    /// binding decision and the proxy writes that carry it out never
+    /// interleave with another replica's binding for the same thread. A
+    /// replica-wide permit is taken before any pool connection, so at most
+    /// [`PROXY_BINDING_LOCK_CONCURRENCY`] locks are held or awaited at once.
+    pub async fn lock_proxy_binding(
+        &self,
+        thread_key: &ThreadKey,
+    ) -> Result<ProxyBindingLock, SessionStoreError> {
+        let permit = self
+            .proxy_binding_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the proxy-binding semaphore is never closed");
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "select pg_advisory_xact_lock(hashtextextended('centaur:proxy-binding:' || $1::text, 0))",
+        )
+        .bind(thread_key.as_str())
+        .execute(&mut *tx)
+        .await?;
+        Ok(ProxyBindingLock {
+            _tx: tx,
+            _permit: permit,
+        })
     }
 
     pub async fn latest_execution_for_thread(
@@ -2577,6 +2644,85 @@ mod tests {
                 .proxy_labels,
             labels
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proxy_binding_lock_excludes_other_holders_of_the_thread() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:proxy-binding-{}", Uuid::new_v4())).unwrap();
+        let other_thread =
+            ThreadKey::parse(format!("test:proxy-binding-{}", Uuid::new_v4())).unwrap();
+
+        let held = store
+            .lock_proxy_binding(&thread_key)
+            .await
+            .expect("take the lock");
+        let _other = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.lock_proxy_binding(&other_thread),
+        )
+        .await
+        .expect("another thread's lock is independent")
+        .expect("take the other thread's lock");
+
+        let waiter = tokio::spawn({
+            let store = store.clone();
+            let thread_key = thread_key.clone();
+            async move { store.lock_proxy_binding(&thread_key).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!waiter.is_finished(), "a second holder waits for the first");
+
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("dropping the guard releases the lock")
+            .expect("join waiter")
+            .expect("take the released lock");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proxy_binding_locks_are_capped_per_replica() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let mut held = Vec::new();
+        for _ in 0..super::PROXY_BINDING_LOCK_CONCURRENCY {
+            let thread_key =
+                ThreadKey::parse(format!("test:proxy-binding-{}", Uuid::new_v4())).unwrap();
+            held.push(
+                store
+                    .lock_proxy_binding(&thread_key)
+                    .await
+                    .expect("take a lock"),
+            );
+        }
+
+        // Even an uncontended thread waits for a permit, without a connection.
+        let (open, idle) = (store.pool().size(), store.pool().num_idle());
+        let waiter = tokio::spawn({
+            let store = store.clone();
+            let thread_key =
+                ThreadKey::parse(format!("test:proxy-binding-{}", Uuid::new_v4())).unwrap();
+            async move { store.lock_proxy_binding(&thread_key).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!waiter.is_finished(), "a lock past the cap waits");
+        assert_eq!(
+            (store.pool().size(), store.pool().num_idle()),
+            (open, idle),
+            "a waiter holds no pool connection"
+        );
+
+        held.pop();
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("a released permit admits the waiter")
+            .expect("join waiter")
+            .expect("take the lock");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

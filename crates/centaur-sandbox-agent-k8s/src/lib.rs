@@ -59,6 +59,10 @@ const IRON_CONTROL_PRINCIPAL_ANNOTATION: &str = "centaur.ai/iron-control-princip
 // Absent when the turn has no requester, so an annotation-vs-binding
 // comparison treats "absent" and "no requester" as equal.
 const IRON_CONTROL_REQUESTER_ANNOTATION: &str = "centaur.ai/iron-control-requester-principal";
+// Set while a proxy rebind is in flight and cleared with the annotations above
+// once it lands, so a rebind that fails partway is never mistaken for one that
+// is already in place.
+const IRON_CONTROL_BINDING_PENDING_ANNOTATION: &str = "centaur.ai/iron-control-binding-pending";
 // RFC 3339 instant stamped when the sandbox is paused for idleness and cleared
 // on resume. This keeps suspended status observable across api-rs restarts.
 const PAUSED_AT_ANNOTATION: &str = "centaur.ai/paused-at";

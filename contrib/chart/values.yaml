@@ -666,6 +666,11 @@ apiRs:
   # incompatible with preapproved mode. Internal workflow/MCP sessions use
   # separate principal-provisioning paths.
   sessionPrincipalAdmission: automatic
+  # What a turn does when its ingress names a linked requester (today, the
+  # Linear user who triggered it) whom no Console user has linked. "optional"
+  # runs it on the conversation principal's grants alone; "required" refuses it
+  # and the ingress asks the person to connect their account in Console.
+  linkedRequesterPolicy: optional
   # Serve /mcp through Code Mode: a centaur-codemode sandbox per principal,
   # with api-rs forwarding catalog search/load and centaur_execute over HTTP.
   # A principal normally has one sandbox; with several api-rs replicas (or

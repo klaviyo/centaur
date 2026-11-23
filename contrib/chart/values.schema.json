@@ -474,6 +474,10 @@
           "type": "string",
           "enum": ["automatic", "preapproved"]
         },
+        "linkedRequesterPolicy": {
+          "type": "string",
+          "enum": ["optional", "required"]
+        },
         "sandboxRunningLimit": { "type": "integer", "minimum": 0 },
         "sandboxWarmPools": {
           "type": "array",
