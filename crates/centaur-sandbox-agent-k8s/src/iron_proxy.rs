@@ -849,6 +849,7 @@ impl AgentSandboxBackend {
                 return Ok(());
             }
 
+            self.mark_proxy_binding_pending(id).await?;
             let iron_control = &self.config.iron_control;
             iron_control
                 .client
@@ -867,6 +868,7 @@ impl AgentSandboxBackend {
             principal_id,
             "iron-proxy resources are missing or not running; recreating before reuse"
         );
+        self.mark_proxy_binding_pending(id).await?;
         self.recreate_iron_proxy_resources_for_principal(
             id,
             principal_id,
@@ -1240,12 +1242,13 @@ impl AgentSandboxBackend {
     ) -> SandboxResult<()> {
         // A merge-patch null removes the requester annotation, so "no
         // requester" and "absent annotation" stay indistinguishable for the
-        // binding comparison.
+        // binding comparison. It also clears any pending-rebind marker.
         let patch = Patch::Merge(json!({
             "metadata": {
                 "annotations": {
                     crate::IRON_CONTROL_PRINCIPAL_ANNOTATION: principal_id,
                     crate::IRON_CONTROL_REQUESTER_ANNOTATION: requester_principal_id,
+                    crate::IRON_CONTROL_BINDING_PENDING_ANNOTATION: null,
                 },
             },
         }));
@@ -1254,6 +1257,24 @@ impl AgentSandboxBackend {
             .await
             .map(|_| ())
             .map_err(|err| map_kube_error("patch sandbox iron-control principal", err))
+    }
+
+    /// Marks a proxy rebind as in flight before it touches the proxy. If the
+    /// rebind then fails before its annotations are written, the marker stays
+    /// and the next ensure reassigns instead of trusting stale annotations.
+    async fn mark_proxy_binding_pending(&self, id: &SandboxId) -> SandboxResult<()> {
+        let patch = Patch::Merge(json!({
+            "metadata": {
+                "annotations": {
+                    crate::IRON_CONTROL_BINDING_PENDING_ANNOTATION: "true",
+                },
+            },
+        }));
+        self.sandboxes()
+            .patch(id.as_str(), &PatchParams::default(), &patch)
+            .await
+            .map(|_| ())
+            .map_err(|err| map_kube_error("mark sandbox proxy rebind pending", err))
     }
 
     fn services(&self) -> Api<Service> {
@@ -2484,7 +2505,8 @@ fn iron_proxy_labels(id: &SandboxId, observability_enabled: bool) -> BTreeMap<St
 /// so the ensure path can skip a redundant reassignment. An absent requester
 /// annotation means "no requester" and compares equal to `None`, keeping
 /// label-less sessions (tool-host, non-Slack) on the skip path. Any label
-/// refresh always reassigns, mirroring the pre-requester behavior.
+/// refresh always reassigns, mirroring the pre-requester behavior, as does a
+/// rebind left pending by an earlier failure.
 fn proxy_binding_matches(
     annotations: Option<&BTreeMap<String, String>>,
     principal_id: &str,
@@ -2495,9 +2517,13 @@ fn proxy_binding_matches(
         .and_then(|annotations| annotations.get(crate::IRON_CONTROL_PRINCIPAL_ANNOTATION));
     let assigned_requester = annotations
         .and_then(|annotations| annotations.get(crate::IRON_CONTROL_REQUESTER_ANNOTATION));
+    let rebind_pending = annotations.is_some_and(|annotations| {
+        annotations.contains_key(crate::IRON_CONTROL_BINDING_PENDING_ANNOTATION)
+    });
     assigned_principal.map(String::as_str) == Some(principal_id)
         && assigned_requester.map(String::as_str) == requester_principal_id
         && labels.is_empty()
+        && !rebind_pending
 }
 
 fn unique_suffix() -> String {
@@ -2651,6 +2677,20 @@ mod tests {
             &labels
         ));
         assert!(!proxy_binding_matches(None, "prn_conv", None, &no_labels));
+
+        // A rebind that failed partway leaves its marker, so even matching
+        // annotations reassign.
+        let mut pending = binding_annotations(Some("prn_conv"), None);
+        pending.insert(
+            crate::IRON_CONTROL_BINDING_PENDING_ANNOTATION.to_owned(),
+            "true".to_owned(),
+        );
+        assert!(!proxy_binding_matches(
+            Some(&pending),
+            "prn_conv",
+            None,
+            &no_labels
+        ));
     }
 
     fn control_target() -> ControlPlaneEgressTarget {

@@ -31,7 +31,7 @@ use centaur_session_core::{
     SessionMessageInput, ThreadKey,
 };
 use centaur_session_sqlx::{
-    PgSessionStore, SessionEventListener, SessionStoreError, default_metadata,
+    PgSessionStore, ProxyBindingLock, SessionEventListener, SessionStoreError, default_metadata,
 };
 use centaur_telemetry::{
     record_sandbox_warm_pool_claim, record_session_execution_finished,
@@ -3179,11 +3179,17 @@ impl SessionRuntime {
                         "replacing existing sandbox whose capabilities do not match"
                     );
                 } else {
+                // Held from the status check through resume and rebind: resume
+                // recreates the proxy from the requester annotation, so a
+                // turn-end unbind must not interleave with either step.
+                let _binding = match iron_control_principal {
+                    Some(_) => lock_proxy_binding_for_unbind(&self.store, thread_key).await?,
+                    None => None,
+                };
                 match self.sandbox_runtime.manager.status(&id).await {
                     Ok(status) => match existing_sandbox_action(&status) {
                         ExistingSandboxAction::Reuse => {
                             if let Some(principal_id) = iron_control_principal {
-                                let _binding = self.store.lock_proxy_binding(thread_key).await?;
                                 self.sandbox_runtime
                                     .manager
                                     .ensure_iron_control_proxy_resources(
@@ -3240,8 +3246,6 @@ impl SessionRuntime {
                             {
                                 Ok(()) => {
                                     if let Some(principal_id) = iron_control_principal {
-                                        let _binding =
-                                            self.store.lock_proxy_binding(thread_key).await?;
                                         self.sandbox_runtime
                                             .manager
                                             .ensure_iron_control_proxy_resources(
@@ -6342,15 +6346,16 @@ async fn record_max_duration_failure(
 /// already rebound per turn, and an unbind there would add a proxy round trip
 /// to every turn. Rebinding to the conversation principal alone is a no-op
 /// when no requester is bound. The unbind holds the thread's proxy-binding
-/// lock, as a dispatch's rebind does, so the two never interleave across
-/// api-rs replicas: a turn that is already queued keeps its binding, and a
-/// turn queued while the unbind runs rebinds after it.
+/// lock, as a dispatch's resume and rebind and an idle pause do, so none of
+/// them interleave across api-rs replicas: a turn that is already queued
+/// keeps its binding, and a turn queued while the unbind runs rebinds after
+/// it. A sandbox that is no longer running is left for resume to rebind.
 ///
 /// A failed unbind retries with backoff. If every attempt fails, the binding
 /// lasts until the thread's next turn rebinds the proxy or the idle pause
 /// stops the sandbox's processes.
 fn spawn_turn_requester_release(ctx: RuntimeContext, thread_key: ThreadKey) {
-    if !thread_key.as_str().starts_with("linear:") {
+    if !unbinds_requester_at_turn_end(&thread_key) {
         return;
     }
     tokio::spawn(async move {
@@ -6382,6 +6387,22 @@ fn spawn_turn_requester_release(ctx: RuntimeContext, thread_key: ThreadKey) {
     });
 }
 
+fn unbinds_requester_at_turn_end(thread_key: &ThreadKey) -> bool {
+    thread_key.as_str().starts_with("linear:")
+}
+
+/// The thread's proxy-binding lock, for threads whose requester is unbound at
+/// turn end; `None` elsewhere, where no unbind can interleave with a rebind.
+async fn lock_proxy_binding_for_unbind(
+    store: &PgSessionStore,
+    thread_key: &ThreadKey,
+) -> Result<Option<ProxyBindingLock>, SessionRuntimeError> {
+    if !unbinds_requester_at_turn_end(thread_key) {
+        return Ok(None);
+    }
+    Ok(Some(store.lock_proxy_binding(thread_key).await?))
+}
+
 async fn release_turn_requester(
     ctx: &RuntimeContext,
     thread_key: &ThreadKey,
@@ -6402,13 +6423,17 @@ async fn release_turn_requester(
     {
         return Ok(());
     }
+    let id = SandboxId::new(sandbox_id);
+    // A sandbox that is not running has no process left to make proxied calls,
+    // and repairing its proxy here would recreate one for a paused sandbox.
+    // Resume rebinds the proxy before the next turn runs.
+    match ctx.manager.status(&id).await {
+        Ok(SandboxStatus::Running | SandboxStatus::Created) => {}
+        Ok(_) | Err(SandboxError::NotFound(_)) => return Ok(()),
+        Err(error) => return Err(SessionRuntimeError::Sandbox(error)),
+    }
     ctx.manager
-        .ensure_iron_control_proxy_resources(
-            &SandboxId::new(sandbox_id),
-            principal_id,
-            None,
-            &session.proxy_labels,
-        )
+        .ensure_iron_control_proxy_resources(&id, principal_id, None, &session.proxy_labels)
         .await?;
     Ok(())
 }
@@ -6447,6 +6472,9 @@ async fn record_idle_pause(
     sandbox_id: &str,
     idle_timeout: Option<Duration>,
 ) -> Result<bool, SessionRuntimeError> {
+    // Pausing tears down the sandbox's proxy, so it holds the thread's
+    // proxy-binding lock as rebinds and unbinds do.
+    let _binding = lock_proxy_binding_for_unbind(&ctx.store, thread_key).await?;
     let latest_execution = ctx.store.latest_execution_for_thread(thread_key).await?;
     let session = ctx.store.get_session(thread_key).await?;
     if !should_pause_idle_sandbox(
@@ -12815,6 +12843,219 @@ mod adoption_tests {
             );
             sleep(Duration::from_millis(20)).await;
         }
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    /// Runs one Linear turn to completion and waits for its turn-end unbind,
+    /// returning the session's sandbox id.
+    async fn complete_linear_turn_and_unbind(
+        runtime: &SessionRuntime,
+        store: &PgSessionStore,
+        backend: &MockBackend,
+        thread_key: &ThreadKey,
+    ) -> String {
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        runtime
+            .create_or_get_session(
+                thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+        execute_with_metadata(runtime, thread_key, json!({})).await;
+        stdout
+            .write_all(&completed_output_bytes("Done."))
+            .await
+            .expect("write terminal output");
+        wait_for_event(store, thread_key, "session.execution_completed").await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while backend.proxy_ensures().is_empty() {
+            assert!(Instant::now() < deadline, "the turn was never unbound");
+            sleep(Duration::from_millis(20)).await;
+        }
+        store
+            .get_session(thread_key)
+            .await
+            .expect("load session")
+            .sandbox_id
+            .expect("session has a sandbox")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resumed_sandbox_waits_for_the_proxy_binding_lock_before_resuming() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+        let sandbox_id =
+            complete_linear_turn_and_unbind(&runtime, &store, &backend, &thread_key).await;
+        backend.set_observed_status(&sandbox_id, SandboxStatus::Suspended);
+
+        // Resume recreates the proxy from the requester annotation, so it must
+        // not start while another replica holds the lock.
+        let (io, _stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let binding = store
+            .lock_proxy_binding(&thread_key)
+            .await
+            .expect("take the proxy-binding lock");
+        runtime
+            .enqueue_session_execution(
+                &thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: None,
+                    metadata: Some(json!({})),
+                    input_lines: vec![
+                        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#
+                            .to_owned(),
+                    ],
+                    idle_timeout_ms: None,
+                    max_duration_ms: None,
+                },
+            )
+            .await
+            .expect("enqueue the next turn");
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            backend.status_of(&sandbox_id),
+            Some(SandboxStatus::Suspended),
+            "resume waits while another binding holds the lock"
+        );
+        assert_eq!(backend.proxy_ensures().len(), 1);
+
+        drop(binding);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while backend.proxy_ensures().len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the resumed turn never rebound after the lock was released"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(backend.status_of(&sandbox_id), Some(SandboxStatus::Running));
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn linear_turn_end_unbind_skips_a_sandbox_that_is_no_longer_running() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+        execute_with_metadata(&runtime, &thread_key, json!({})).await;
+        let sandbox_id = store
+            .get_session(&thread_key)
+            .await
+            .expect("load session")
+            .sandbox_id
+            .expect("session has a sandbox");
+
+        // The sandbox is paused before the unbind gets the lock.
+        let binding = store
+            .lock_proxy_binding(&thread_key)
+            .await
+            .expect("take the proxy-binding lock");
+        stdout
+            .write_all(&completed_output_bytes("Done."))
+            .await
+            .expect("write terminal output");
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        backend.set_observed_status(&sandbox_id, SandboxStatus::Suspended);
+        drop(binding);
+        sleep(Duration::from_millis(300)).await;
+        assert!(
+            backend.proxy_ensures().is_empty(),
+            "a paused sandbox's proxy is left for resume to rebind"
+        );
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_pause_waits_for_the_proxy_binding_lock() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+        let sandbox_id =
+            complete_linear_turn_and_unbind(&runtime, &store, &backend, &thread_key).await;
+
+        // Pausing tears down the proxy, so it waits for a binding in flight.
+        let binding = store
+            .lock_proxy_binding(&thread_key)
+            .await
+            .expect("take the proxy-binding lock");
+        let pause = tokio::spawn({
+            let runtime = runtime.clone();
+            let thread_key = thread_key.clone();
+            async move { runtime.pause_idle_session(&thread_key).await }
+        });
+        sleep(Duration::from_millis(300)).await;
+        assert!(!pause.is_finished(), "the pause waits for the lock");
+        assert_ne!(
+            backend.status_of(&sandbox_id),
+            Some(SandboxStatus::Suspended)
+        );
+
+        drop(binding);
+        let paused = tokio::time::timeout(Duration::from_secs(5), pause)
+            .await
+            .expect("the pause runs once the lock is released")
+            .expect("join pause")
+            .expect("pause the sandbox");
+        assert!(paused);
+        assert_eq!(
+            backend.status_of(&sandbox_id),
+            Some(SandboxStatus::Suspended)
+        );
         server.abort();
         reset_test_store(&store).await;
     }
