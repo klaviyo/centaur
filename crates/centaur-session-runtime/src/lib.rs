@@ -3304,6 +3304,7 @@ impl SessionRuntime {
                                         %error,
                                         "replacing sandbox after resume failed"
                                     );
+                                    self.stop_abandoned_sandbox(thread_key, &id).await?;
                                     self.store
                                         .append_event(
                                             thread_key,
@@ -3331,6 +3332,9 @@ impl SessionRuntime {
                                 status = ?status,
                                 "existing sandbox is not reusable"
                             );
+                            if matches!(status, SandboxStatus::Unknown(_)) {
+                                self.stop_abandoned_sandbox(thread_key, &id).await?;
+                            }
                         }
                     },
                     Err(SandboxError::NotFound(_)) => {
@@ -3525,6 +3529,29 @@ impl SessionRuntime {
             );
         }
         result
+    }
+
+    /// Stops a sandbox the next turn is about to replace without having
+    /// confirmed it stopped: one whose status cannot be read, or one that
+    /// failed to resume. It may still be running with the thread's last
+    /// requester bound to its proxy, and once it is replaced no turn-end
+    /// unbind reaches it. Stop failures fail the turn, as a capabilities
+    /// mismatch does, so the session keeps the sandbox for the failed turn's
+    /// unbind and the next attempt. Only threads that unbind at turn end need
+    /// this; elsewhere the replacement proceeds as before.
+    async fn stop_abandoned_sandbox(
+        &self,
+        thread_key: &ThreadKey,
+        id: &SandboxId,
+    ) -> Result<(), SessionRuntimeError> {
+        if !unbinds_requester_at_turn_end(thread_key) {
+            return Ok(());
+        }
+        self.sandbox_pipes.remove(id.as_str());
+        match self.sandbox_runtime.manager.stop(id).await {
+            Ok(()) | Err(SandboxError::NotFound(_)) => Ok(()),
+            Err(error) => Err(SessionRuntimeError::Sandbox(error)),
+        }
     }
 
     /// Under [`LinkedRequesterPolicy::Required`], refuse an unlinked requester
@@ -13073,6 +13100,176 @@ mod adoption_tests {
             );
             sleep(Duration::from_millis(20)).await;
         }
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    fn next_turn_input() -> ExecuteSessionInput {
+        ExecuteSessionInput {
+            idempotency_key: None,
+            metadata: Some(json!({})),
+            input_lines: vec![
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#
+                    .to_owned(),
+            ],
+            idle_timeout_ms: None,
+            max_duration_ms: None,
+        }
+    }
+
+    /// Runs a first Linear turn, leaves its sandbox as `abandon` describes,
+    /// and enqueues the next turn with sandbox creation held. Returns the old
+    /// sandbox id and the create gate.
+    async fn replace_abandoned_linear_sandbox(
+        store: &PgSessionStore,
+        backend: &Arc<MockBackend>,
+        base_url: String,
+        thread_key: &ThreadKey,
+        abandon: impl FnOnce(&MockBackend, &str),
+    ) -> (String, Arc<tokio::sync::Notify>) {
+        let runtime =
+            runtime_with_registrar(store, backend.clone(), requester_test_registrar(base_url));
+        let sandbox_id =
+            complete_linear_turn_and_unbind(&runtime, store, backend, thread_key).await;
+        abandon(backend, &sandbox_id);
+        let (io, _stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let create_gate = backend.hold_create();
+        runtime
+            .enqueue_session_execution(thread_key, next_turn_input())
+            .await
+            .expect("enqueue the next turn");
+        (sandbox_id, create_gate)
+    }
+
+    /// Waits until the next turn has begun creating its replacement sandbox;
+    /// creation is held, so the replacement does not run yet.
+    async fn wait_for_replacement_create(backend: &MockBackend) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while backend.created_specs().len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the next turn never created a replacement"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn linear_turn_stops_an_unreadable_sandbox_before_replacing_it() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+
+        // The backend loses sight of the old sandbox, which may still be
+        // running with the last requester bound, and the next turn replaces it.
+        let (sandbox_id, create_gate) = replace_abandoned_linear_sandbox(
+            &store,
+            &backend,
+            base_url,
+            &thread_key,
+            |backend, id| {
+                backend.set_observed_status(id, SandboxStatus::Unknown("unknown".to_owned()));
+            },
+        )
+        .await;
+        wait_for_replacement_create(&backend).await;
+        assert!(
+            backend.stopped().contains(&sandbox_id),
+            "the unreadable sandbox is stopped before its replacement is created"
+        );
+        create_gate.notify_one();
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn linear_turn_stops_a_sandbox_that_failed_to_resume_before_replacing_it() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+
+        // A pod on a lost node reads as not yet ready, so the next turn tries
+        // to resume it, fails, and replaces it.
+        let (sandbox_id, create_gate) = replace_abandoned_linear_sandbox(
+            &store,
+            &backend,
+            base_url,
+            &thread_key,
+            |backend, id| {
+                backend.set_observed_status(id, SandboxStatus::Created);
+                backend.fail_resume();
+            },
+        )
+        .await;
+        wait_for_replacement_create(&backend).await;
+        assert!(
+            backend.stopped().contains(&sandbox_id),
+            "the sandbox that failed to resume is stopped before its replacement is created"
+        );
+        create_gate.notify_one();
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn linear_turn_keeps_an_abandoned_sandbox_it_could_not_stop() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+
+        let (sandbox_id, create_gate) = replace_abandoned_linear_sandbox(
+            &store,
+            &backend,
+            base_url,
+            &thread_key,
+            |backend, id| {
+                backend.set_observed_status(id, SandboxStatus::Unknown("unknown".to_owned()));
+                backend.fail_stop();
+            },
+        )
+        .await;
+        wait_for_event(&store, &thread_key, "session.execution_failed").await;
+        assert_eq!(
+            backend.created_specs().len(),
+            1,
+            "a sandbox that could not be stopped is not replaced"
+        );
+        assert_eq!(
+            store
+                .get_session(&thread_key)
+                .await
+                .expect("load session")
+                .sandbox_id
+                .as_deref(),
+            Some(sandbox_id.as_str()),
+            "the session keeps the sandbox for its unbind and the next attempt"
+        );
+        create_gate.notify_one();
         server.abort();
         reset_test_store(&store).await;
     }
