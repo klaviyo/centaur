@@ -3304,7 +3304,6 @@ impl SessionRuntime {
                                         %error,
                                         "replacing sandbox after resume failed"
                                     );
-                                    self.stop_abandoned_sandbox(thread_key, &id).await?;
                                     self.store
                                         .append_event(
                                             thread_key,
@@ -3318,6 +3317,7 @@ impl SessionRuntime {
                                             }),
                                         )
                                         .await?;
+                                    self.stop_abandoned_sandbox(thread_key, &id).await?;
                                 }
                                 Err(error) => return Err(error),
                             }
@@ -3332,7 +3332,7 @@ impl SessionRuntime {
                                 status = ?status,
                                 "existing sandbox is not reusable"
                             );
-                            if matches!(status, SandboxStatus::Unknown(_)) {
+                            if matches!(status, SandboxStatus::Unknown(_) | SandboxStatus::Gone) {
                                 self.stop_abandoned_sandbox(thread_key, &id).await?;
                             }
                         }
@@ -3532,8 +3532,9 @@ impl SessionRuntime {
     }
 
     /// Stops a sandbox the next turn is about to replace without having
-    /// confirmed it stopped: one whose status cannot be read, or one that
-    /// failed to resume. It may still be running with the thread's last
+    /// confirmed it stopped: one whose status cannot be read, one whose
+    /// Sandbox is gone while its pod or proxy may linger after a partial stop,
+    /// or one that failed to resume. It may still be running with the thread's last
     /// requester bound to its proxy, and once it is replaced no turn-end
     /// unbind reaches it. Stop failures fail the turn, as a capabilities
     /// mismatch does, so the session keeps the sandbox for the failed turn's
@@ -13192,6 +13193,39 @@ mod adoption_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn linear_turn_cleans_up_a_gone_sandbox_before_replacing_it() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+
+        // A partial stop can delete the Sandbox while its pod and proxy linger.
+        let (sandbox_id, create_gate) = replace_abandoned_linear_sandbox(
+            &store,
+            &backend,
+            base_url,
+            &thread_key,
+            |backend, id| backend.set_observed_status(id, SandboxStatus::Gone),
+        )
+        .await;
+        wait_for_replacement_create(&backend).await;
+        assert!(
+            backend.stopped().contains(&sandbox_id),
+            "a gone sandbox's leftovers are cleaned up before its replacement is created"
+        );
+        create_gate.notify_one();
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn linear_turn_stops_a_sandbox_that_failed_to_resume_before_replacing_it() {
         let Some(store) = test_store().await else {
             return;
@@ -13242,6 +13276,7 @@ mod adoption_tests {
         .unwrap();
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
 
+        let base_url_for_retry = base_url.clone();
         let (sandbox_id, create_gate) = replace_abandoned_linear_sandbox(
             &store,
             &backend,
@@ -13268,6 +13303,42 @@ mod adoption_tests {
                 .as_deref(),
             Some(sandbox_id.as_str()),
             "the session keeps the sandbox for its unbind and the next attempt"
+        );
+
+        // The failed turn's own unbind still reaches the old sandbox (the
+        // first unbind is the earlier turn's).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while backend
+            .proxy_ensures()
+            .iter()
+            .filter(|(id, _, requester, _)| *id == sandbox_id && requester.is_none())
+            .count()
+            < 2
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the failed turn never unbound the old sandbox"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+
+        // The next attempt stops it before replacing it.
+        backend.stop_fails.store(false, Ordering::SeqCst);
+        let (io, _stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with_registrar(
+            &store,
+            backend.clone(),
+            requester_test_registrar(base_url_for_retry),
+        );
+        runtime
+            .enqueue_session_execution(&thread_key, next_turn_input())
+            .await
+            .expect("enqueue the retry");
+        wait_for_replacement_create(&backend).await;
+        assert!(
+            backend.stopped().contains(&sandbox_id),
+            "the retry stops the abandoned sandbox before replacing it"
         );
         create_gate.notify_one();
         server.abort();
