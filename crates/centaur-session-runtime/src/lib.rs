@@ -12908,6 +12908,10 @@ mod adoption_tests {
             assert!(Instant::now() < deadline, "the turn was never unbound");
             sleep(Duration::from_millis(20)).await;
         }
+        // Close the turn's stdout and wait for its pump to record the EOF, so
+        // the pump cannot race the test's store reset.
+        drop(stdout);
+        wait_for_event(store, thread_key, "session.stdout_eof").await;
         store
             .get_session(thread_key)
             .await
@@ -13121,8 +13125,9 @@ mod adoption_tests {
     /// Runs a first Linear turn, leaves its sandbox as `abandon` describes,
     /// and enqueues the next turn with sandbox creation held. Returns the old
     /// sandbox id and the create gate, which callers keep closed: the held
-    /// turn never touches the store again, so resetting it cannot race the
-    /// replacement, and the test runtime cancels the task at teardown.
+    /// turn writes nothing further to the store but its stdout-owner lease
+    /// renewal, which tolerates the reset, and the test runtime cancels the
+    /// task at teardown.
     async fn replace_abandoned_linear_sandbox(
         store: &PgSessionStore,
         backend: &Arc<MockBackend>,
@@ -13189,6 +13194,38 @@ mod adoption_tests {
             backend.stopped().contains(&sandbox_id),
             "the unreadable sandbox is stopped before its replacement is created"
         );
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn linear_turn_replaces_an_abandoned_sandbox_that_vanished_before_its_stop() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+
+        // The sandbox disappears between the status read and the stop, so the
+        // stop reports it missing: that counts as stopped.
+        let (_sandbox_id, _create_gate) = replace_abandoned_linear_sandbox(
+            &store,
+            &backend,
+            base_url,
+            &thread_key,
+            |backend, id| {
+                backend.set_observed_status(id, SandboxStatus::Unknown("unknown".to_owned()));
+                backend.mark_stop_missing(id);
+            },
+        )
+        .await;
+        wait_for_replacement_create(&backend).await;
         server.abort();
         reset_test_store(&store).await;
     }
