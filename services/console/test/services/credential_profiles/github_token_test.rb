@@ -31,15 +31,7 @@ module CredentialProfiles
       assert_includes secret.errors[:base],
                       "github_token credentials must use the canonical Authorization placeholder replacement"
       assert_includes secret.errors[:rules],
-                      "github_token credentials must target only api.github.com, github.com, api.githubcopilot.com, uploads.github.com"
-    end
-
-    test "allows credentials on the exact upload host" do
-      secret = StaticSecret.new(kind: "github_token")
-      secret.rules = secret.apply_kind_defaults(rules: [ RequestRule.new(host: "uploads.github.com") ])
-
-      assert secret.valid?, secret.errors.full_messages.inspect
-      assert_equal({ "host" => "uploads.github.com" }, secret.rules.first.to_proxy_rule)
+                      "github_token credentials must target only api.github.com, github.com, api.githubcopilot.com"
     end
 
     test "accepts secrets seeded before a host was added to the canonical set" do

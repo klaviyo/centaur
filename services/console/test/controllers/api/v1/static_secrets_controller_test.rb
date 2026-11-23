@@ -68,7 +68,7 @@ module Api
         }
 
         assert_difference -> { StaticSecret.count } => 1,
-                          -> { RequestRule.count } => 4 do
+                          -> { RequestRule.count } => 3 do
           post api_v1_static_secrets_url, params: body.to_json, headers: auth_headers
         end
         assert_response :created
@@ -77,10 +77,7 @@ module Api
         assert_equal "github_token", data["kind"]
         assert_nil data["inject_config"]
         assert_equal CredentialProfiles::GithubToken::REPLACE_CONFIG, data["replace_config"]
-        assert_equal %w[api.github.com github.com api.githubcopilot.com uploads.github.com],
-                     data["rules"].map { |rule| rule["host"] }
-        assert_empty data["rules"].last["http_methods"]
-        assert_empty data["rules"].last["paths"]
+        assert_equal %w[api.github.com github.com api.githubcopilot.com], data["rules"].map { |rule| rule["host"] }
       end
 
       test "POST rejects configuration that conflicts with the selected profile" do
@@ -100,7 +97,7 @@ module Api
         assert_includes json_body.dig("error", "details", "base"),
                         "github_token credentials must use the canonical Authorization placeholder replacement"
         assert_includes json_body.dig("error", "details", "rules"),
-                        "github_token credentials must target only api.github.com, github.com, api.githubcopilot.com, uploads.github.com"
+                        "github_token credentials must target only api.github.com, github.com, api.githubcopilot.com"
       end
 
       test "GET returns 404 for an unknown oid" do

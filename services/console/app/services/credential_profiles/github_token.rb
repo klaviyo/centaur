@@ -1,8 +1,8 @@
 module CredentialProfiles
   # GitHub API clients authenticate with Bearer/token while Git-over-HTTPS uses
   # HTTP Basic. Replacing a placeholder preserves the scheme selected by each
-  # client and confines the credential to GitHub's API, Git, hosted MCP server,
-  # and upload hosts.
+  # client and confines the credential to GitHub's API, Git, and hosted MCP
+  # server hosts.
   module GithubToken
     KIND = "github_token"
     REPLACE_CONFIG = {
@@ -13,8 +13,7 @@ module CredentialProfiles
     RULE_ATTRIBUTES = [
       { host: "api.github.com", http_methods: [], paths: [], position: 0 },
       { host: "github.com", http_methods: [], paths: [], position: 1 },
-      { host: "api.githubcopilot.com", http_methods: [], paths: [], position: 2 },
-      { host: "uploads.github.com", http_methods: [], paths: [], position: 3 }
+      { host: "api.githubcopilot.com", http_methods: [], paths: [], position: 2 }
     ].freeze
     ALLOWED_HOSTS = RULE_ATTRIBUTES.map { |attributes| attributes[:host] }.freeze
 
