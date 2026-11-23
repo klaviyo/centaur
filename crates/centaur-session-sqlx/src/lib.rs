@@ -2702,6 +2702,7 @@ mod tests {
         }
 
         // Even an uncontended thread waits for a permit, without a connection.
+        let (open, idle) = (store.pool().size(), store.pool().num_idle());
         let waiter = tokio::spawn({
             let store = store.clone();
             let thread_key =
@@ -2710,6 +2711,11 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(!waiter.is_finished(), "a lock past the cap waits");
+        assert_eq!(
+            (store.pool().size(), store.pool().num_idle()),
+            (open, idle),
+            "a waiter holds no pool connection"
+        );
 
         held.pop();
         tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
