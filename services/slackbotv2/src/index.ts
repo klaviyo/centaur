@@ -2107,19 +2107,17 @@ async function syncThreadMessageToSession(
     const latest = (await thread.state) ?? {}
     const latestMessageIds = new Set(latest.forwardedMessageIds ?? [])
     for (const item of messagesToAppend) latestMessageIds.add(item.id)
-    const steeringReactionAck = input.steeringReactionAck
-    const holdSteeringReaction =
-      steeringReactionAck !== undefined && latest.activeExecution === true
     await thread.setState({
       ...(stickyOverridesUpdate ?? {}),
       forwardedMessageIds: Array.from(latestMessageIds).slice(-1000),
       historyForwarded: latest.historyForwarded || (shouldIncludeContext && !contextDegraded),
       lastEventId
     })
-    if (holdSteeringReaction) {
-      input.steeringReactions.hold(steeringReactionAck)
-      input.steeringReactionAck = undefined
-    }
+    // api-rs answers the append only after it has handed the message to the
+    // active execution, so a steer's reaction is removed once the forward
+    // returns (finishSteeringReaction) instead of after the turn's response.
+    // A message that starts a turn keeps its reaction via
+    // commitExecutionStarted.
     traceLog(input.options, 'slackbotv2_forward_messages_committed', trace, {
       appended_message_count: messagesToAppend.length,
       forwarded_message_count: Math.min(latestMessageIds.size, 1000)
