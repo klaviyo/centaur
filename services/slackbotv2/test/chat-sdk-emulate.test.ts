@@ -1879,6 +1879,44 @@ describe('slackbotv2', () => {
     expect(await threadText(mention.ts)).toContain('Done thinking.')
   })
 
+  it('removes a steering reaction once the steer is handed to the running turn', async () => {
+    bot = createTestBot({ steeringReactionEnabled: true })
+    codexApi.autoRespond = false
+
+    const parent = await postUserMessage('Context before a steer.')
+    const firstMention = await sendMessage(`<@${BOT_USER_ID}> start running`, {
+      threadTs: parent.ts
+    })
+    expect(firstMention.response.status).toBe(200)
+    await waitFor(() => codexApi.streamCount === 1)
+
+    const steering = await sendMessage(`<@${BOT_USER_ID}> also check the logs`, {
+      threadTs: parent.ts
+    })
+    expect(steering.response.status).toBe(200)
+    await steering.finished()
+    await waitFor(() => slackApi.calls.some(call => call.method === 'reactions.remove'), 3000)
+
+    // The turn is still running; the hourglass already cleared on handoff.
+    expect(
+      slackApi.calls
+        .filter(call => call.method === 'reactions.add' || call.method === 'reactions.remove')
+        .map(call => ({
+          method: call.method,
+          name: stringField(call.body.name),
+          timestamp: stringField(call.body.timestamp)
+        }))
+    ).toEqual([
+      { method: 'reactions.add', name: 'hourglass_flowing_sand', timestamp: steering.ts },
+      { method: 'reactions.remove', name: 'hourglass_flowing_sand', timestamp: steering.ts }
+    ])
+    expect(codexApi.appends).toHaveLength(2)
+    expect(codexApi.executes).toHaveLength(1)
+
+    codexApi.emitOutputLines(threadKey(parent.ts), sampleCodexOutputLines('Done.'))
+    await firstMention.finished()
+  })
+
   it('auto-disables steering reactions when reactions:write is missing', async () => {
     const logs: CapturedLog[] = []
     bot = createTestBot({
