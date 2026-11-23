@@ -91,6 +91,12 @@ pub struct WorkflowOwnedSandbox {
     pub sandbox_id: String,
 }
 
+/// A thread's proxy-binding lock, returned by
+/// [`PgSessionStore::lock_proxy_binding`]. Dropping it releases the lock.
+pub struct ProxyBindingLock {
+    _tx: sqlx::Transaction<'static, sqlx::Postgres>,
+}
+
 #[derive(Clone)]
 pub struct PgSessionStore {
     pool: PgPool,
@@ -618,6 +624,24 @@ impl PgSessionStore {
         .await?;
 
         row.map(TryInto::try_into).transpose()
+    }
+
+    /// Waits for, then holds, the thread's proxy-binding lock until the
+    /// returned guard is dropped. Every api-rs replica shares the lock, so a
+    /// binding decision and the proxy writes that carry it out never
+    /// interleave with another replica's binding for the same thread.
+    pub async fn lock_proxy_binding(
+        &self,
+        thread_key: &ThreadKey,
+    ) -> Result<ProxyBindingLock, SessionStoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "select pg_advisory_xact_lock(hashtextextended('centaur:proxy-binding:' || $1::text, 0))",
+        )
+        .bind(thread_key.as_str())
+        .execute(&mut *tx)
+        .await?;
+        Ok(ProxyBindingLock { _tx: tx })
     }
 
     pub async fn latest_execution_for_thread(
@@ -2598,6 +2622,44 @@ mod tests {
                 .proxy_labels,
             labels
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proxy_binding_lock_excludes_other_holders_of_the_thread() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:proxy-binding-{}", Uuid::new_v4())).unwrap();
+        let other_thread =
+            ThreadKey::parse(format!("test:proxy-binding-{}", Uuid::new_v4())).unwrap();
+
+        let held = store
+            .lock_proxy_binding(&thread_key)
+            .await
+            .expect("take the lock");
+        let _other = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.lock_proxy_binding(&other_thread),
+        )
+        .await
+        .expect("another thread's lock is independent")
+        .expect("take the other thread's lock");
+
+        let waiter = tokio::spawn({
+            let store = store.clone();
+            let thread_key = thread_key.clone();
+            async move { store.lock_proxy_binding(&thread_key).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!waiter.is_finished(), "a second holder waits for the first");
+
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("dropping the guard releases the lock")
+            .expect("join waiter")
+            .expect("take the released lock");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
