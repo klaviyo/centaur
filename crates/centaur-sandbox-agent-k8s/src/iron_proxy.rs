@@ -831,10 +831,7 @@ impl AgentSandboxBackend {
         if self.config.iron_proxy.is_none() {
             return Ok(());
         }
-        let proxy_id = self.proxy_id_for_sandbox(id).await?;
-        if let Some(proxy_id) = proxy_id
-            && self.has_usable_iron_proxy_resources(id).await?
-        {
+        if let Some(proxy_id) = self.live_iron_proxy_id(id).await? {
             let sandbox = self
                 .sandboxes()
                 .get(id.as_str())
@@ -1170,6 +1167,36 @@ impl AgentSandboxBackend {
             }
         }
         Ok(None)
+    }
+
+    /// The id of the proxy now serving the sandbox: its running, ready, not
+    /// terminating pod's, when the proxy service exists too. Read from the
+    /// cluster rather than this replica's cache, which goes stale once another
+    /// replica recreates the proxy, so a rebind always reaches the live proxy.
+    /// Refreshes the cache. `None` means the proxy needs repair.
+    async fn live_iron_proxy_id(&self, id: &SandboxId) -> SandboxResult<Option<String>> {
+        let params = ListParams::default().labels(&format!(
+            "{IRON_PROXY_LABEL}=true,{SANDBOX_ID_LABEL}={}",
+            id.as_str()
+        ));
+        let pods = self
+            .pods()
+            .list(&params)
+            .await
+            .map_err(|err| map_kube_error("list iron-proxy pods", err))?;
+        let Some(proxy_id) = live_proxy_id(&pods.items) else {
+            return Ok(None);
+        };
+        match self.services().get(&iron_proxy_service_name(id)).await {
+            Ok(_) => {}
+            Err(err) if is_not_found(&err) => return Ok(None),
+            Err(err) => return Err(map_kube_error("get iron-proxy service", err)),
+        }
+        self.proxy_ids
+            .lock()
+            .await
+            .insert(id.as_str().to_owned(), proxy_id.clone());
+        Ok(Some(proxy_id))
     }
 
     async fn has_usable_iron_proxy_resources(&self, id: &SandboxId) -> SandboxResult<bool> {
@@ -2284,6 +2311,21 @@ fn pod_running(pod: &Pod) -> bool {
             })
 }
 
+/// The proxy id recorded on a running, ready proxy pod that is not being
+/// deleted.
+fn live_proxy_id(pods: &[Pod]) -> Option<String> {
+    pods.iter()
+        .filter(|pod| pod.metadata.deletion_timestamp.is_none() && pod_running(pod))
+        .find_map(|pod| {
+            pod.metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(IRON_CONTROL_PROXY_ID_ANNOTATION))
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+        })
+}
+
 fn pod_stopped(pod: &Pod) -> bool {
     pod.status
         .as_ref()
@@ -2619,6 +2661,48 @@ mod tests {
             );
         }
         annotations
+    }
+
+    fn proxy_pod(proxy_id: &str, ready: bool, terminating: bool) -> Pod {
+        use k8s_openapi::{
+            api::core::v1::{PodCondition, PodStatus},
+            apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time},
+        };
+
+        Pod {
+            metadata: ObjectMeta {
+                annotations: Some(BTreeMap::from([(
+                    IRON_CONTROL_PROXY_ID_ANNOTATION.to_owned(),
+                    proxy_id.to_owned(),
+                )])),
+                deletion_timestamp: terminating.then(|| Time(jiff::Timestamp::now())),
+                ..Default::default()
+            },
+            status: Some(PodStatus {
+                phase: Some("Running".to_owned()),
+                conditions: Some(vec![PodCondition {
+                    type_: "Ready".to_owned(),
+                    status: if ready { "True" } else { "False" }.to_owned(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn live_proxy_id_reads_the_serving_pod() {
+        // A recreated proxy replaces a terminating one: the rebind must reach
+        // the new proxy, not a replica's cached id for the old one.
+        let pods = [
+            proxy_pod("iprx_retired", true, true),
+            proxy_pod("iprx_starting", false, false),
+            proxy_pod("iprx_live", true, false),
+        ];
+        assert_eq!(live_proxy_id(&pods).as_deref(), Some("iprx_live"));
+        assert_eq!(live_proxy_id(&pods[..2]), None);
+        assert_eq!(live_proxy_id(&[]), None);
     }
 
     #[test]

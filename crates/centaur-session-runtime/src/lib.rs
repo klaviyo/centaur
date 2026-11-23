@@ -6424,12 +6424,14 @@ async fn release_turn_requester(
         return Ok(());
     }
     let id = SandboxId::new(sandbox_id);
-    // A sandbox that is not running has no process left to make proxied calls,
-    // and repairing its proxy here would recreate one for a paused sandbox.
-    // Resume rebinds the proxy before the next turn runs.
+    // A paused or stopped sandbox has no process left to make proxied calls,
+    // and repairing its proxy here would recreate one for it. Resume rebinds
+    // the proxy before the next turn runs. Any other status, including one the
+    // backend cannot read, may still have processes running, so it unbinds.
     match ctx.manager.status(&id).await {
-        Ok(SandboxStatus::Running | SandboxStatus::Created) => {}
-        Ok(_) | Err(SandboxError::NotFound(_)) => return Ok(()),
+        Ok(SandboxStatus::Suspended | SandboxStatus::Stopped | SandboxStatus::Gone)
+        | Err(SandboxError::NotFound(_)) => return Ok(()),
+        Ok(SandboxStatus::Running | SandboxStatus::Created | SandboxStatus::Unknown(_)) => {}
         Err(error) => return Err(SessionRuntimeError::Sandbox(error)),
     }
     ctx.manager
@@ -13005,6 +13007,72 @@ mod adoption_tests {
             backend.proxy_ensures().is_empty(),
             "a paused sandbox's proxy is left for resume to rebind"
         );
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn linear_turn_end_unbinds_a_sandbox_whose_status_is_unknown() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+        execute_with_metadata(&runtime, &thread_key, json!({})).await;
+        let sandbox_id = store
+            .get_session(&thread_key)
+            .await
+            .expect("load session")
+            .sandbox_id
+            .expect("session has a sandbox");
+
+        // The backend loses sight of the pod, which may still be running.
+        let binding = store
+            .lock_proxy_binding(&thread_key)
+            .await
+            .expect("take the proxy-binding lock");
+        stdout
+            .write_all(&completed_output_bytes("Done."))
+            .await
+            .expect("write terminal output");
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        backend.set_observed_status(&sandbox_id, SandboxStatus::Unknown("unknown".to_owned()));
+        drop(binding);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some((_sandbox_id, _principal_id, requester, _labels)) =
+                backend.proxy_ensures().first()
+            {
+                assert_eq!(requester, &None, "the turn's requester is unbound");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "an unknown status skipped the unbind"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
         server.abort();
         reset_test_store(&store).await;
     }
