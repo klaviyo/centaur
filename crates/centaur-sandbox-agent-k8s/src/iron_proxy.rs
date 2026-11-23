@@ -846,7 +846,9 @@ impl AgentSandboxBackend {
                 return Ok(());
             }
 
-            self.mark_proxy_binding_pending(id).await?;
+            if labels.is_empty() {
+                self.mark_proxy_binding_pending(id).await?;
+            }
             let iron_control = &self.config.iron_control;
             iron_control
                 .client
@@ -865,7 +867,9 @@ impl AgentSandboxBackend {
             principal_id,
             "iron-proxy resources are missing or not running; recreating before reuse"
         );
-        self.mark_proxy_binding_pending(id).await?;
+        if labels.is_empty() {
+            self.mark_proxy_binding_pending(id).await?;
+        }
         self.recreate_iron_proxy_resources_for_principal(
             id,
             principal_id,
@@ -1289,6 +1293,8 @@ impl AgentSandboxBackend {
     /// Marks a proxy rebind as in flight before it touches the proxy. If the
     /// rebind then fails before its annotations are written, the marker stays
     /// and the next ensure reassigns instead of trusting stale annotations.
+    /// Only label-less bindings need it: a binding with labels always
+    /// reassigns, so it never trusts the annotations.
     async fn mark_proxy_binding_pending(&self, id: &SandboxId) -> SandboxResult<()> {
         let patch = Patch::Merge(json!({
             "metadata": {
@@ -1493,7 +1499,9 @@ async fn wait_for_proxy_ack(
 /// env (so env overrides are respected). `None` for pods that are not
 /// running or predate the management env wiring.
 fn proxy_management_endpoint_from_pod(pod: &Pod) -> Option<ProxyManagementEndpoint> {
-    if !pod_running(pod) {
+    // A pod being deleted may still report Ready while its replacement starts;
+    // the barrier must wait on the proxy that will serve.
+    if pod.metadata.deletion_timestamp.is_some() || !pod_running(pod) {
         return None;
     }
     let pod_ip = pod.status.as_ref()?.pod_ip.as_deref()?;
@@ -3586,6 +3594,16 @@ mod tests {
             vec![env_var("IRON_MANAGEMENT_API_KEY", "key-123")],
         );
         pod.status.as_mut().unwrap().phase = Some("Pending".to_owned());
+        assert!(proxy_management_endpoint_from_pod(&pod).is_none());
+
+        // A pod being deleted yields no endpoint, even while it reports Ready.
+        let mut pod = running_proxy_pod(
+            "10.1.2.3",
+            vec![env_var("IRON_MANAGEMENT_API_KEY", "key-123")],
+        );
+        pod.metadata.deletion_timestamp = Some(
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(jiff::Timestamp::now()),
+        );
         assert!(proxy_management_endpoint_from_pod(&pod).is_none());
     }
 
