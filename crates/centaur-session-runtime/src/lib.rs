@@ -3533,9 +3533,9 @@ impl SessionRuntime {
     /// stopped it itself: one whose status cannot be read, one that reads as
     /// stopped or gone while its pod or proxy may linger (a pod on a lost node
     /// can read as failed before it is deleted, and a partial stop can delete
-    /// the Sandbox first), or one that failed to resume. It may still be running with the thread's last
-    /// requester bound to its proxy, and once it is replaced no turn-end
-    /// unbind reaches it. Stop failures fail the turn, as a capabilities
+    /// the Sandbox first), or one that failed to resume. It may still be
+    /// running with the thread's last requester bound to its proxy, and once
+    /// it is replaced no turn-end unbind reaches it. Stop failures fail the turn, as a capabilities
     /// mismatch does, so the session keeps the sandbox for the failed turn's
     /// unbind and the next attempt. Only threads that unbind at turn end need
     /// this; elsewhere the replacement proceeds as before.
@@ -6377,11 +6377,11 @@ async fn record_max_duration_failure(
 /// them interleave across api-rs replicas: a turn that is already queued
 /// keeps its binding, and a turn queued while the unbind runs rebinds after
 /// it. A paused sandbox is left for resume to rebind, and one that reads as
-/// stopped or gone is stopped, which removes any pod or proxy it left behind.
+/// gone is stopped, which removes any pod or proxy it left behind.
 ///
 /// A failed unbind retries with backoff. If every attempt fails, the binding
-/// lasts until the thread's next turn rebinds the proxy or the idle pause
-/// stops the sandbox's processes.
+/// lasts until the thread's next turn rebinds the proxy, or stops the sandbox
+/// to replace it, or the idle pause stops the sandbox's processes.
 fn spawn_turn_requester_release(ctx: RuntimeContext, thread_key: ThreadKey) {
     if !unbinds_requester_at_turn_end(&thread_key) {
         return;
@@ -6454,21 +6454,26 @@ async fn release_turn_requester(
     let id = SandboxId::new(sandbox_id);
     // A paused sandbox has no process left to make proxied calls, and
     // repairing its proxy here would recreate one for it; resume rebinds the
-    // proxy before the next turn runs. A sandbox that reads as stopped or gone
-    // is never reused, but its pod or proxy may linger, and with its Sandbox
-    // gone the proxy can no longer be rebound, so it is stopped instead, which
-    // removes what is left. Any other status, including one the backend
-    // cannot read, may still have processes running, so it unbinds.
+    // proxy before the next turn runs. A gone sandbox's pod or proxy may
+    // linger, and with its Sandbox gone the proxy can no longer be rebound, so
+    // it is stopped instead, which removes what is left. Any other status may
+    // still have processes running, or get them back (a stopped pod can be
+    // recreated on the same state), so it unbinds and keeps the sandbox.
     match ctx.manager.status(&id).await {
         Ok(SandboxStatus::Suspended) | Err(SandboxError::NotFound(_)) => return Ok(()),
-        Ok(SandboxStatus::Stopped | SandboxStatus::Gone) => {
+        Ok(SandboxStatus::Gone) => {
             ctx.sandbox_pipes.remove(sandbox_id);
             return match ctx.manager.stop(&id).await {
                 Ok(()) | Err(SandboxError::NotFound(_)) => Ok(()),
                 Err(error) => Err(SessionRuntimeError::Sandbox(error)),
             };
         }
-        Ok(SandboxStatus::Running | SandboxStatus::Created | SandboxStatus::Unknown(_)) => {}
+        Ok(
+            SandboxStatus::Running
+            | SandboxStatus::Created
+            | SandboxStatus::Stopped
+            | SandboxStatus::Unknown(_),
+        ) => {}
         Err(error) => return Err(SessionRuntimeError::Sandbox(error)),
     }
     ctx.manager
@@ -10297,6 +10302,7 @@ mod adoption_tests {
         resume_fails: AtomicBool,
         stop_fails: AtomicBool,
         stopped: std::sync::Mutex<Vec<String>>,
+        stop_attempts: std::sync::Mutex<Vec<String>>,
         proxy_ensures: std::sync::Mutex<Vec<ProxyEnsure>>,
         proxy_ensure_failures: AtomicUsize,
         missing_on_stop: std::sync::Mutex<BTreeSet<String>>,
@@ -10328,6 +10334,7 @@ mod adoption_tests {
                 resume_fails: AtomicBool::new(false),
                 stop_fails: AtomicBool::new(false),
                 stopped: std::sync::Mutex::new(Vec::new()),
+                stop_attempts: std::sync::Mutex::new(Vec::new()),
                 proxy_ensures: std::sync::Mutex::new(Vec::new()),
                 proxy_ensure_failures: AtomicUsize::new(0),
                 missing_on_stop: std::sync::Mutex::new(BTreeSet::new()),
@@ -10413,6 +10420,10 @@ mod adoption_tests {
                 .lock()
                 .unwrap()
                 .insert(sandbox_id.to_owned());
+        }
+
+        fn stop_attempts(&self) -> Vec<String> {
+            self.stop_attempts.lock().unwrap().clone()
         }
 
         fn stopped(&self) -> Vec<String> {
@@ -10521,6 +10532,10 @@ mod adoption_tests {
         }
 
         async fn stop(&self, id: &SandboxId) -> SandboxResult<()> {
+            self.stop_attempts
+                .lock()
+                .unwrap()
+                .push(id.as_str().to_owned());
             if self.missing_on_stop.lock().unwrap().contains(id.as_str()) {
                 return Err(SandboxError::NotFound(id.as_str().to_owned()));
             }
@@ -13223,7 +13238,7 @@ mod adoption_tests {
 
         // The sandbox disappears between the status read and the stop, so the
         // stop reports it missing: that counts as stopped.
-        let (_sandbox_id, _create_gate) = replace_abandoned_linear_sandbox(
+        let (sandbox_id, _create_gate) = replace_abandoned_linear_sandbox(
             &store,
             &backend,
             base_url,
@@ -13235,6 +13250,10 @@ mod adoption_tests {
         )
         .await;
         wait_for_replacement_create(&backend).await;
+        assert!(
+            backend.stop_attempts().contains(&sandbox_id),
+            "the replacement first tries to stop the old sandbox"
+        );
         server.abort();
         reset_test_store(&store).await;
     }
@@ -13331,6 +13350,78 @@ mod adoption_tests {
         assert!(
             backend.proxy_ensures().is_empty(),
             "a gone sandbox's proxy is removed, not rebound"
+        );
+        drop(stdout);
+        wait_for_event(&store, &thread_key, "session.stdout_eof").await;
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn linear_turn_end_unbinds_a_sandbox_that_reads_stopped() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+        execute_with_metadata(&runtime, &thread_key, json!({})).await;
+        let sandbox_id = store
+            .get_session(&thread_key)
+            .await
+            .expect("load session")
+            .sandbox_id
+            .expect("session has a sandbox");
+
+        // An OOM-killed pod reads as stopped, and the controller can recreate
+        // it on the same state, so the unbind keeps the sandbox and unbinds it.
+        let binding = store
+            .lock_proxy_binding(&thread_key)
+            .await
+            .expect("take the proxy-binding lock");
+        stdout
+            .write_all(&completed_output_bytes("Done."))
+            .await
+            .expect("write terminal output");
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        backend.set_observed_status(&sandbox_id, SandboxStatus::Stopped);
+        drop(binding);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some((id, _principal_id, requester, _labels)) = backend.proxy_ensures().first() {
+                assert_eq!(id, &sandbox_id);
+                assert_eq!(requester, &None, "the turn's requester is unbound");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a stopped sandbox's requester was never unbound"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            backend.stop_attempts().is_empty(),
+            "a stopped sandbox is kept, since its pod can come back"
         );
         drop(stdout);
         wait_for_event(&store, &thread_key, "session.stdout_eof").await;
