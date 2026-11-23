@@ -3331,6 +3331,28 @@ impl SessionRuntime {
                                 status = ?status,
                                 "existing sandbox is not reusable"
                             );
+                            // A sandbox whose status cannot be read may still
+                            // be running with the last requester bound to its
+                            // proxy, and once it is replaced no turn-end unbind
+                            // reaches it. Stop it first, as a capabilities
+                            // mismatch does.
+                            if matches!(status, SandboxStatus::Unknown(_))
+                                && unbinds_requester_at_turn_end(thread_key)
+                            {
+                                self.sandbox_pipes.remove(sandbox_id);
+                                match self.sandbox_runtime.manager.stop(&id).await {
+                                    Ok(()) | Err(SandboxError::NotFound(_)) => {}
+                                    Err(error) => warn!(
+                                        component = COMPONENT_SESSION_RUNTIME,
+                                        event = "sandbox_ensure_replace_stop_failed",
+                                        thread_key = %thread_key,
+                                        execution_id,
+                                        sandbox_id,
+                                        %error,
+                                        "failed to stop the unreadable sandbox being replaced"
+                                    ),
+                                }
+                            }
                         }
                     },
                     Err(SandboxError::NotFound(_)) => {
@@ -13070,6 +13092,58 @@ mod adoption_tests {
             assert!(
                 Instant::now() < deadline,
                 "an unknown status skipped the unbind"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn linear_turn_stops_an_unreadable_sandbox_before_replacing_it() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "linear:issue-{}:c:comment-1",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+        let sandbox_id =
+            complete_linear_turn_and_unbind(&runtime, &store, &backend, &thread_key).await;
+
+        // The backend loses sight of the old sandbox, which may still be
+        // running with the last requester bound, and the next turn replaces it.
+        backend.set_observed_status(&sandbox_id, SandboxStatus::Unknown("unknown".to_owned()));
+        let (io, _stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        runtime
+            .enqueue_session_execution(
+                &thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: None,
+                    metadata: Some(json!({})),
+                    input_lines: vec![
+                        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#
+                            .to_owned(),
+                    ],
+                    idle_timeout_ms: None,
+                    max_duration_ms: None,
+                },
+            )
+            .await
+            .expect("enqueue the next turn");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !backend.stopped().contains(&sandbox_id) {
+            assert!(
+                Instant::now() < deadline,
+                "the unreadable sandbox was replaced without being stopped"
             );
             sleep(Duration::from_millis(20)).await;
         }
