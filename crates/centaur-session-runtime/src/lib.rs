@@ -13120,7 +13120,9 @@ mod adoption_tests {
 
     /// Runs a first Linear turn, leaves its sandbox as `abandon` describes,
     /// and enqueues the next turn with sandbox creation held. Returns the old
-    /// sandbox id and the create gate.
+    /// sandbox id and the create gate, which callers keep closed: the held
+    /// turn never touches the store again, so resetting it cannot race the
+    /// replacement, and the test runtime cancels the task at teardown.
     async fn replace_abandoned_linear_sandbox(
         store: &PgSessionStore,
         backend: &Arc<MockBackend>,
@@ -13172,7 +13174,7 @@ mod adoption_tests {
 
         // The backend loses sight of the old sandbox, which may still be
         // running with the last requester bound, and the next turn replaces it.
-        let (sandbox_id, create_gate) = replace_abandoned_linear_sandbox(
+        let (sandbox_id, _create_gate) = replace_abandoned_linear_sandbox(
             &store,
             &backend,
             base_url,
@@ -13187,7 +13189,6 @@ mod adoption_tests {
             backend.stopped().contains(&sandbox_id),
             "the unreadable sandbox is stopped before its replacement is created"
         );
-        create_gate.notify_one();
         server.abort();
         reset_test_store(&store).await;
     }
@@ -13207,7 +13208,7 @@ mod adoption_tests {
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
 
         // A partial stop can delete the Sandbox while its pod and proxy linger.
-        let (sandbox_id, create_gate) = replace_abandoned_linear_sandbox(
+        let (sandbox_id, _create_gate) = replace_abandoned_linear_sandbox(
             &store,
             &backend,
             base_url,
@@ -13220,7 +13221,6 @@ mod adoption_tests {
             backend.stopped().contains(&sandbox_id),
             "a gone sandbox's leftovers are cleaned up before its replacement is created"
         );
-        create_gate.notify_one();
         server.abort();
         reset_test_store(&store).await;
     }
@@ -13241,7 +13241,7 @@ mod adoption_tests {
 
         // A pod on a lost node reads as not yet ready, so the next turn tries
         // to resume it, fails, and replaces it.
-        let (sandbox_id, create_gate) = replace_abandoned_linear_sandbox(
+        let (sandbox_id, _create_gate) = replace_abandoned_linear_sandbox(
             &store,
             &backend,
             base_url,
@@ -13257,7 +13257,6 @@ mod adoption_tests {
             backend.stopped().contains(&sandbox_id),
             "the sandbox that failed to resume is stopped before its replacement is created"
         );
-        create_gate.notify_one();
         server.abort();
         reset_test_store(&store).await;
     }
@@ -13277,7 +13276,7 @@ mod adoption_tests {
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
 
         let base_url_for_retry = base_url.clone();
-        let (sandbox_id, create_gate) = replace_abandoned_linear_sandbox(
+        let (sandbox_id, _create_gate) = replace_abandoned_linear_sandbox(
             &store,
             &backend,
             base_url,
@@ -13340,7 +13339,6 @@ mod adoption_tests {
             backend.stopped().contains(&sandbox_id),
             "the retry stops the abandoned sandbox before replacing it"
         );
-        create_gate.notify_one();
         server.abort();
         reset_test_store(&store).await;
     }
