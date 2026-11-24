@@ -951,6 +951,17 @@ async fn api_jwt_names_the_requester_the_proxy_is_bound_to() {
     );
 }
 
+/// The secrets a sync response delivers under the PR-create OAuth placeholder.
+fn pr_oauth_secrets(body: &Value) -> Vec<Value> {
+    body["secrets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|secret| secret["replace"]["proxy_value"] == "CENTAUR_PR_OAUTH")
+        .cloned()
+        .collect()
+}
+
 /// How many secrets a sync response delivers for `api.github.com`.
 fn github_secret_count(body: &Value) -> usize {
     body["secrets"]
@@ -994,9 +1005,11 @@ async fn api_jwt_names_the_sandbox_and_the_github_account_behind_its_token() {
     f.bump(principal).await;
     // The token was connected by the Console admin, but the principal is not
     // that person (it is a plain `user` principal), so it is not the actor's.
-    let claims = api_jwt_claims(&f.sync(&token).await);
+    let body = f.sync(&token).await;
+    let claims = api_jwt_claims(&body);
     assert_eq!(claims["sandbox_id"], f.name("proxy"));
     assert!(claims.get("github_user_id").is_none());
+    assert!(pr_oauth_secrets(&body).is_empty());
 
     // Once the acting principal is the connecting Console user, the token is
     // theirs and its numeric GitHub id is the claim.
@@ -1012,16 +1025,34 @@ async fn api_jwt_names_the_sandbox_and_the_github_account_behind_its_token() {
     // The claim names the account behind the one GitHub token this very
     // response delivers.
     assert_eq!(github_secret_count(&body), 1);
+    // The create-only OAuth secret rides along with the claim: the attested
+    // credential's own delivered token source, under its placeholder, for the
+    // one create operation.
+    let extra = pr_oauth_secrets(&body);
+    assert_eq!(extra.len(), 1, "{extra:?}");
+    let delivered = body["secrets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|secret| secret["rules"] == json!([{ "host": "api.github.com" }]))
+        .unwrap();
+    assert_eq!(extra[0]["source"], delivered["source"]);
+    assert_eq!(
+        extra[0]["replace"],
+        json!({"proxy_value": "CENTAUR_PR_OAUTH", "match_headers": ["Authorization"], "require": false})
+    );
+    assert_eq!(
+        extra[0]["rules"],
+        json!([{"host": "api.github.com", "methods": ["POST"], "paths": ["/repos/*/*/pulls"]}])
+    );
 
     // A shared app serves one connection to many people: no claim.
     f.update("UPDATE oauth_apps SET shared = true WHERE id = $1", app)
         .await;
     f.bump(principal).await;
-    assert!(
-        api_jwt_claims(&f.sync(&token).await)
-            .get("github_user_id")
-            .is_none()
-    );
+    let body = f.sync(&token).await;
+    assert!(api_jwt_claims(&body).get("github_user_id").is_none());
+    assert!(pr_oauth_secrets(&body).is_empty());
     f.update("UPDATE oauth_apps SET shared = false WHERE id = $1", app)
         .await;
 
@@ -1051,6 +1082,7 @@ async fn api_jwt_names_the_sandbox_and_the_github_account_behind_its_token() {
         "the owner-only token is still delivered"
     );
     assert!(api_jwt_claims(&body).get("github_user_id").is_none());
+    assert!(pr_oauth_secrets(&body).is_empty());
     f.update(
         "UPDATE oauth_apps SET owner_only = false WHERE id = $1",
         app,
@@ -1090,6 +1122,7 @@ async fn api_jwt_names_the_sandbox_and_the_github_account_behind_its_token() {
     assert!(api_jwt_claims(&body).get("github_user_id").is_none());
     // Both competing tokens are delivered, which is why none is claimed.
     assert_eq!(github_secret_count(&body), 2);
+    assert!(pr_oauth_secrets(&body).is_empty());
 }
 
 #[tokio::test]

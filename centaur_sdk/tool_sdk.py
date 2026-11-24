@@ -178,6 +178,7 @@ def current_session_context() -> dict[str, Any]:
 
 
 _PR_REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_CREATE_PULL_REQUEST_TIMEOUT_SECONDS = 120
 
 
 def create_pull_request(
@@ -226,7 +227,10 @@ def create_pull_request(
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=60) as response:
+    # The API may wait on a per-sandbox lock (held while the proxy is rebinding
+    # to the current speaker) before its own 30s GitHub call, so this must
+    # outlast the lock wait plus that call.
+    with urllib.request.urlopen(request, timeout=_CREATE_PULL_REQUEST_TIMEOUT_SECONDS) as response:
         return json.loads(response.read())
 
 

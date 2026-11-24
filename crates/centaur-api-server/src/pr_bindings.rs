@@ -196,8 +196,10 @@ impl GithubPullRequest {
 /// by its proxy.
 ///
 /// The thread's proxy-binding lock, the one every rebind and unbind of that
-/// thread's proxy takes, is held from before the first of those checks until
-/// the response is handled. A turn change cannot rebind the proxy to the next
+/// thread's proxy takes, is held from before the sandbox, execution and
+/// requester checks until the response is handled. A cheap ownership check
+/// runs first, without the lock, so a caller that does not own the session is
+/// refused without ever waiting on or holding it. A turn change cannot rebind the proxy to the next
 /// speaker between the checks and the GitHub call, so the token GitHub sees is
 /// the one the checks vouched for.
 pub(crate) async fn create_session_pull_request(
@@ -209,6 +211,24 @@ pub(crate) async fn create_session_pull_request(
     create_session_pull_request_with(&state, &caller, raw_thread_key, request, || async {})
         .await
         .map(Json)
+}
+
+/// Refuses a caller that is not a principal owning `session`.
+fn authorize_session_owner(
+    caller: &AuthenticatedCaller,
+    session: &centaur_session_core::Session,
+) -> Result<(), ApiError> {
+    if caller.principal_subject().is_none()
+        || !principal_subject_owns_session(
+            caller.principal_subject(),
+            session.iron_control_principal.as_deref(),
+        )
+    {
+        return Err(ApiError::Forbidden(
+            "caller is not authorized for this session".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// [`create_session_pull_request`], with `before_github` run while the
@@ -228,22 +248,18 @@ where
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
     let request = request.validate()?;
     let runtime = state.runtime()?;
+    // A cheap read-only check first, so a caller that does not own the session
+    // is refused before it can wait on, or hold, the thread's proxy-binding
+    // lock. It is repeated under the lock, where the session is read afresh.
+    let session = runtime.session(&thread_key).await?;
+    authorize_session_owner(caller, &session)?;
     let _proxy_binding = runtime
         .store()
         .lock_proxy_binding(&thread_key)
         .await
         .map_err(SessionRuntimeError::from)?;
     let session = runtime.session(&thread_key).await?;
-    if caller.principal_subject().is_none()
-        || !principal_subject_owns_session(
-            caller.principal_subject(),
-            session.iron_control_principal.as_deref(),
-        )
-    {
-        return Err(ApiError::Forbidden(
-            "caller is not authorized for this session".to_owned(),
-        ));
-    }
+    authorize_session_owner(caller, &session)?;
 
     // The proxy mints the sandbox id from its own record; the session must
     // name that same sandbox and no other session may.
@@ -1572,6 +1588,111 @@ mod tests {
         .await
         .expect("a refusal releases the lock")
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_does_not_own_the_session_never_waits_on_the_lock() {
+        use std::time::Duration;
+
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let sandbox = h.sandbox_id("owner");
+        let thread_key = h.session("C0TEST", &sandbox).await;
+        // Someone holds the thread's lock, as an in-flight rebind would.
+        let held = h.store.lock_proxy_binding(&thread_key).await.unwrap();
+
+        // A non-owner, and a request for a session that does not exist, are
+        // refused at once instead of queueing behind the lock.
+        let stranger = proxy_token("prn_someone_else", Some(&sandbox), Some("1"));
+        let missing = ThreadKey::parse(format!("slack:T0TEST:C0TEST:{}.9", h.suffix)).unwrap();
+        for (thread, token, expected) in [
+            (&thread_key, stranger.as_str(), StatusCode::FORBIDDEN),
+            (&missing, h.token(&sandbox).as_str(), StatusCode::NOT_FOUND),
+        ] {
+            let (status, _) = tokio::time::timeout(
+                Duration::from_secs(3),
+                h.create(thread, token, h.create_body()),
+            )
+            .await
+            .expect("the refusal did not wait for the lock");
+            assert_eq!(status, expected);
+        }
+
+        // The owner does wait for it: the lock is what the pre-check avoids.
+        let owner = tokio::time::timeout(
+            Duration::from_millis(400),
+            h.create(&thread_key, &h.token(&sandbox), h.create_body()),
+        )
+        .await;
+        assert!(owner.is_err(), "the owner's request ignored the lock");
+        assert!(h.backend.calls().is_empty());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_placeholder_leaves_nothing_bound() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let sandbox = h.sandbox_id("unsubstituted");
+        let thread_key = h.session("C0TEST", &sandbox).await;
+        // The credential stopped being the attested OAuth one, so the proxy
+        // forwarded `CENTAUR_PR_OAUTH` as is and GitHub refused it.
+        h.backend
+            .respond(401, json!({"message": "Bad credentials"}));
+
+        let (status, body) = h
+            .create(&thread_key, &h.token(&sandbox), h.create_body())
+            .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["code"], "github_error");
+        assert_eq!(body["error"], "Bad credentials");
+        assert_eq!(h.backend.calls().len(), 1);
+        for number in 1..=10 {
+            assert_eq!(
+                h.store.pr_binding(&h.repository(), number).await.unwrap(),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn contradictory_state_writes_at_one_observation_are_a_conflict_over_http() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let (repository, _) = bound_pr(&h, true).await;
+        let uri = format!("/api/pr-bindings/{repository}/7/state");
+        let write = |closed: bool, observed: &str| {
+            let body = json!({
+                "pr_node_id": h.node_id(),
+                "observed_updated_at": observed,
+                "closed": closed,
+            });
+            let (uri, h) = (uri.clone(), &h);
+            async move { h.send(Method::POST, &uri, GITHUBBOT_KEY, Some(body)).await }
+        };
+
+        let (status, _) = write(true, "2026-11-20T10:00:10Z").await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = write(false, "2026-11-20T10:00:10Z").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "binding_state_conflict");
+        assert!(
+            h.store
+                .pr_binding(&repository, 7)
+                .await
+                .unwrap()
+                .unwrap()
+                .closed
+        );
+        // The same value again, and a newer observation, go through.
+        assert_eq!(write(true, "2026-11-20T10:00:10Z").await.0, StatusCode::OK);
+        let (status, body) = write(false, "2026-11-20T10:00:11Z").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["closed"], false);
     }
 
     #[tokio::test]

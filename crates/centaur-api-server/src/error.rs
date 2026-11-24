@@ -96,7 +96,8 @@ impl IntoResponse for ApiError {
             Self::Runtime(SessionRuntimeError::Store(
                 SessionStoreError::ExecutionActive { .. }
                 | SessionStoreError::WorkflowOwnedSandbox { .. }
-                | SessionStoreError::PrBindingConflict { .. },
+                | SessionStoreError::PrBindingConflict { .. }
+                | SessionStoreError::PrBindingStateConflict { .. },
             )) => StatusCode::CONFLICT,
             Self::Runtime(SessionRuntimeError::Store(SessionStoreError::InvalidPrBinding(_))) => {
                 StatusCode::BAD_REQUEST
@@ -183,6 +184,12 @@ impl IntoResponse for ApiError {
         })) = &self
         {
             body["code"] = json!("binding_conflict");
+        }
+        if let Self::Runtime(SessionRuntimeError::Store(
+            SessionStoreError::PrBindingStateConflict { .. },
+        )) = &self
+        {
+            body["code"] = json!("binding_state_conflict");
         }
         let mut response = (status, Json(body)).into_response();
         if status == StatusCode::UNAUTHORIZED {
@@ -323,6 +330,15 @@ mod tests {
                 },
                 StatusCode::CONFLICT,
                 Some("binding_conflict"),
+            ),
+            (
+                SessionStoreError::PrBindingStateConflict {
+                    repository: "acme/widgets".to_owned(),
+                    number: 7,
+                    field: "closed",
+                },
+                StatusCode::CONFLICT,
+                Some("binding_state_conflict"),
             ),
         ] {
             let response = ApiError::Runtime(SessionRuntimeError::Store(error)).into_response();

@@ -2176,6 +2176,12 @@ pub enum SessionStoreError {
         number: i64,
         reason: String,
     },
+    #[error("PR binding state conflict for {repository}#{number}: {field}")]
+    PrBindingStateConflict {
+        repository: String,
+        number: i64,
+        field: &'static str,
+    },
     #[error("invalid notification payload on {channel}: {payload}: {error}")]
     InvalidNotification {
         channel: String,

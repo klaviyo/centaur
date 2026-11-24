@@ -1392,10 +1392,22 @@ impl AgentSandboxBackend {
 const GITHUB_PULL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Most response bytes read back from the create call.
 const GITHUB_PULL_REQUEST_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
-/// `Authorization` value of the create call: a placeholder, not a credential.
-/// The sandbox's proxy replaces it with the token of the human its principal
-/// is bound to.
+/// The generic GitHub placeholder: Console's canonical `github_token`
+/// credential replaces it in `Authorization` on `api.github.com` whether that
+/// credential is an OAuth token or a personal access token. The create call
+/// does not use it, because the account check only means something for an
+/// OAuth token (see [`GITHUB_PR_OAUTH_PLACEHOLDER_AUTHORIZATION`]).
+#[allow(dead_code)]
 const GITHUB_TOKEN_PLACEHOLDER_AUTHORIZATION: &str = "Bearer GITHUB_TOKEN";
+/// `Authorization` value of the create call: a placeholder, not a credential.
+/// The sandbox's proxy replaces `CENTAUR_PR_OAUTH` only with the attested
+/// OAuth credential's token, and only for `POST api.github.com
+/// /repos/*/*/pulls`: proxy-sync adds that substitution in the same build that
+/// attests the account, and only when it does. If the credential has since
+/// turned into a personal access token (or is gone), the placeholder goes to
+/// GitHub unsubstituted and is rejected, so no pull request is created under a
+/// credential the attestation does not describe.
+const GITHUB_PR_OAUTH_PLACEHOLDER_AUTHORIZATION: &str = "Bearer CENTAUR_PR_OAUTH";
 
 impl AgentSandboxBackend {
     /// Creates a pull request through the sandbox's own proxy: HTTP CONNECT to
@@ -1531,7 +1543,7 @@ fn github_pull_request_request(
         .post(format!("https://{GITHUB_API_HOST}{path}"))
         .header(
             reqwest::header::AUTHORIZATION,
-            GITHUB_TOKEN_PLACEHOLDER_AUTHORIZATION,
+            GITHUB_PR_OAUTH_PLACEHOLDER_AUTHORIZATION,
         )
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
@@ -4281,7 +4293,13 @@ AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
             "https://api.github.com/repos/acme/widgets/pulls"
         );
         let headers = request.headers();
-        assert_eq!(headers["authorization"], "Bearer GITHUB_TOKEN");
+        // Only the OAuth-only placeholder, never the generic one that a
+        // personal access token would also satisfy.
+        assert_eq!(headers["authorization"], "Bearer CENTAUR_PR_OAUTH");
+        assert_ne!(
+            headers["authorization"],
+            GITHUB_TOKEN_PLACEHOLDER_AUTHORIZATION
+        );
         assert_eq!(headers["accept"], "application/vnd.github+json");
         assert_eq!(headers["x-github-api-version"], "2022-11-28");
         assert_eq!(headers["content-type"], "application/json");

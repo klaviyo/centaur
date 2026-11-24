@@ -12,7 +12,10 @@ mod principals;
 mod ssh_keys;
 
 pub use api_clients::{ApiClient, ApiClientPrincipal, api_client_principals, find_api_client};
-pub use config::{REDACTED, SecretValues, Subject, build_config, build_config_with_github_user_id};
+pub use config::{
+    PR_OAUTH_PLACEHOLDER, REDACTED, SecretValues, Subject, build_config,
+    build_config_with_github_user_id,
+};
 pub use credentials::{SlackChannels, slack_channels};
 pub use error::{Error, Result};
 pub use oid::{decode_oid, oid};

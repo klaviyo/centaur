@@ -606,6 +606,8 @@ def test_create_pull_request_posts_to_the_current_session(
     }
     # The api token is injected by the proxy, never by the sandbox.
     assert requested["authorization"] is None
+    # Covers the API's lock wait plus its own 30s GitHub call.
+    assert requested["timeout"] == 120
 
 
 def test_create_pull_request_defaults_to_a_non_draft_with_no_body(

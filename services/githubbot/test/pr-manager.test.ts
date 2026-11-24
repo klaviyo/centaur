@@ -1550,7 +1550,7 @@ describe("PR session bindings", () => {
     lookupBody?: unknown;
     // One entry per /state call, consumed in order: a failing HTTP status or a
     // network error. Calls after the list is used up succeed.
-    stateFailures?: (number | "network")[];
+    stateFailures?: (number | "network" | "conflict")[];
     // One entry per binding GET, consumed in order; later GETs succeed.
     lookupFailures?: number[];
   }) {
@@ -1590,6 +1590,12 @@ describe("PR session bindings", () => {
       }
       const failure = stateFailures.shift();
       if (failure === "network") throw new TypeError("fetch failed");
+      if (failure === "conflict") {
+        return Response.json(
+          { error: { code: "binding_state_conflict", message: "contradicts the stored state" } },
+          { status: 409 },
+        );
+      }
       if (failure) return new Response("unavailable", { status: failure });
       if (current && typeof (body as { head_sha?: string })?.head_sha === "string") {
         current.head_sha = (body as { head_sha: string }).head_sha;
@@ -1611,6 +1617,16 @@ describe("PR session bindings", () => {
     // The rollup's check detail is unreadable, so the evaluation falls back to
     // aggregate counts: red, but with no failing name or link.
     aggregateOnly?: boolean;
+    // Some, but not all, of the rollup's check nodes are readable.
+    partial?: boolean;
+    // What fresh reads of the signed event's check return (or "throw").
+    github?: {
+      // The head's latest check runs for the event's check name.
+      checkRuns?: Record<string, unknown>[] | "throw";
+      combinedStatus?: Record<string, unknown> | "throw";
+      // The head's runs of the event's workflow.
+      workflowRuns?: Record<string, unknown>[] | "throw";
+    };
     // Head the PR reports on its Nth fetch (the last entry repeats).
     heads?: string[];
     nodeId?: string;
@@ -1635,6 +1651,14 @@ describe("PR session bindings", () => {
       permalink: "https://github.com/base/repo/runs/1",
     };
     const comments: string[] = [];
+    // Every GitHub read, in order, so a test can see which one came last.
+    const reads: string[] = [];
+    const fresh = (kind: string, value: Record<string, unknown> | "throw" | undefined) =>
+      async () => {
+        reads.push(kind);
+        if (value === undefined || value === "throw") throw new Error("not confirmable");
+        return { data: value };
+      };
     const ctx = {
       octokit: {
         graphql: async () => ({
@@ -1643,11 +1667,11 @@ describe("PR session bindings", () => {
               statusCheckRollup: {
                 state: input.settled === false ? "PENDING" : "FAILURE",
                 contexts: {
-                  nodes: input.aggregateOnly ? [null] : [node],
+                  nodes: input.aggregateOnly ? [null] : input.partial ? [node, null] : [node],
                   pageInfo: { hasNextPage: false, endCursor: null },
-                  ...(input.aggregateOnly
+                  ...(input.aggregateOnly || input.partial
                     ? {
-                        checkRunCountsByState: [{ count: 1, state: "FAILURE" }],
+                        checkRunCountsByState: [{ count: input.partial ? 2 : 1, state: "FAILURE" }],
                         statusContextCountsByState: [],
                       }
                     : {}),
@@ -1659,9 +1683,27 @@ describe("PR session bindings", () => {
         rest: {
           repos: {
             getCommit: async () => ({ data: { author: { login: "centaur-bot" } } }),
+            getCombinedStatusForRef: fresh("status", input.github?.combinedStatus),
+          },
+          checks: {
+            listForRef: async () => {
+              reads.push("check");
+              const runs = input.github?.checkRuns;
+              if (runs === undefined || runs === "throw") throw new Error("not confirmable");
+              return { data: { check_runs: runs } };
+            },
+          },
+          actions: {
+            listWorkflowRuns: async () => {
+              reads.push("workflow");
+              const runs = input.github?.workflowRuns;
+              if (runs === undefined || runs === "throw") throw new Error("not confirmable");
+              return { data: { workflow_runs: runs } };
+            },
           },
           pulls: {
             get: async () => {
+              reads.push("pr");
               const head = heads[Math.min(fetches, heads.length - 1)];
               const read = input.perRead?.[fetches] ?? {};
               fetches += 1;
@@ -1706,7 +1748,7 @@ describe("PR session bindings", () => {
         sleeps.push(ms);
       },
     } as unknown as PrManagerContext;
-    return { comments, ctx, sleeps };
+    return { comments, ctx, reads, sleeps };
   }
 
   const PR_KEY = "centaur-githubbot:pr:base/repo#7";
@@ -1973,6 +2015,16 @@ describe("PR session bindings", () => {
         ]);
       });
 
+      test("a conflicting head repair is recomputed and retried before the report", async () => {
+        const api = makeApi({ binding: stale, stateFailures: ["conflict"] });
+        await handleCiEvent(makeCtx({ api }).ctx, "check_run", redCheckRun);
+        expect(api.calls.filter((c) => c.method === "POST").map((c) => c.path.split("/").pop())).toEqual([
+          "state",
+          "state",
+          "ci-failures",
+        ]);
+      });
+
       test("a new head between the repair and the report is not reported", async () => {
         const api = makeApi({ binding: stale });
         await handleCiEvent(
@@ -2055,85 +2107,299 @@ describe("PR session bindings", () => {
       }
     });
 
-    describe("when the evaluation names no failing check", () => {
+    describe("naming the failing check", () => {
       const eventFor = (check: Record<string, unknown>) =>
         JSON.stringify({
           repository: { full_name: "base/repo" },
-          check_run: { head_sha: "abc123", pull_requests: [{ number: 7 }], ...check },
+          check_run: { head_sha: "abc123", pull_requests: [{ number: 7 }], id: 99, ...check },
         });
       const bound = () => makeApi({ binding: { managed: true, closed: false } });
+      const stillFailing = {
+        id: 90,
+        started_at: "2026-11-23T10:00:00Z",
+        head_sha: "abc123",
+        status: "completed",
+        conclusion: "failure",
+        name: "lint",
+        details_url: "https://ci.example.test/lint/9",
+        html_url: "https://github.com/base/repo/runs/9",
+      };
+      const failedEvent = { name: "lint", conclusion: "failure" };
+      const body = (api: ReturnType<typeof makeApi>) =>
+        api.posts("/ci-failures")[0]?.body as Record<string, unknown> | undefined;
 
-      test("the signed event's failing check stands in, with its details url", async () => {
+      test("an aggregate-only evaluation uses the event's check once a fresh read confirms it", async () => {
         const api = bound();
-        const { ctx } = makeCtx({ api, aggregateOnly: true });
-        await handleCiEvent(
-          ctx,
-          "check_run",
-          eventFor({
-            name: "lint",
-            conclusion: "failure",
-            details_url: "https://ci.example.test/lint/9",
-            html_url: "https://github.com/base/repo/runs/9",
-          }),
-        );
+        const { ctx, reads } = makeCtx({ api, aggregateOnly: true, github: { checkRuns: [stillFailing] } });
+        await handleCiEvent(ctx, "check_run", eventFor(failedEvent));
         expect(api.posts("/ci-failures")).toHaveLength(1);
-        expect(api.posts("/ci-failures")[0]?.body).toMatchObject({
+        expect(body(api)).toMatchObject({
           check_name: "lint",
           details_url: "https://ci.example.test/lint/9",
           head_sha: "abc123",
         });
+        // The confirmation comes before, and the fresh PR read stays last.
+        expect(reads).toEqual(["pr", "check", "pr"]);
       });
 
-      test("falls back to the event's html_url, and omits the link when it has neither", async () => {
-        const withHtml = bound();
+      test("takes the link from the latest run, not the event's, and falls back to html_url", async () => {
+        const api = bound();
+        const { ctx } = makeCtx({
+          api,
+          aggregateOnly: true,
+          github: { checkRuns: [{ ...stillFailing, details_url: null }] },
+        });
         await handleCiEvent(
-          makeCtx({ api: withHtml, aggregateOnly: true }).ctx,
+          ctx,
           "check_run",
-          eventFor({ name: "lint", conclusion: "timed_out", html_url: "https://github.com/base/repo/runs/9" }),
+          eventFor({ ...failedEvent, details_url: "https://ci.example.test/stale-link" }),
         );
-        expect(withHtml.posts("/ci-failures")[0]?.body).toMatchObject({
+        expect(body(api)).toMatchObject({
           check_name: "lint",
           details_url: "https://github.com/base/repo/runs/9",
         });
-        const bare = bound();
-        await handleCiEvent(
-          makeCtx({ api: bare, aggregateOnly: true }).ctx,
-          "check_run",
-          eventFor({ name: "lint", conclusion: "failure" }),
-        );
-        const body = bare.posts("/ci-failures")[0]?.body as Record<string, unknown>;
-        expect(body.check_name).toBe("lint");
-        expect("details_url" in body).toBe(false);
       });
 
-      test("a passing or unnamed event is not mistaken for the failure", async () => {
+      test("omits the link when the fresh read has none", async () => {
+        const api = bound();
+        const { ctx } = makeCtx({
+          api,
+          aggregateOnly: true,
+          github: { checkRuns: [{ ...stillFailing, details_url: null, html_url: null }] },
+        });
+        await handleCiEvent(ctx, "check_run", eventFor(failedEvent));
+        expect(body(api)?.check_name).toBe("lint");
+        expect("details_url" in (body(api) ?? {})).toBe(false);
+      });
+
+      test("a stale event (its check has since passed, moved or can't be read) is not used", async () => {
+        for (const checkRuns of [
+          [{ ...stillFailing, conclusion: "success" }],
+          [{ ...stillFailing, status: "in_progress", conclusion: null }],
+          [{ ...stillFailing, head_sha: "def456" }],
+          [{ ...stillFailing, name: "other" }],
+          [],
+          "throw" as const,
+        ]) {
+          const api = bound();
+          const state = makeState();
+          const { ctx } = makeCtx({ api, state, aggregateOnly: true, github: { checkRuns } });
+          await handleCiEvent(ctx, "check_run", eventFor(failedEvent));
+          // No identifiable failing check: no report, and the head stays unclaimed.
+          expect(api.posts("/ci-failures")).toHaveLength(0);
+          expect(api.sessionCalls).toEqual([]);
+          expect(state.keys()).toEqual([]);
+        }
+      });
+
+      test("a late event from an old failed run is not used once a rerun of that check passed", async () => {
+        const api = bound();
+        const state = makeState();
+        const { ctx, reads } = makeCtx({
+          api,
+          state,
+          aggregateOnly: true,
+          github: {
+            checkRuns: [
+              // The run the event is about, still failing when read by itself...
+              stillFailing,
+              // ...and its rerun, a newer run of the same check, which passed.
+              {
+                ...stillFailing,
+                id: 91,
+                started_at: "2026-11-23T10:05:00Z",
+                conclusion: "success",
+                details_url: "https://ci.example.test/lint/10",
+              },
+            ],
+          },
+        });
+        await handleCiEvent(ctx, "check_run", eventFor(failedEvent));
+        expect(reads).toContain("check");
+        expect(api.posts("/ci-failures")).toHaveLength(0);
+        expect(state.keys()).toEqual([]);
+      });
+
+      test("when the latest run of the check is the failing one, its link is used", async () => {
+        const api = bound();
+        const { ctx } = makeCtx({
+          api,
+          aggregateOnly: true,
+          github: {
+            checkRuns: [
+              stillFailing,
+              { ...stillFailing, id: 91, started_at: "2026-11-23T10:05:00Z", details_url: "https://ci.example.test/lint/10" },
+            ],
+          },
+        });
+        await handleCiEvent(ctx, "check_run", eventFor(failedEvent));
+        expect(body(api)).toMatchObject({ details_url: "https://ci.example.test/lint/10" });
+      });
+
+      test("no identifiable check means no report, with no generic notice", async () => {
         for (const check of [
           { name: "build", conclusion: "success", details_url: "https://ci.example.test/ok" },
           { conclusion: "failure", details_url: "https://ci.example.test/unnamed" },
         ]) {
           const api = bound();
-          await handleCiEvent(
-            makeCtx({ api, aggregateOnly: true }).ctx,
-            "check_run",
-            eventFor(check),
-          );
-          const body = api.posts("/ci-failures")[0]?.body as Record<string, unknown>;
-          expect(body.check_name).toBe("CI checks");
-          expect("details_url" in body).toBe(false);
+          const { ctx, reads } = makeCtx({ api, aggregateOnly: true, github: { checkRuns: [stillFailing] } });
+          await handleCiEvent(ctx, "check_run", eventFor(check));
+          expect(api.posts("/ci-failures")).toHaveLength(0);
+          // A passing or unnamed event is never even looked up.
+          expect(reads).not.toContain("check");
         }
+        // And an aggregate-only evaluation with no usable event at all.
+        const api = bound();
+        const { ctx } = makeCtx({ api, aggregateOnly: true });
+        await handleCiEvent(ctx, "check_suite", JSON.stringify({
+          repository: { full_name: "base/repo" },
+          check_suite: { head_sha: "abc123", pull_requests: [{ number: 7 }] },
+        }));
+        expect(api.posts("/ci-failures")).toHaveLength(0);
+      });
+
+      const workflowEvent = JSON.stringify({
+        repository: { full_name: "base/repo" },
+        workflow_run: {
+          id: 5,
+          workflow_id: 17,
+          name: "ci",
+          conclusion: "failure",
+          head_sha: "abc123",
+          pull_requests: [{ number: 7 }],
+        },
+      });
+      const workflowRun = {
+        id: 5,
+        run_number: 3,
+        run_attempt: 1,
+        head_sha: "abc123",
+        status: "completed",
+        conclusion: "failure",
+        name: "ci",
+        html_url: "https://github.com/base/repo/actions/runs/5",
+      };
+
+      test("a workflow run is confirmed by the latest run of that workflow on the head", async () => {
+        const failing = bound();
+        await handleCiEvent(
+          makeCtx({ api: failing, aggregateOnly: true, github: { workflowRuns: [workflowRun] } }).ctx,
+          "workflow_run",
+          workflowEvent,
+        );
+        expect(body(failing)).toMatchObject({
+          check_name: "ci",
+          details_url: "https://github.com/base/repo/actions/runs/5",
+        });
+
+        // A later run of the same workflow on that head passed: the old failure is stale.
+        for (const workflowRuns of [
+          [workflowRun, { ...workflowRun, id: 6, run_number: 4, conclusion: "success" }],
+          [workflowRun, { ...workflowRun, run_attempt: 2, conclusion: "success" }],
+          [{ ...workflowRun, status: "in_progress", conclusion: null }],
+          [],
+          "throw" as const,
+        ]) {
+          const stale = bound();
+          await handleCiEvent(
+            makeCtx({ api: stale, aggregateOnly: true, github: { workflowRuns } }).ctx,
+            "workflow_run",
+            workflowEvent,
+          );
+          expect(stale.posts("/ci-failures")).toHaveLength(0);
+        }
+      });
+
+      test("a status is confirmed by its latest state for the sha", async () => {
+        const statusApi = bound();
+        const statusCtx = makeCtx({
+          api: statusApi,
+          aggregateOnly: true,
+          github: {
+            combinedStatus: {
+              sha: "abc123",
+              statuses: [
+                { context: "deploy", state: "failure", target_url: "https://ci.example.test/deploy/3" },
+              ],
+            },
+          },
+        }).ctx;
+        (statusCtx.octokit.rest.repos as unknown as Record<string, unknown>).listPullRequestsAssociatedWithCommit =
+          async () => ({ data: [{ number: 7 }] });
+        const statusEvent = JSON.stringify({
+          repository: { full_name: "base/repo" },
+          sha: "abc123",
+          state: "failure",
+          context: "deploy",
+          target_url: "https://ci.example.test/old",
+        });
+        await handleCiEvent(statusCtx, "status", statusEvent);
+        expect(body(statusApi)).toMatchObject({
+          check_name: "deploy",
+          details_url: "https://ci.example.test/deploy/3",
+        });
+
+        // The same status has since passed.
+        const passedApi = bound();
+        const passedCtx = makeCtx({
+          api: passedApi,
+          aggregateOnly: true,
+          github: {
+            combinedStatus: {
+              sha: "abc123",
+              statuses: [{ context: "deploy", state: "success", target_url: "u" }],
+            },
+          },
+        }).ctx;
+        (passedCtx.octokit.rest.repos as unknown as Record<string, unknown>).listPullRequestsAssociatedWithCommit =
+          async () => ({ data: [{ number: 7 }] });
+        await handleCiEvent(passedCtx, "status", statusEvent);
+        expect(passedApi.posts("/ci-failures")).toHaveLength(0);
+      });
+
+      test("a partially readable evaluation keeps the failing check it did read", async () => {
+        const api = bound();
+        const { ctx, reads } = makeCtx({
+          api,
+          partial: true,
+          // A readable event that would name something else must not win.
+          github: { checkRuns: [{ ...stillFailing, name: "other" }] },
+        });
+        await handleCiEvent(ctx, "check_run", eventFor({ name: "other", conclusion: "failure" }));
+        expect(body(api)).toMatchObject({ check_name: "build", details_url: FAILURE_URL });
+        expect(reads).not.toContain("check");
       });
 
       test("never overrides a failing check the evaluation did read", async () => {
         const api = bound();
-        await handleCiEvent(
-          makeCtx({ api }).ctx,
-          "check_run",
-          eventFor({ name: "lint", conclusion: "failure", details_url: "https://ci.example.test/lint/9" }),
-        );
-        expect(api.posts("/ci-failures")[0]?.body).toMatchObject({
-          check_name: "build",
-          details_url: FAILURE_URL,
+        const { ctx, reads } = makeCtx({ api, github: { checkRuns: [stillFailing] } });
+        await handleCiEvent(ctx, "check_run", eventFor(failedEvent));
+        expect(body(api)).toMatchObject({ check_name: "build", details_url: FAILURE_URL });
+        expect(reads).not.toContain("check");
+      });
+
+      test("truncates a very long check name to api-rs's 200 characters", async () => {
+        const api = bound();
+        const long = "x".repeat(150) + "é".repeat(100);
+        const { ctx } = makeCtx({
+          api,
+          checkNode: { __typename: "CheckRun", name: long, status: "COMPLETED", conclusion: "FAILURE" },
         });
+        await handleCiEvent(ctx, "check_run", eventFor({}));
+        const name = body(api)?.check_name as string;
+        expect(Array.from(name)).toHaveLength(200);
+        expect(name).toBe(long.slice(0, 200));
+        // A name at the limit is left alone.
+        const exact = bound();
+        await handleCiEvent(
+          makeCtx({
+            api: exact,
+            checkNode: { __typename: "CheckRun", name: "y".repeat(200), status: "COMPLETED", conclusion: "FAILURE" },
+          }).ctx,
+          "check_run",
+          eventFor({}),
+        );
+        expect(body(exact)?.check_name).toBe("y".repeat(200));
       });
     });
 
@@ -2225,9 +2491,10 @@ describe("PR session bindings", () => {
       lookupFailures?: number[];
       lookupStatus?: number;
       nodeId?: string;
+      perRead?: Record<number, { fails?: boolean; nodeId?: string; state?: string; updatedAt?: string }>;
       prFetchFails?: boolean;
       prState?: string;
-      stateFailures?: (number | "network")[];
+      stateFailures?: (number | "network" | "conflict")[];
       updatedAt?: string | null;
     };
 
@@ -2444,6 +2711,54 @@ describe("PR session bindings", () => {
         const forbidden = await exec(bound, assigned, { lookupStatus: 403 });
         expect(forbidden.updates).toEqual([]);
         expect(forbidden.sleeps).toEqual([]);
+      });
+
+      test("a binding_state_conflict is recomputed from a fresh read and converges to it", async () => {
+        // A reopened event reads the PR as closed and writes closed:true, but
+        // api-rs holds the contradicting value at the same timestamp. By the
+        // re-read the PR is open: the retry writes that.
+        const result = await exec(managed, prEvent("reopened"), {
+          prState: "closed",
+          perRead: { 1: { state: "open" } },
+          stateFailures: ["conflict"],
+        });
+        expect(result.updates).toEqual([
+          { pr_node_id: NODE_ID, ...seen, closed: true },
+          { pr_node_id: NODE_ID, ...seen, closed: false },
+        ]);
+        expect(result.sleeps).toEqual([10_000]);
+      });
+
+      test("a conflict is retried for any write, within the same bounded budget", async () => {
+        const sync = await exec(bound, prEvent("synchronize"), {
+          heads: ["head-1", "head-2"],
+          stateFailures: ["conflict"],
+        });
+        expect(sync.updates.map((u) => (u as { head_sha: string }).head_sha)).toEqual([
+          "head-1",
+          "head-2",
+        ]);
+        const exhausted = await exec(managed, prEvent("closed"), {
+          prState: "closed",
+          stateFailures: ["conflict", "conflict", "conflict", "conflict"],
+        });
+        expect(exhausted.updates).toHaveLength(3);
+        expect(exhausted.sleeps).toEqual([10_000, 20_000]);
+      });
+
+      test("a conflict whose re-read is unreadable, or no longer calls for a write, stops there", async () => {
+        const unreadable = await exec(managed, prEvent("closed"), {
+          prState: "closed",
+          perRead: { 1: { fails: true } },
+          stateFailures: ["conflict"],
+        });
+        expect(unreadable.updates).toHaveLength(1);
+        const moot = await exec(managed, prEvent("closed"), {
+          prState: "closed",
+          perRead: { 1: { nodeId: "PR_other" } },
+          stateFailures: ["conflict"],
+        });
+        expect(moot.updates).toHaveLength(1);
       });
 
       test("still writes on the payload's node id when the binding lookup fails", async () => {

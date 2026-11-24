@@ -60,11 +60,7 @@ pub async fn build_config(
     subject: &Subject<'_>,
     requester_id: Option<i64>,
 ) -> Result<Config> {
-    Ok(
-        build_config_with_github_user_id(pool, values, subject, requester_id)
-            .await?
-            .0,
-    )
+    Ok(build(pool, values, subject, requester_id, false).await?.0)
 }
 
 /// [`build_config`], together with the GitHub account id
@@ -80,15 +76,42 @@ pub async fn build_config(
 /// contains (a grant, token or ownership change between the two reads), and
 /// callers compare it with the author GitHub reports for a PR created with
 /// that token.
+///
+/// When an account is attested, the configuration also carries one extra
+/// secret, appended after every credential's own so it never takes part in
+/// conflict suppression: the attested credential's own token source under the
+/// placeholder [`PR_OAUTH_PLACEHOLDER`], valid only for `POST api.github.com
+/// /repos/*/*/pulls`. api-rs's pull-request create call sends that placeholder
+/// instead of the generic `GITHUB_TOKEN` one, so it can only authenticate with
+/// the attested OAuth credential in the configuration in force at that moment:
+/// if the credential has since become a personal access token, or is gone, the
+/// placeholder is not substituted and GitHub rejects the call. With no
+/// attested account there is no such secret.
 pub async fn build_config_with_github_user_id(
     pool: &PgPool,
     values: SecretValues<'_>,
     subject: &Subject<'_>,
     requester_id: Option<i64>,
 ) -> Result<(Config, Option<String>)> {
+    build(pool, values, subject, requester_id, true).await
+}
+
+/// The placeholder api-rs's pull-request create call sends as its bearer
+/// token, replaced by the proxy only with the attested OAuth credential's
+/// token and only on that one operation.
+pub const PR_OAUTH_PLACEHOLDER: &str = "CENTAUR_PR_OAUTH";
+
+async fn build(
+    pool: &PgPool,
+    values: SecretValues<'_>,
+    subject: &Subject<'_>,
+    requester_id: Option<i64>,
+    pr_oauth_secret: bool,
+) -> Result<(Config, Option<String>)> {
     let credentials =
         effective_credentials(pool, values, subject.principal_id, requester_id).await?;
-    let github_user_id = github_user_id_of(&credentials);
+    let attested = attested_github_credential(&credentials);
+    let github_user_id = attested.map(|(_, account)| account.to_owned());
 
     let mut config = Config::default();
     for credential in credentials
@@ -132,6 +155,24 @@ pub async fn build_config_with_github_user_id(
             .push(json!({ "name": "oauth_token", "config": { "tokens": oauth } }));
     }
     append_postgres(subject, &credentials, values, &mut config)?;
+    if pr_oauth_secret
+        && let Some((credential, _)) = attested
+        && let Some(source) = source_value(&credential.sources[0], values)?
+    {
+        config.secrets.push(json!({
+            "source": source,
+            "replace": {
+                "proxy_value": PR_OAUTH_PLACEHOLDER,
+                "match_headers": ["Authorization"],
+                "require": false,
+            },
+            "rules": [{
+                "host": GITHUB_API_HOST,
+                "methods": ["POST"],
+                "paths": ["/repos/*/*/pulls"],
+            }],
+        }));
+    }
     Ok((config, github_user_id))
 }
 
@@ -186,7 +227,14 @@ const GITHUB_API_HOST: &str = "api.github.com";
 ///
 /// Any other shape (no credential, a non-OAuth token, a competing credential,
 /// a missing or non-numeric subject) is `None`, never a guess.
+#[cfg(test)]
 fn github_user_id_of(credentials: &[Credential]) -> Option<String> {
+    attested_github_credential(credentials).map(|(_, account)| account.to_owned())
+}
+
+/// The credential whose token the proxy would inject for the GitHub API, and
+/// its GitHub account, when [`github_user_id_of`]'s rules attest one.
+fn attested_github_credential(credentials: &[Credential]) -> Option<(&Credential, &str)> {
     let mut serving = credentials
         .iter()
         .filter(|credential| writes_header_on_host(credential, "authorization", GITHUB_API_HOST));
@@ -204,12 +252,12 @@ fn github_user_id_of(credentials: &[Credential]) -> Option<String> {
     {
         return None;
     }
-    source
+    let account = source
         .broker_provider_subject
         .as_deref()
         .map(str::trim)
-        .filter(|subject| !subject.is_empty() && subject.bytes().all(|b| b.is_ascii_digit()))
-        .map(str::to_owned)
+        .filter(|subject| !subject.is_empty() && subject.bytes().all(|b| b.is_ascii_digit()))?;
+    Some((credential, account))
 }
 
 pub(crate) fn source_value(

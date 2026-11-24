@@ -277,13 +277,17 @@ export async function fetchCiEvaluation(
   else if (countsPending !== undefined) {
     settled = !aggregatePending && !countsPending;
   }
+  // Without a complete detail set, the verdict is the aggregate's, but a
+  // failing check among the contexts that *were* readable is still a real
+  // failing check: keep its name and link for whoever reports it.
+  const named = detail ?? (nodes.length > 0 ? evaluateCiRollupContexts(nodes) : null);
   return {
     settled,
     // GitHub computes rollupState over every context, marked ones included, so
     // OR-ing it in would undo the filter. A readable detail set is authoritative.
     failed: detail ? detail.failed : rollupState === "FAILURE" || rollupState === "ERROR",
-    failingNames: detail?.failingNames ?? [],
-    ...(detail?.firstFailingUrl ? { firstFailingUrl: detail.firstFailingUrl } : {}),
+    failingNames: named?.failingNames ?? [],
+    ...(named?.firstFailingUrl ? { firstFailingUrl: named.firstFailingUrl } : {}),
   };
 }
 

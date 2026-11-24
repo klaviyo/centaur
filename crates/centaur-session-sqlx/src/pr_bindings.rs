@@ -238,8 +238,11 @@ impl PgSessionStore {
     /// ordered on its own: it is applied only when the field has no stored
     /// observation or its stored one is not later, and then records this one.
     /// An older write to a field changes nothing in that field, and never
-    /// disturbs another field's newer value. `applied` is true when any
-    /// provided field was applied. Webhook handlers run concurrently and
+    /// disturbs another field's newer value. A provided field whose
+    /// observation equals the stored one but whose value differs cannot be
+    /// ordered; the write is refused whole with
+    /// [`SessionStoreError::PrBindingStateConflict`] and nothing changes.
+    /// `applied` is true when any provided field was applied. Webhook handlers run concurrently and
     /// arrive out of order, so this is what makes close, reopen, assignment
     /// and head writes converge on the newest fetch. `None` writes
     /// unconditionally and leaves the stored observations alone; only
@@ -282,6 +285,49 @@ impl PgSessionStore {
                 number,
                 reason: "the binding is for a different pull request".to_owned(),
             });
+        }
+        // A write that disagrees with a field's value at the very same
+        // observation time cannot be ordered against it: neither is newer.
+        // Refuse it, changing nothing, so the caller re-reads GitHub and
+        // retries with a fresher observation.
+        let contradicts = |field: &'static str, differs: bool, stored: Option<OffsetDateTime>| {
+            (differs && observed_updated_at.is_some() && observed_updated_at == stored).then(|| {
+                SessionStoreError::PrBindingStateConflict {
+                    repository: repository.clone(),
+                    number,
+                    field,
+                }
+            })
+        };
+        if let Some(error) = update
+            .managed
+            .and_then(|managed| {
+                contradicts(
+                    "managed",
+                    managed != current.managed,
+                    current.managed_observed_at,
+                )
+            })
+            .or_else(|| {
+                update.closed.and_then(|closed| {
+                    contradicts(
+                        "closed",
+                        closed != current.closed,
+                        current.closed_observed_at,
+                    )
+                })
+            })
+            .or_else(|| {
+                update.head_sha.as_deref().and_then(|head_sha| {
+                    contradicts(
+                        "head_sha",
+                        head_sha != current.head_sha,
+                        current.head_observed_at,
+                    )
+                })
+            })
+        {
+            return Err(error);
         }
         // A field applies when it is provided and no later observation of it
         // is already stored.
@@ -824,12 +870,15 @@ mod tests {
         assert!(!outcome.applied);
         assert!(!outcome.binding.closed);
         assert_eq!(outcome.binding.closed_observed_at, at(30));
-        // The same observation, or a newer one, applies.
-        assert!(write(&store, &new, close, at(30)).await.applied);
+        // The same value at the same observation, or a newer observation of
+        // another value, applies.
+        assert!(write(&store, &new, reopen.clone(), at(30)).await.applied);
+        let outcome = write(&store, &new, close, at(31)).await;
+        assert!(outcome.applied && outcome.binding.closed);
         // An unobserved server-side write applies and keeps the observation.
         let outcome = write(&store, &new, reopen, None).await;
         assert!(outcome.applied && !outcome.binding.closed);
-        assert_eq!(outcome.binding.closed_observed_at, at(30));
+        assert_eq!(outcome.binding.closed_observed_at, at(31));
     }
 
     #[tokio::test]
@@ -905,6 +954,97 @@ mod tests {
         assert_eq!(outcome.binding.head_sha, "fedcba9");
         assert_eq!(outcome.binding.managed_observed_at, at(15));
         assert_eq!(outcome.binding.head_observed_at, at(20));
+    }
+
+    #[tokio::test]
+    async fn a_contradiction_at_an_equal_observation_is_a_conflict_that_changes_nothing() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key = session(&store).await;
+        let new = new_binding(&thread_key);
+        store.insert_pr_binding(&new).await.unwrap();
+        let update = |closed: bool, head: &str| PrBindingStateUpdate {
+            closed: Some(closed),
+            head_sha: Some(head.to_owned()),
+            ..Default::default()
+        };
+        write(&store, &new, update(true, "aaa1111"), at(10)).await;
+
+        // The same observation, a different closed value: neither is newer.
+        let error = store
+            .update_pr_binding_state(
+                &new.repository,
+                new.number,
+                &new.pr_node_id,
+                &PrBindingStateUpdate {
+                    closed: Some(false),
+                    managed: Some(true),
+                    ..Default::default()
+                },
+                at(10),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SessionStoreError::PrBindingStateConflict {
+                    field: "closed",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        // Nothing changed, including the provided field that did not clash.
+        let after = store
+            .pr_binding(&new.repository, new.number)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(after.closed && !after.managed);
+        assert_eq!(after.managed_observed_at, None);
+
+        // The head contradicts the same way.
+        assert!(matches!(
+            store
+                .update_pr_binding_state(
+                    &new.repository,
+                    new.number,
+                    &new.pr_node_id,
+                    &PrBindingStateUpdate {
+                        head_sha: Some("bbb2222".to_owned()),
+                        ..Default::default()
+                    },
+                    at(10),
+                )
+                .await,
+            Err(SessionStoreError::PrBindingStateConflict {
+                field: "head_sha",
+                ..
+            })
+        ));
+
+        // The same value at the same time still applies, as before.
+        let outcome = write(&store, &new, update(true, "aaa1111"), at(10)).await;
+        assert!(outcome.applied);
+        // A newer observation overrides; an older one is ignored, not a
+        // conflict; an unobserved server-side write is never one.
+        assert!(
+            write(&store, &new, update(false, "ccc3333"), at(20))
+                .await
+                .applied
+        );
+        assert!(
+            !write(&store, &new, update(true, "ddd4444"), at(15))
+                .await
+                .applied
+        );
+        assert!(
+            write(&store, &new, update(true, "eee5555"), None)
+                .await
+                .applied
+        );
     }
 
     #[tokio::test]

@@ -8,10 +8,10 @@ use std::env;
 
 use active_record_encryption::ActiveRecordEncryption;
 use centaur_console_db::{
-    ApiClient, ApiClientPrincipal, REDACTED, SecretValues, SlackChannelPermission, Subject,
-    api_client_principals, build_config, build_config_with_github_user_id, find_api_client,
-    find_direct_slack_channel_permission, find_principal, find_principal_by_foreign_id,
-    find_user_id_by_email, models::Config,
+    ApiClient, ApiClientPrincipal, PR_OAUTH_PLACEHOLDER, REDACTED, SecretValues,
+    SlackChannelPermission, Subject, api_client_principals, build_config,
+    build_config_with_github_user_id, find_api_client, find_direct_slack_channel_permission,
+    find_principal, find_principal_by_foreign_id, find_user_id_by_email, models::Config,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -617,6 +617,114 @@ fn github_secrets(config: &Config) -> Vec<&Value> {
                 && secret["rules"] == json!([{ "host": "api.github.com" }])
         })
         .collect()
+}
+
+/// The secrets that carry the PR-create OAuth placeholder.
+fn pr_oauth_secrets(config: &Config) -> Vec<&Value> {
+    config
+        .secrets
+        .iter()
+        .filter(|secret| secret["replace"]["proxy_value"] == PR_OAUTH_PLACEHOLDER)
+        .collect()
+}
+
+#[tokio::test]
+async fn the_oauth_only_secret_exists_exactly_when_an_account_is_attested() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let actor = fixture.owner_principal("pr-oauth").await;
+    let (config, account) = github_config(&fixture, actor).await;
+    assert_eq!(account, None);
+    assert!(pr_oauth_secrets(&config).is_empty());
+
+    fixture
+        .brokered_token(
+            actor,
+            "github-pr-oauth",
+            "github",
+            Some("90210001"),
+            "api.github.com",
+            100,
+            fixture.personal(),
+        )
+        .await;
+    let (config, account) = github_config(&fixture, actor).await;
+    assert_eq!(account.as_deref(), Some("90210001"));
+
+    // One extra secret: the attested credential's own token source, under the
+    // placeholder, for the one create operation only.
+    let extra = pr_oauth_secrets(&config);
+    assert_eq!(extra.len(), 1, "{extra:?}");
+    let delivered = github_secrets(&config);
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(extra[0]["source"], delivered[0]["source"]);
+    assert_eq!(extra[0]["source"]["type"], "control_plane");
+    assert_eq!(
+        extra[0]["replace"],
+        json!({
+            "proxy_value": "CENTAUR_PR_OAUTH",
+            "match_headers": ["Authorization"],
+            "require": false,
+        })
+    );
+    assert_eq!(
+        extra[0]["rules"],
+        json!([{
+            "host": "api.github.com",
+            "methods": ["POST"],
+            "paths": ["/repos/*/*/pulls"],
+        }])
+    );
+    assert!(extra[0].get("inject").is_none());
+    // It is appended after every credential's own secret, so it never took
+    // part in suppression, and the delivered one is unchanged.
+    assert_eq!(
+        config
+            .secrets
+            .last()
+            .map(|secret| &secret["replace"]["proxy_value"]),
+        Some(&json!("CENTAUR_PR_OAUTH"))
+    );
+
+    // The plain config (Console's effective-config preview, for one) never
+    // carries it.
+    let encryption = ActiveRecordEncryption::new(PRIMARY_KEY, SALT);
+    let empty = json!([]);
+    let labels = json!({});
+    let subject = Subject {
+        principal_id: actor,
+        principal: None,
+        console_user_id: None,
+        console_user_email: None,
+        slack_history_channel_ids: &empty,
+        proxy_labels: &labels,
+    };
+    let plain = build_config(
+        &fixture.pool,
+        SecretValues::Live(&encryption),
+        &subject,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(pr_oauth_secrets(&plain).is_empty());
+
+    // An equal competitor leaves the account unattested, so no secret.
+    fixture
+        .brokered_token(
+            actor,
+            "github-pr-oauth-competing",
+            "github",
+            Some("90210002"),
+            "api.github.com",
+            100,
+            fixture.personal(),
+        )
+        .await;
+    let (config, account) = github_config(&fixture, actor).await;
+    assert_eq!(account, None);
+    assert!(pr_oauth_secrets(&config).is_empty());
 }
 
 #[tokio::test]
