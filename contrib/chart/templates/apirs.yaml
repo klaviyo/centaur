@@ -6,7 +6,13 @@
 value, the override and selector checks, the certificate projection) reads this
 boolean, so a non-boolean value (possible when the schema is skipped) can't
 leave them disagreeing. */ -}}
-{{- $trustedPrCreateRaw := .Values.apiRs.trustedPrCreateEnabled | default false -}}
+{{- /* No "default": it would turn 0, "", [] or {} into false before the check.
+A missing key (Helm drops an explicit null) means off; any present value must be
+a boolean. */ -}}
+{{- $trustedPrCreateRaw := false -}}
+{{- if hasKey .Values.apiRs "trustedPrCreateEnabled" -}}
+{{- $trustedPrCreateRaw = .Values.apiRs.trustedPrCreateEnabled -}}
+{{- end -}}
 {{- if not (kindIs "bool" $trustedPrCreateRaw) -}}
 {{- fail (printf "apiRs.trustedPrCreateEnabled must be a boolean; got %v (%s)" $trustedPrCreateRaw (kindOf $trustedPrCreateRaw)) -}}
 {{- end -}}
@@ -134,11 +140,14 @@ connectors, so later sources come later in the list. */ -}}
 {{- range $env := $apiRsEtlEnv -}}
 {{- $apiRsEtlPassthroughNames = append $apiRsEtlPassthroughNames $env.name -}}
 {{- end -}}
-{{- with (get .Values.apiRs.extraEnv "SESSION_SANDBOX_PASSTHROUGH_ENV") -}}
-{{- if not (kindIs "string" .) -}}
+{{- /* hasKey, not "with": "with" skips false or 0, which would then silently
+fall back to the generated list instead of failing. */ -}}
+{{- if hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_PASSTHROUGH_ENV" -}}
+{{- $passthrough := get .Values.apiRs.extraEnv "SESSION_SANDBOX_PASSTHROUGH_ENV" -}}
+{{- if not (kindIs "string" $passthrough) -}}
 {{- fail "apiRs.extraEnv.SESSION_SANDBOX_PASSTHROUGH_ENV must be a comma-separated string" -}}
 {{- end -}}
-{{- range $name := splitList "," (toString .) -}}
+{{- range $name := splitList "," $passthrough -}}
 {{- $trimmedName := trim $name -}}
 {{- if $trimmedName -}}
 {{- $apiRsEtlPassthroughNames = append $apiRsEtlPassthroughNames $trimmedName -}}
