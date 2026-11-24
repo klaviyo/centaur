@@ -546,12 +546,12 @@ them and override what the checks below compared. */}}
 the container to something other than what the alias check below compares.
 Valid Secret names and keys can't contain "$": require their real formats. */}}
 {{- range $name := list (include "centaur.trustedCaSecretName" .) (include "centaur.trustedCaKeySecretName" .) }}
-{{- if not (regexMatch "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" $name) }}
+{{- if or (gt (len $name) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $name)) }}
 {{- fail (printf "apiRs.trustedPrCreateEnabled needs firewall CA Secret names that are valid Kubernetes names; got %q" $name) }}
 {{- end }}
 {{- end }}
 {{- range $key := list (.Values.firewall.existingCaSecretKey | default "ca-cert.pem") (.Values.firewall.existingCaKeySecretKey | default "ca-key.pem") }}
-{{- if not (regexMatch "^[-._a-zA-Z0-9]+$" $key) }}
+{{- if or (gt (len $key) 253) (not (regexMatch "^[-._a-zA-Z0-9]+$" $key)) (eq $key ".") (eq $key "..") (hasPrefix ".." $key) }}
 {{- fail (printf "apiRs.trustedPrCreateEnabled needs firewall CA Secret keys that are valid Secret keys; got %q" $key) }}
 {{- end }}
 {{- end }}
@@ -746,7 +746,13 @@ copies in source order (later roots shadow earlier ones). */}}
             from an unquoted scalar. */}}
             - name: {{ $name | quote }}
 {{- if kindIs "map" $value }}
-{{ toYaml $value | nindent 14 }}
+{{- /* Only valueFrom: anything else in the map (a nested "name", say, when
+the schema is skipped) would otherwise override the quoted name above. */}}
+{{- if not (hasKey $value "valueFrom") }}
+{{- fail (printf "apiRs.extraEnv.%s: a map value must be {valueFrom: ...}" $name) }}
+{{- end }}
+              valueFrom:
+{{ toYaml $value.valueFrom | nindent 16 }}
 {{- else }}
               value: {{ $value | quote }}
 {{- end }}

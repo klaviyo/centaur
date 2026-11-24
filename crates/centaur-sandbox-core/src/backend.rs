@@ -224,10 +224,14 @@ pub trait SandboxBackend: Send + Sync {
     /// This is deliberately not a general proxied HTTPS request. The backend
     /// fixes the method, host, path (see [`github_pull_requests_path`]) and
     /// headers, so the caller cannot choose any of them. The request carries
-    /// only the placeholder `Bearer CENTAUR_PR_OAUTH`; the sandbox's proxy swaps in
-    /// the OAuth token of the human its principal is bound to, for this one
-    /// operation and only while that credential is attested as OAuth. Otherwise
-    /// the placeholder reaches GitHub unsubstituted and is rejected. The pull
+    /// only `Bearer <placeholder>`, the identity-bound placeholder derived from
+    /// the GitHub account and requester api-rs validated. The sandbox's proxy
+    /// swaps in the OAuth token of the human its principal is bound to, for
+    /// this one operation, and only while that credential is attested as an
+    /// OAuth App user token for the same identity. A proxy bound to anyone
+    /// else, or with nothing attested, refuses the call itself (403) before
+    /// GitHub sees it. An older proxy without the guard passes the placeholder
+    /// through unsubstituted, and GitHub rejects it. The pull
     /// request is authored as that person and api-rs never holds the token.
     /// Callers must still verify the author in the response.
     async fn create_github_pull_request(
