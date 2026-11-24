@@ -708,10 +708,25 @@ def test_create_pull_request_cli_prints_result(
     assert str(requested["url"]).endswith("/pull-requests")
 
 
+@pytest.mark.parametrize(
+    ("status", "code", "fallback"),
+    [
+        (409, "github_oauth_required", True),
+        (403, "slack_session_required", True),
+        (403, "dm_not_supported", True),
+        (403, "sandbox_mismatch", True),
+        (502, "upstream_error", False),
+    ],
+)
 def test_create_pull_request_cli_reports_http_errors(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    status: int,
+    code: str,
+    fallback: bool,
 ):
     import io
+    import json
     import urllib.error
 
     from centaur_sdk import pull_requests
@@ -719,10 +734,10 @@ def test_create_pull_request_cli_reports_http_errors(
     def refuse(request, timeout):
         raise urllib.error.HTTPError(
             request.full_url,
-            409,
-            "Conflict",
+            status,
+            "Error",
             {},
-            io.BytesIO(b'{"error":{"code":"github_oauth_required"}}'),
+            io.BytesIO(json.dumps({"error": {"code": code}}).encode()),
         )
 
     monkeypatch.setattr("urllib.request.urlopen", refuse)
@@ -736,6 +751,7 @@ def test_create_pull_request_cli_reports_http_errors(
     )
     captured = capsys.readouterr()
     assert exit_code == 1
-    assert "HTTP 409" in captured.err
-    assert "github_oauth_required" in captured.err
+    assert f"HTTP {status}" in captured.err
+    assert code in captured.err
+    assert ("open the pull request as you normally would" in captured.err) is fallback
     assert captured.out == ""

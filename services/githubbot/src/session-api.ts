@@ -676,7 +676,11 @@ function sleep(ms: number): Promise<void> {
 
 export type PrBindingRef = { repository: string; number: number };
 
-/** The binding for a PR, or null when none exists (404 means unbound). */
+/**
+ * The binding for a PR. Only an explicit 404 means unbound (null); any other
+ * status, or a malformed body, throws so callers cannot mistake an unknown
+ * binding for an unbound PR.
+ */
 export async function getPrBinding(
   options: GithubbotOptions,
   ref: PrBindingRef,
@@ -743,7 +747,13 @@ async function postPrBinding(
 }
 
 function parsePrBinding(payload: unknown): PrBinding {
-  if (!isJsonObject(payload) || typeof payload.thread_key !== "string") {
+  if (
+    !isJsonObject(payload) ||
+    typeof payload.thread_key !== "string" ||
+    typeof payload.pr_node_id !== "string" ||
+    typeof payload.managed !== "boolean" ||
+    typeof payload.closed !== "boolean"
+  ) {
     throw new Error("pr binding response has an unexpected shape");
   }
   return payload as unknown as PrBinding;

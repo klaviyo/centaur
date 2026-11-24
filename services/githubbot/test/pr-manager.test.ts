@@ -905,8 +905,14 @@ describe("CI fix counter and escalation", () => {
         ciFixMaxAttempts: 3,
         escalationHandle: "maintainer",
         logger: quietLogger,
-        // Non-retryable so the backgrounded fix turn settles off the network.
-        fetch: () => Promise.resolve(new Response("no", { status: 400 })),
+        // The binding lookup answers 404 (unbound); anything else is
+        // non-retryable so the backgrounded fix turn settles off the network.
+        fetch: (url: string | URL | Request) =>
+          Promise.resolve(
+            String(url).includes("/api/pr-bindings/")
+              ? new Response("not found", { status: 404 })
+              : new Response("no", { status: 400 }),
+          ),
       },
       state,
       userName: "centaur-bot",
@@ -1517,21 +1523,28 @@ describe("PR session bindings", () => {
   const PR_URL = "https://github.com/base/repo/pull/7";
   const FAILURE_URL = "https://ci.example.test/runs/1";
 
-  type Binding = { managed: boolean; closed: boolean };
+  type Binding = { managed: boolean; closed: boolean; pr_node_id?: string };
   type Call = { body: unknown; method: string; path: string };
+
+  const NODE_ID = "PR_node_1";
 
   function bindingJson(binding: Binding, headSha = "abc123") {
     return {
       repository: "base/repo",
       number: 7,
       thread_key: "slack:T0:C0:1700000000.000100",
+      pr_node_id: NODE_ID,
       head_sha: headSha,
       ...binding,
     };
   }
 
   /** In-memory api-rs: records every call, and any session (agent turn) call. */
-  function makeApi(input: { binding: Binding | null; lookupStatus?: number }) {
+  function makeApi(input: {
+    binding: Binding | null;
+    lookupStatus?: number;
+    lookupBody?: unknown;
+  }) {
     const calls: Call[] = [];
     const sessionCalls: string[] = [];
     const fetch = async (url: string | URL | Request, init?: RequestInit) => {
@@ -1545,6 +1558,7 @@ describe("PR session bindings", () => {
       calls.push({ body, method, path });
       if (method === "GET") {
         if (input.lookupStatus) return new Response("x", { status: input.lookupStatus });
+        if ("lookupBody" in input) return Response.json(input.lookupBody);
         if (!input.binding) return new Response("not found", { status: 404 });
         return Response.json(bindingJson(input.binding));
       }
@@ -1562,6 +1576,8 @@ describe("PR session bindings", () => {
     checkNode?: Record<string, unknown>;
     // Head the PR reports on its Nth fetch (the last entry repeats).
     heads?: string[];
+    nodeId?: string;
+    prFetchFails?: boolean;
     prState?: string;
     state?: ReturnType<typeof makeState>;
     settled?: boolean;
@@ -1600,6 +1616,7 @@ describe("PR session bindings", () => {
             get: async () => {
               const head = heads[Math.min(fetches, heads.length - 1)];
               fetches += 1;
+              if (input.prFetchFails) throw new Error("github unavailable");
               return {
                 data: {
                   ...prPayload({
@@ -1608,6 +1625,7 @@ describe("PR session bindings", () => {
                     headSha: head,
                   }),
                   html_url: PR_URL,
+                  node_id: input.nodeId ?? NODE_ID,
                   state: input.prState ?? "open",
                 },
               };
@@ -1635,6 +1653,7 @@ describe("PR session bindings", () => {
   }
 
   const PR_KEY = "centaur-githubbot:pr:base/repo#7";
+  const NOTICE_CLAIM = "centaur-githubbot:ci-notice:base/repo#7:abc123";
 
   describe("failed CI", () => {
     test("an unbound red PR still gets the fix turn", async () => {
@@ -1657,6 +1676,7 @@ describe("PR session bindings", () => {
       const reports = api.posts("/api/pr-bindings/base/repo/7/ci-failures");
       expect(reports.map((r) => r.body)).toEqual([
         {
+          pr_node_id: NODE_ID,
           head_sha: "abc123",
           current_head_sha: "abc123",
           open: true,
@@ -1741,14 +1761,73 @@ describe("PR session bindings", () => {
       }
     });
 
-    test("passes the fresh open and assigned facts through for api-rs to judge", async () => {
-      const api = makeApi({ binding: { managed: true, closed: false } });
-      const { ctx } = makeCtx({ api, prState: "closed" });
+    test("a PR that is closed or unassigned is not reported and takes no claim", async () => {
+      for (const opts of [
+        { prState: "closed" },
+        { assignees: [{ login: "a-human" }] },
+      ]) {
+        const api = makeApi({ binding: { managed: true, closed: false } });
+        const state = makeState();
+        const { ctx } = makeCtx({ api, state, ...opts });
+        // An unassigned PR never reaches the bound path (not owned); a closed
+        // one does, and must not consume the notice claim.
+        await handleCiEvent(ctx, "check_run", redCheckRun);
+        expect(api.posts("/ci-failures")).toHaveLength(0);
+        expect(await state.get(NOTICE_CLAIM)).toBeUndefined();
+        expect(api.sessionCalls).toEqual([]);
+      }
+    });
+
+    test("a binding for another PR (reused number) is neither reported nor given a turn", async () => {
+      const api = makeApi({ binding: { managed: true, closed: false, pr_node_id: "PR_other" } });
+      const state = makeState();
+      const { ctx } = makeCtx({ api, state });
       await handleCiEvent(ctx, "check_run", redCheckRun);
-      expect(api.posts("/ci-failures")[0]?.body).toMatchObject({
-        open: false,
-        assigned: true,
-      });
+      await drainBackgroundWork(2000);
+      expect(api.posts("/ci-failures")).toHaveLength(0);
+      expect(api.sessionCalls).toEqual([]);
+      expect(await state.get(NOTICE_CLAIM)).toBeUndefined();
+      expect(await state.get(PR_KEY)).toBeUndefined();
+    });
+
+    test("does not depend on the shared settled claim, which a green result may have consumed", async () => {
+      const api = makeApi({ binding: { managed: true, closed: false } });
+      const state = makeState();
+      await state.set("centaur-githubbot:ci-settled:base/repo#7:abc123", "1");
+      await handleCiEvent(makeCtx({ api, state }).ctx, "check_run", redCheckRun);
+      expect(api.posts("/ci-failures")).toHaveLength(1);
+    });
+
+    test("an ineligible attempt keeps no claim, so the report goes out once management starts", async () => {
+      const state = makeState();
+      const early = makeApi({ binding: { managed: false, closed: false } });
+      await handleCiEvent(makeCtx({ api: early, state }).ctx, "check_run", redCheckRun);
+      expect(early.posts("/ci-failures")).toHaveLength(0);
+      expect(await state.get(NOTICE_CLAIM)).toBeUndefined();
+      expect(await state.get("centaur-githubbot:ci-settled:base/repo#7:abc123")).toBeUndefined();
+
+      const later = makeApi({ binding: { managed: true, closed: false } });
+      await handleCiEvent(makeCtx({ api: later, state }).ctx, "check_run", redCheckRun);
+      expect(later.posts("/ci-failures")).toHaveLength(1);
+    });
+
+    test("keeps the claim when api-rs queues the notice, and drops it when api-rs skips", async () => {
+      const state = makeState();
+      const queued = makeApi({ binding: { managed: true, closed: false } });
+      await handleCiEvent(makeCtx({ api: queued, state }).ctx, "check_run", redCheckRun);
+      expect(await state.get(NOTICE_CLAIM)).toBeDefined();
+
+      const skipState = makeState();
+      const api = makeApi({ binding: { managed: true, closed: false } });
+      const skipping = {
+        ...api,
+        fetch: async (url: string | URL | Request, init?: RequestInit) =>
+          String(url).endsWith("/ci-failures")
+            ? Response.json({ notice: "skipped", reason: "stale_head" })
+            : api.fetch(url, init),
+      };
+      await handleCiEvent(makeCtx({ api: skipping, state: skipState }).ctx, "check_run", redCheckRun);
+      expect(await skipState.get(NOTICE_CLAIM)).toBeUndefined();
     });
 
     test("never escalates a bound PR, even at the attempt cap", async () => {
@@ -1762,14 +1841,38 @@ describe("PR session bindings", () => {
       expect(await state.get(PR_KEY)).toEqual({ consecutiveCiFixes: 3 });
     });
 
-    test("an unreachable api-rs runs no turn, and a later delivery retries the report", async () => {
-      const failing = makeApi({ binding: null, lookupStatus: 503 });
-      const state = makeState();
-      await handleCiEvent(makeCtx({ api: failing, state }).ctx, "check_run", redCheckRun);
-      await drainBackgroundWork(2000);
-      expect(failing.sessionCalls).toEqual([]);
-      expect(await state.get(PR_KEY)).toBeUndefined();
+    test("anything but a 404 from the binding lookup does nothing: no turn, no escalation, no counter change", async () => {
+      for (const lookup of [
+        { lookupStatus: 403 },
+        { lookupStatus: 503 },
+        { lookupStatus: 400 },
+        { lookupBody: {} },
+        { lookupBody: { thread_key: "slack:T0:C0:1.2" } },
+      ]) {
+        const api = makeApi({ binding: null, ...lookup });
+        const state = makeState();
+        // At the cap, so a fall-through would escalate with a comment.
+        await state.set(PR_KEY, { consecutiveCiFixes: 3 });
+        const { ctx, comments } = makeCtx({ api, state });
+        await handleCiEvent(ctx, "check_run", redCheckRun);
+        await drainBackgroundWork(2000);
+        expect(api.sessionCalls).toEqual([]);
+        expect(comments).toEqual([]);
+        expect(api.posts("/ci-failures")).toHaveLength(0);
+        expect(await state.get(PR_KEY)).toEqual({ consecutiveCiFixes: 3 });
+        // No claim is left behind to suppress a later delivery.
+        expect(await state.get("centaur-githubbot:ci-settled:base/repo#7:abc123")).toBeUndefined();
+        expect(await state.get(NOTICE_CLAIM)).toBeUndefined();
+      }
+    });
 
+    test("a later delivery after a failed lookup reports normally", async () => {
+      const state = makeState();
+      await handleCiEvent(
+        makeCtx({ api: makeApi({ binding: null, lookupStatus: 503 }), state }).ctx,
+        "check_run",
+        redCheckRun,
+      );
       const recovered = makeApi({ binding: { managed: true, closed: false } });
       await handleCiEvent(makeCtx({ api: recovered, state }).ctx, "check_run", redCheckRun);
       expect(recovered.posts("/ci-failures")).toHaveLength(1);
@@ -1799,11 +1902,12 @@ describe("PR session bindings", () => {
       action: string,
       extra: Record<string, unknown> = {},
       head = "old000",
+      nodeId = NODE_ID,
     ) {
       return JSON.stringify({
         action,
         repository: { full_name: "base/repo" },
-        pull_request: { number: 7, head: { sha: head } },
+        pull_request: { number: 7, node_id: nodeId, head: { sha: head } },
         ...extra,
       });
     }
@@ -1811,7 +1915,12 @@ describe("PR session bindings", () => {
     async function run(
       binding: Binding | null,
       body: string,
-      opts: { assignees?: { login: string }[]; heads?: string[] } = {},
+      opts: {
+        assignees?: { login: string }[];
+        heads?: string[];
+        nodeId?: string;
+        prFetchFails?: boolean;
+      } = {},
     ) {
       const api = makeApi({ binding });
       const { ctx } = makeCtx({ api, settled: false, ...opts });
@@ -1828,7 +1937,7 @@ describe("PR session bindings", () => {
         prEvent("assigned", { assignee: { login: "Centaur-Bot" } }),
         { heads: ["fresh11"] },
       );
-      expect(updates).toEqual([{ managed: true, head_sha: "fresh11" }]);
+      expect(updates).toEqual([{ pr_node_id: NODE_ID, managed: true, head_sha: "fresh11" }]);
     });
 
     test("assigning someone else does not, even with the bot already assigned", async () => {
@@ -1840,23 +1949,87 @@ describe("PR session bindings", () => {
       expect(updates).toEqual([]);
     });
 
-    test("unassigning the bot clears managed; unassigning someone else does not", async () => {
+    test("a late assigned after the bot was unassigned does not enable management", async () => {
       expect(
-        await run({ managed: true, closed: false }, prEvent("unassigned", { assignee: { login: "centaur-bot" } }), {
-          assignees: [],
+        await run(bound, prEvent("assigned", { assignee: { login: "centaur-bot" } }), {
+          assignees: [{ login: "a-human" }],
         }),
-      ).toEqual([{ managed: false }]);
+      ).toEqual([]);
+      // If the fresh read fails, management is not enabled either.
       expect(
-        await run({ managed: true, closed: false }, prEvent("unassigned", { assignee: { login: "a-human" } })),
+        await run(bound, prEvent("assigned", { assignee: { login: "centaur-bot" } }), {
+          prFetchFails: true,
+        }),
       ).toEqual([]);
     });
 
-    test("closed, reopened and synchronize record closure and the new head", async () => {
-      expect(await run(bound, prEvent("closed"))).toEqual([{ closed: true }]);
-      expect(await run(bound, prEvent("reopened"))).toEqual([{ closed: false }]);
-      expect(await run(bound, prEvent("synchronize", {}, "new789"))).toEqual([
-        { head_sha: "new789" },
+    test("unassigning the bot clears managed; unassigning someone else does not", async () => {
+      const managed = { managed: true, closed: false };
+      expect(
+        await run(managed, prEvent("unassigned", { assignee: { login: "centaur-bot" } }), {
+          assignees: [],
+        }),
+      ).toEqual([{ pr_node_id: NODE_ID, managed: false }]);
+      expect(
+        await run(managed, prEvent("unassigned", { assignee: { login: "a-human" } })),
+      ).toEqual([]);
+    });
+
+    test("a late unassigned while the bot is assigned again does not disable management", async () => {
+      expect(
+        await run(
+          { managed: true, closed: false },
+          prEvent("unassigned", { assignee: { login: "centaur-bot" } }),
+          { assignees: [{ login: "centaur-bot" }] },
+        ),
+      ).toEqual([]);
+    });
+
+    test("an unassigned whose fresh read fails disables, the safe direction", async () => {
+      expect(
+        await run(
+          { managed: true, closed: false },
+          prEvent("unassigned", { assignee: { login: "centaur-bot" } }),
+          { prFetchFails: true },
+        ),
+      ).toEqual([{ pr_node_id: NODE_ID, managed: false }]);
+    });
+
+    test("closed and reopened record closure", async () => {
+      expect(await run(bound, prEvent("closed"))).toEqual([{ pr_node_id: NODE_ID, closed: true }]);
+      expect(await run(bound, prEvent("reopened"))).toEqual([
+        { pr_node_id: NODE_ID, closed: false },
       ]);
+    });
+
+    test("synchronize records the freshly fetched head, not the payload's", async () => {
+      expect(
+        await run(bound, prEvent("synchronize", {}, "payload9"), { heads: ["fresh22"] }),
+      ).toEqual([{ pr_node_id: NODE_ID, head_sha: "fresh22" }]);
+      // No fresh head, no write.
+      expect(
+        await run(bound, prEvent("synchronize", {}, "payload9"), { prFetchFails: true }),
+      ).toEqual([]);
+    });
+
+    test("an event for a different PR than the binding's writes nothing", async () => {
+      for (const body of [
+        prEvent("closed", {}, "old000", "PR_other"),
+        prEvent("synchronize", {}, "old000", "PR_other"),
+        prEvent("assigned", { assignee: { login: "centaur-bot" } }, "old000", "PR_other"),
+      ]) {
+        expect(await run(bound, body)).toEqual([]);
+      }
+      // The payload agrees with the binding but the fresh read does not.
+      expect(await run(bound, prEvent("synchronize"), { nodeId: "PR_other" })).toEqual([]);
+      // No node id anywhere means no proof of identity.
+      expect(
+        await run(bound, JSON.stringify({
+          action: "closed",
+          repository: { full_name: "base/repo" },
+          pull_request: { number: 7 },
+        })),
+      ).toEqual([]);
     });
 
     test("an unbound PR records nothing and keeps its existing handling", async () => {

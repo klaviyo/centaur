@@ -4315,11 +4315,13 @@ pub struct PrCiNoticeInput {
 /// The `pr_ci_notice` workflow: one failed-CI notice in the Slack thread a
 /// pull request is bound to.
 ///
-/// Step `recheck` reloads the binding, because the request that spawned this
-/// run may be stale by the time it executes: the PR may have closed, been
-/// unassigned, or moved to a newer head. Only a binding that is still managed,
-/// open and at this head proceeds to step `slack:notice`, which posts into the
-/// thread the binding names. A skip is a completed run, never a retry.
+/// One durable step, `slack:notice`, reloads the binding and then posts. The
+/// request that spawned this run may be stale by the time it executes, and a
+/// failed post is retried later, so every attempt rechecks right before it
+/// posts: the PR may have closed, been unassigned, or moved to a newer head
+/// since. Only a binding that is still managed, open and at this head gets a
+/// post, into the thread the binding names. A skip is a completed run, never
+/// a retry.
 async fn run_pr_ci_notice<P, Fut>(
     ctx: &TaskContext,
     store: &PgSessionStore,
@@ -4332,55 +4334,58 @@ where
 {
     let input: PrCiNoticeInput =
         serde_json::from_value(input.clone()).map_err(|error| absurd_error(error.into()))?;
-    let recheck = ctx
-        .step("recheck", || async {
-            pr_ci_notice_recheck(store, &input)
-                .await
-                .map_err(absurd_error)
-        })
-        .await?;
-    let Some(thread_key) = recheck.get("thread_key").and_then(Value::as_str) else {
-        return Ok((vec!["recheck".to_owned()], recheck));
-    };
-    let message = pr_ci_notice_message(thread_key, &input, ctx.task_id()).map_err(absurd_error)?;
-    let slack = ctx
+    let output = ctx
         .step("slack:notice", || async {
+            let thread_key = match pr_ci_notice_recheck(store, &input).await {
+                Ok(Ok(thread_key)) => thread_key,
+                Ok(Err(reason)) => return Ok(json!({ "skipped": reason })),
+                Err(error) => return Err(absurd_error(error)),
+            };
+            let message =
+                pr_ci_notice_message(&thread_key, &input, ctx.task_id()).map_err(absurd_error)?;
             let channel = message["channel"].as_str().unwrap_or_default().to_owned();
-            let response = post(message.clone()).await.map_err(absurd_error)?;
-            Ok(slack_post_result_from_response(&channel, response))
+            let response = post(message).await.map_err(absurd_error)?;
+            Ok(json!({
+                "thread_key": thread_key,
+                "slack": slack_post_result_from_response(&channel, response),
+            }))
         })
         .await?;
-    Ok((
-        vec!["recheck".to_owned(), "slack:notice".to_owned()],
-        json!({ "thread_key": thread_key, "slack": slack }),
-    ))
+    Ok((vec!["slack:notice".to_owned()], output))
 }
 
-/// Output of the `recheck` step: `{"thread_key"}` to proceed, or
-/// `{"skipped": reason}`.
+/// The bound thread key to post into, or the reason not to post.
 async fn pr_ci_notice_recheck(
     store: &PgSessionStore,
     input: &PrCiNoticeInput,
-) -> Result<Value, WorkflowRuntimeError> {
-    let skipped = |reason: &str| Ok(json!({ "skipped": reason }));
+) -> Result<Result<String, &'static str>, WorkflowRuntimeError> {
+    // The link in the notice must point at this very pull request, so the
+    // input cannot make the bound thread display an arbitrary URL.
+    let expected_url = format!(
+        "https://github.com/{}/pull/{}",
+        input.repository, input.number
+    );
+    if !input.html_url.eq_ignore_ascii_case(&expected_url) {
+        return Ok(Err("invalid_html_url"));
+    }
     let Some(binding) = store.pr_binding(&input.repository, input.number).await? else {
-        return skipped("unbound");
+        return Ok(Err("unbound"));
     };
     if binding.closed {
-        return skipped("closed");
+        return Ok(Err("closed"));
     }
     if !binding.managed {
-        return skipped("not_managed");
+        return Ok(Err("not_managed"));
     }
     if binding.head_sha != input.head_sha {
-        return skipped("stale_head");
+        return Ok(Err("stale_head"));
     }
     // Only a Slack thread outside a DM is ever a binding's destination.
     match binding.thread_key.chat_destination() {
         Some(ChatDestination::Slack { channel_id, .. }) if !channel_id.starts_with('D') => {
-            Ok(json!({ "thread_key": binding.thread_key.as_str() }))
+            Ok(Ok(binding.thread_key.as_str().to_owned()))
         }
-        _ => skipped("not_slack_thread"),
+        _ => Ok(Err("not_slack_thread")),
     }
 }
 
@@ -6182,6 +6187,10 @@ mod pr_ci_notice_tests {
         store: PgSessionStore,
         client: Client,
         posts: Arc<Mutex<Vec<Value>>>,
+        /// How many of the next Slack posts fail, before reaching `posts`.
+        failures: Arc<Mutex<usize>>,
+        /// Every Slack post attempt, failed or not.
+        attempts: Arc<Mutex<usize>>,
         repository: String,
     }
 
@@ -6206,17 +6215,33 @@ mod pr_ci_notice_tests {
             .unwrap();
             client.create_queue(None, Default::default()).await.unwrap();
             let posts = Arc::new(Mutex::new(Vec::<Value>::new()));
+            let failures = Arc::new(Mutex::new(0usize));
+            let attempts = Arc::new(Mutex::new(0usize));
             client
                 .register_task("pr_ci_notice_test", {
                     let store = store.clone();
                     let posts = posts.clone();
+                    let failures = failures.clone();
+                    let attempts = attempts.clone();
                     move |input: Value, ctx| {
                         let store = store.clone();
                         let posts = posts.clone();
+                        let failures = failures.clone();
+                        let attempts = attempts.clone();
                         async move {
                             let (steps, output) = run_pr_ci_notice(&ctx, &store, &input, |message| {
                                 let posts = posts.clone();
+                                let failures = failures.clone();
+                                let attempts = attempts.clone();
                                 async move {
+                                    *attempts.lock().await += 1;
+                                    let mut failures = failures.lock().await;
+                                    if *failures > 0 {
+                                        *failures -= 1;
+                                        return Err(WorkflowRuntimeError::Upstream(
+                                            "Slack is down".to_owned(),
+                                        ));
+                                    }
                                     posts.lock().await.push(message);
                                     Ok(json!({"ok": true, "channel": "C0TEST", "ts": "1700000001.000200"}))
                                 }
@@ -6231,6 +6256,8 @@ mod pr_ci_notice_tests {
                 store,
                 client,
                 posts,
+                failures,
+                attempts,
                 repository: format!("acme/widgets-{}", uuid::Uuid::new_v4().simple()),
             })
         }
@@ -6282,22 +6309,35 @@ mod pr_ci_notice_tests {
         /// Spawns the notice for `head_sha`, lets the worker run it, and
         /// returns its task id and result.
         async fn run(&self, head_sha: &str) -> (String, Value) {
+            let spawn = self.spawn(head_sha, 1).await;
+            self.work(&spawn).await
+        }
+
+        /// Queues the notice for `head_sha`, retried at once up to
+        /// `max_attempts` times, and returns its task id.
+        async fn spawn(&self, head_sha: &str, max_attempts: i32) -> String {
             let mut input = serde_json::to_value(notice_input(head_sha)).unwrap();
             input["repository"] = json!(self.repository);
-            let spawn = self
-                .client
+            input["html_url"] = json!(format!("https://github.com/{}/pull/7", self.repository));
+            self.client
                 .spawn(
                     "pr_ci_notice_test",
                     &input,
                     SpawnOptions {
                         idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
-                        max_attempts: Some(1),
+                        max_attempts: Some(max_attempts),
+                        retry_strategy: Some(RetryStrategy {
+                            kind: RetryKind::Fixed,
+                            base_seconds: Some(0.0),
+                            factor: None,
+                            max_seconds: None,
+                        }),
                         ..Default::default()
                     },
                 )
                 .await
-                .unwrap();
-            self.work(&spawn.task_id).await
+                .unwrap()
+                .task_id
         }
 
         async fn work(&self, task_id: &str) -> (String, Value) {
@@ -6335,7 +6375,7 @@ mod pr_ci_notice_tests {
 
         let (task_id, result) = f.run("abcdef1").await;
 
-        assert_eq!(result["steps"], json!(["recheck", "slack:notice"]));
+        assert_eq!(result["steps"], json!(["slack:notice"]));
         assert_eq!(
             result["output"]["thread_key"],
             "slack:T0TEST:C0TEST:1700000000.000100"
@@ -6349,10 +6389,10 @@ mod pr_ci_notice_tests {
         assert_eq!(posts[0]["unfurl_links"], false);
         assert_eq!(posts[0]["unfurl_media"], false);
         assert!(
-            posts[0]["text"]
-                .as_str()
-                .unwrap()
-                .starts_with("CI failed on <https://github.com/acme/widgets/pull/7|"),
+            posts[0]["text"].as_str().unwrap().starts_with(&format!(
+                "CI failed on <https://github.com/{}/pull/7|",
+                f.repository
+            )),
             "{}",
             posts[0]["text"]
         );
@@ -6373,7 +6413,7 @@ mod pr_ci_notice_tests {
         })
         .await;
         let (_, result) = f.run("abcdef1").await;
-        assert_eq!(result["steps"], json!(["recheck"]));
+        assert_eq!(result["steps"], json!(["slack:notice"]));
         assert_eq!(result["output"], json!({"skipped": "stale_head"}));
 
         // Unassigned (no longer managed).
@@ -6392,30 +6432,125 @@ mod pr_ci_notice_tests {
             ..Default::default()
         })
         .await;
-        let mut input = serde_json::to_value(notice_input("abcdef1")).unwrap();
-        input["repository"] = json!(f.repository);
-        let spawn = f
-            .client
-            .spawn(
-                "pr_ci_notice_test",
-                &input,
-                SpawnOptions {
-                    idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
-                    max_attempts: Some(1),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
+        let task_id = f.spawn("abcdef1", 1).await;
         f.update(PrBindingStateUpdate {
             closed: Some(true),
             ..Default::default()
         })
         .await;
-        let (_, result) = f.work(&spawn.task_id).await;
+        let (_, result) = f.work(&task_id).await;
         assert_eq!(result["output"], json!({"skipped": "closed"}));
 
         assert!(f.posts.lock().await.is_empty());
+        f.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn every_attempt_rechecks_the_binding_so_a_retry_after_closure_does_not_post() {
+        let Some(f) = Fixture::new().await else {
+            return;
+        };
+        f.bind("slack:T0TEST:C0TEST:1700000000.000100", true).await;
+        *f.failures.lock().await = 1;
+        let task_id = f.spawn("abcdef1", 2).await;
+
+        // The first attempt rechecks (still eligible), tries to post, and
+        // Slack fails.
+        f.client
+            .work_batch(WorkBatchOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(*f.attempts.lock().await, 1);
+        assert!(f.posts.lock().await.is_empty());
+
+        // The PR closes before the retry.
+        f.update(PrBindingStateUpdate {
+            closed: Some(true),
+            ..Default::default()
+        })
+        .await;
+        let (_, result) = f.work(&task_id).await;
+
+        assert_eq!(result["output"], json!({"skipped": "closed"}));
+        assert_eq!(*f.attempts.lock().await, 1, "the retry must not post");
+        assert!(f.posts.lock().await.is_empty());
+        f.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn a_retry_that_is_still_eligible_posts_once() {
+        let Some(f) = Fixture::new().await else {
+            return;
+        };
+        f.bind("slack:T0TEST:C0TEST:1700000000.000100", true).await;
+        *f.failures.lock().await = 1;
+        let task_id = f.spawn("abcdef1", 2).await;
+        f.client
+            .work_batch(WorkBatchOptions::default())
+            .await
+            .unwrap();
+
+        let (_, result) = f.work(&task_id).await;
+
+        assert_eq!(result["output"]["slack"]["ts"], "1700000001.000200");
+        assert_eq!(*f.attempts.lock().await, 2);
+        assert_eq!(f.posts.lock().await.len(), 1);
+        f.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn the_notice_link_must_be_the_pull_request_itself() {
+        let Some(f) = Fixture::new().await else {
+            return;
+        };
+        f.bind("slack:T0TEST:C0TEST:1700000000.000100", true).await;
+        let spawn = |html_url: String| {
+            let mut input = serde_json::to_value(notice_input("abcdef1")).unwrap();
+            input["repository"] = json!(f.repository);
+            input["html_url"] = json!(html_url);
+            let client = f.client.clone();
+            async move {
+                client
+                    .spawn(
+                        "pr_ci_notice_test",
+                        &input,
+                        SpawnOptions {
+                            idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
+                            max_attempts: Some(1),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .task_id
+            }
+        };
+        for url in [
+            "https://evil.example/acme/widgets/pull/7".to_owned(),
+            format!("https://github.com/{}/pull/8", f.repository),
+            format!("https://github.com/{}/pull/7/files", f.repository),
+            format!("http://github.com/{}/pull/7", f.repository),
+            format!("https://github.com/{}/issues/7", f.repository),
+        ] {
+            let task_id = spawn(url.clone()).await;
+            let (_, result) = f.work(&task_id).await;
+            assert_eq!(
+                result["output"],
+                json!({"skipped": "invalid_html_url"}),
+                "{url}"
+            );
+        }
+        assert!(f.posts.lock().await.is_empty());
+
+        // Owner and repository compare case-insensitively.
+        let task_id = spawn(format!(
+            "https://github.com/{}/pull/7",
+            f.repository.to_ascii_uppercase()
+        ))
+        .await;
+        let (_, result) = f.work(&task_id).await;
+        assert!(result["output"]["slack"].is_object(), "{result}");
+        assert_eq!(f.posts.lock().await.len(), 1);
         f.cleanup().await;
     }
 

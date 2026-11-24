@@ -936,6 +936,28 @@ async fn api_jwt_names_the_sandbox_and_the_github_account_behind_its_token() {
     )
     .await;
     f.bump(principal).await;
+    // A shared (not owner-only) app's token can reach anyone it is granted
+    // to, so it names no account.
+    let claims = api_jwt_claims(&f.sync(&token).await);
+    assert_eq!(claims["sandbox_id"], f.name("proxy"));
+    assert!(claims.get("github_user_id").is_none());
+
+    // Owner-only: Console serves the token only to its owner's own principal.
+    f.update("UPDATE oauth_apps SET owner_only = true WHERE id = $1", app)
+        .await;
+    sqlx::query("UPDATE principals SET kind = 'console_user', console_user_id = $2 WHERE id = $1")
+        .bind(principal)
+        .bind(f.admin)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    // An owner-only token is delivered only while its owner is active.
+    sqlx::query("UPDATE users SET status = 'active' WHERE id = $1")
+        .bind(f.admin)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    f.bump(principal).await;
     let claims = api_jwt_claims(&f.sync(&token).await);
     assert_eq!(claims["sandbox_id"], f.name("proxy"));
     assert_eq!(claims["github_user_id"], "90210001");

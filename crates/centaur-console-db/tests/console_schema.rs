@@ -138,9 +138,26 @@ impl Fixture {
         .unwrap()
     }
 
+    /// A `console_user` principal for the admin user, the owner of the
+    /// credentials `brokered_token` creates.
+    async fn owner_principal(&self, label: &str) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO principals (foreign_id, name, kind, labels, console_user_id, created_by_id, created_at, updated_at) \
+             VALUES ($1, 'Owner', 'console_user', '{}', $2, $2, now(), now()) RETURNING id",
+        )
+        .bind(self.name(label))
+        .bind(self.admin)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
     /// A brokered token for `provider` account `subject`, wrapped in a static
-    /// secret that injects `Authorization` on `host`, and granted to
-    /// `principal` at `priority`. Returns the static secret's id.
+    /// secret that injects `Authorization` on `host`, and granted directly to
+    /// `principal` at `priority`. The app is `owner_only` as given; Console
+    /// delivers an owner-only token only to the owner's own principal
+    /// (`owner_principal`). Returns the static secret's id.
+    #[allow(clippy::too_many_arguments)]
     async fn brokered_token(
         &self,
         principal: i64,
@@ -149,13 +166,15 @@ impl Fixture {
         subject: Option<&str>,
         host: &str,
         priority: i32,
+        owner_only: bool,
     ) -> i64 {
         let app: i64 = sqlx::query_scalar(
-            "INSERT INTO oauth_apps (slug, provider, client_id, created_by_id, created_at, updated_at) \
-             VALUES ($1, $2, 'client', $3, now(), now()) RETURNING id",
+            "INSERT INTO oauth_apps (slug, provider, client_id, owner_only, created_by_id, created_at, updated_at) \
+             VALUES ($1, $2, 'client', $3, $4, now(), now()) RETURNING id",
         )
         .bind(self.name(label))
         .bind(provider)
+        .bind(owner_only)
         .bind(self.admin)
         .fetch_one(&self.pool)
         .await
@@ -172,9 +191,17 @@ impl Fixture {
         .fetch_one(&self.pool)
         .await
         .unwrap();
-        let secret = self
-            .static_secret(label, json!({ "header": "Authorization" }), None)
-            .await;
+        let secret: i64 = sqlx::query_scalar(
+            "INSERT INTO static_secrets (foreign_id, inject_config, broker_credential_id, created_by_id, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, now(), now()) RETURNING id",
+        )
+        .bind(self.name(label))
+        .bind(json!({ "header": "Authorization" }))
+        .bind(broker)
+        .bind(self.admin)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
         self.source(
             "static_secret_id",
             secret,
@@ -538,7 +565,7 @@ async fn names_the_github_account_behind_the_token_injected_for_the_api_host() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
-    let principal = fixture.principal("principal").await;
+    let principal = fixture.owner_principal("principal").await;
     assert_eq!(github_account(&fixture, principal).await, None);
 
     fixture
@@ -549,6 +576,7 @@ async fn names_the_github_account_behind_the_token_injected_for_the_api_host() {
             Some("90210001"),
             "api.github.com",
             100,
+            true,
         )
         .await;
     assert_eq!(
@@ -566,6 +594,7 @@ async fn names_the_github_account_behind_the_token_injected_for_the_api_host() {
             Some("90210002"),
             "api.github.com",
             0,
+            true,
         )
         .await;
     assert_eq!(
@@ -582,6 +611,7 @@ async fn names_the_github_account_behind_the_token_injected_for_the_api_host() {
             Some("90210003"),
             "api.github.com",
             100,
+            true,
         )
         .await;
     assert_eq!(github_account(&fixture, principal).await, None);
@@ -592,7 +622,7 @@ async fn only_a_github_app_with_a_subject_names_an_account() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
-    let other_provider = fixture.principal("other-provider").await;
+    let other_provider = fixture.owner_principal("other-provider").await;
     fixture
         .brokered_token(
             other_provider,
@@ -601,11 +631,12 @@ async fn only_a_github_app_with_a_subject_names_an_account() {
             Some("90210001"),
             "api.github.com",
             100,
+            true,
         )
         .await;
     assert_eq!(github_account(&fixture, other_provider).await, None);
 
-    let no_subject = fixture.principal("no-subject").await;
+    let no_subject = fixture.owner_principal("no-subject").await;
     fixture
         .brokered_token(
             no_subject,
@@ -614,11 +645,12 @@ async fn only_a_github_app_with_a_subject_names_an_account() {
             None,
             "api.github.com",
             100,
+            true,
         )
         .await;
     assert_eq!(github_account(&fixture, no_subject).await, None);
 
-    let other_host = fixture.principal("other-host").await;
+    let other_host = fixture.owner_principal("other-host").await;
     fixture
         .brokered_token(
             other_host,
@@ -627,6 +659,7 @@ async fn only_a_github_app_with_a_subject_names_an_account() {
             Some("90210001"),
             "github.com",
             100,
+            true,
         )
         .await;
     assert_eq!(github_account(&fixture, other_host).await, None);
@@ -651,4 +684,45 @@ async fn only_a_github_app_with_a_subject_names_an_account() {
         .await;
     fixture.grant(shared, "static_secret_id", secret).await;
     assert_eq!(github_account(&fixture, shared).await, None);
+}
+
+#[tokio::test]
+async fn a_shared_github_app_names_no_account() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    // The same token, granted the same way, from an app that is not
+    // owner-only: Console may serve it to anyone the grant reaches, so it
+    // does not say who is acting.
+    let shared_principal = fixture.owner_principal("shared-app").await;
+    fixture
+        .brokered_token(
+            shared_principal,
+            "github-shared-app",
+            "github",
+            Some("90210001"),
+            "api.github.com",
+            100,
+            false,
+        )
+        .await;
+    assert_eq!(github_account(&fixture, shared_principal).await, None);
+
+    // The owner-only version of the same setup names its owner.
+    let owner = fixture.owner_principal("owner-app").await;
+    fixture
+        .brokered_token(
+            owner,
+            "github-owner-app",
+            "github",
+            Some("90210001"),
+            "api.github.com",
+            100,
+            true,
+        )
+        .await;
+    assert_eq!(
+        github_account(&fixture, owner).await.as_deref(),
+        Some("90210001")
+    );
 }

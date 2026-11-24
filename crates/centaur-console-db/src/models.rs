@@ -135,6 +135,11 @@ pub struct SecretSource {
     /// The provider's stable account id for the person who connected the
     /// brokered credential.
     pub broker_provider_subject: Option<String>,
+    /// Whether the brokered credential's OAuth app is `owner_only`: Console
+    /// then delivers its tokens only through the owner's own direct grant.
+    /// An app that is not owner-only may serve one shared token to anyone it
+    /// is granted to.
+    pub broker_owner_only: Option<bool>,
     pub role: Option<String>,
     pub role_kind: Option<String>,
 }

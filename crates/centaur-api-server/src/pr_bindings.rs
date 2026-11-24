@@ -41,6 +41,22 @@ use crate::{
 
 /// The built-in workflow that posts the failed-CI notice.
 const PR_CI_NOTICE_WORKFLOW: &str = "pr_ci_notice";
+
+/// Refuses workflows only api-rs itself may start. `pr_ci_notice` posts into
+/// whatever Slack thread a binding names, on the strength of a ci-failures
+/// report that githubbot has just verified; no external caller, whatever its
+/// class, may start it through a generic workflow route. The ci-failures
+/// route spawns it in-process and does not pass through this check.
+pub(crate) fn refuse_internal_workflow(workflow_name: &str) -> Result<(), ApiError> {
+    if workflow_name.trim() == PR_CI_NOTICE_WORKFLOW {
+        return Err(ApiError::coded(
+            StatusCode::FORBIDDEN,
+            "internal_workflow",
+            "this workflow is started only by api-rs",
+        ));
+    }
+    Ok(())
+}
 const MAX_TITLE_CHARS: usize = 256;
 const MAX_BODY_CHARS: usize = 65_536;
 const MAX_REF_CHARS: usize = 255;
@@ -422,20 +438,69 @@ pub(crate) async fn get_pr_binding(
         .ok_or_else(|| ApiError::NotFound(format!("no PR binding for {repository}#{number}")))
 }
 
+/// `POST /api/pr-bindings/{owner}/{repo}/{number}/state` body. `pr_node_id`
+/// names the pull request githubbot is talking about; a repository name and
+/// number can be reused by a different PR, so the update applies only to a
+/// binding for that exact PR.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StateUpdateRequest {
+    pr_node_id: String,
+    #[serde(default)]
+    managed: Option<bool>,
+    #[serde(default)]
+    closed: Option<bool>,
+    #[serde(default)]
+    head_sha: Option<String>,
+}
+
+/// The binding for `repository#number`, which must be for the PR `pr_node_id`
+/// names: 404 when unbound and 409 `pr_identity_mismatch` for another PR that
+/// reuses the number.
+async fn binding_for_pr(
+    store: &PgSessionStore,
+    repository: &str,
+    number: i64,
+    pr_node_id: &str,
+) -> Result<PrBinding, ApiError> {
+    let binding = store
+        .pr_binding(repository, number)
+        .await
+        .map_err(SessionRuntimeError::from)?
+        .ok_or_else(|| ApiError::NotFound(format!("no PR binding for {repository}#{number}")))?;
+    if binding.pr_node_id != pr_node_id {
+        return Err(ApiError::coded(
+            StatusCode::CONFLICT,
+            "pr_identity_mismatch",
+            "the binding is for a different pull request than the one named",
+        ));
+    }
+    Ok(binding)
+}
+
 /// `POST /api/pr-bindings/{owner}/{repo}/{number}/state`: records `managed`,
-/// `closed` and `head_sha` on an existing binding. It cannot create or rebind
-/// one.
+/// `closed` and `head_sha` on an existing binding for the named PR. It cannot
+/// create or rebind one.
 pub(crate) async fn update_pr_binding_state(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    Json(update): Json<PrBindingStateUpdate>,
+    Json(request): Json<StateUpdateRequest>,
 ) -> Result<Json<PrBinding>, ApiError> {
     let (repository, number) = pr_path(&owner, &repo, number);
+    let runtime = state.runtime()?;
+    let store = runtime.store();
+    binding_for_pr(store, &repository, number, &request.pr_node_id).await?;
     Ok(Json(
-        state
-            .runtime()?
-            .store()
-            .update_pr_binding_state(&repository, number, &update)
+        store
+            .update_pr_binding_state(
+                &repository,
+                number,
+                &PrBindingStateUpdate {
+                    managed: request.managed,
+                    closed: request.closed,
+                    head_sha: request.head_sha,
+                },
+            )
             .await
             .map_err(SessionRuntimeError::from)?,
     ))
@@ -446,6 +511,8 @@ pub(crate) async fn update_pr_binding_state(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CiFailureRequest {
+    /// The pull request's GraphQL node id; must be the bound PR's.
+    pr_node_id: String,
     /// The head the failing check ran on.
     head_sha: String,
     /// The PR's head now.
@@ -474,19 +541,21 @@ impl CiFailureRequest {
         {
             return invalid("check_name must be 1 to 200 characters");
         }
-        let https_url = |url: &str| url.starts_with("https://") && url.len() <= MAX_URL_CHARS;
-        if !https_url(&self.html_url) {
+        if !is_usable_url(&self.html_url) {
             return invalid("html_url must be an https URL");
-        }
-        if self
-            .details_url
-            .as_deref()
-            .is_some_and(|url| !https_url(url))
-        {
-            return invalid("details_url must be an https URL");
         }
         Ok(())
     }
+
+    /// The failing check's own page, when it has a usable one. An unusable
+    /// link only costs the notice its link; it never costs the notice.
+    fn usable_details_url(&self) -> Option<&str> {
+        self.details_url.as_deref().filter(|url| is_usable_url(url))
+    }
+}
+
+fn is_usable_url(url: &str) -> bool {
+    url.starts_with("https://") && url.len() <= MAX_URL_CHARS
 }
 
 /// `POST /api/pr-bindings/{owner}/{repo}/{number}/ci-failures`.
@@ -512,10 +581,11 @@ pub(crate) async fn report_pr_ci_failure(
 /// Decides whether a failed check still deserves a notice and, if so, spawns
 /// the notice workflow once per `(PR, head)`.
 ///
-/// Nothing is spawned unless the PR is open, assigned, managed, not closed,
-/// and the failing head is still the PR's head. Each reason that applies is
-/// also recorded on the binding first, so a later event for the same head
-/// stays dropped. The workflow rechecks the binding when it runs.
+/// Nothing is spawned unless the request is for the bound PR and the PR is
+/// open, assigned, managed, not closed, and the failing head is the binding's
+/// head and the PR's fresh head. Closure and unassignment are recorded on the
+/// binding; the head never is. The workflow rechecks the binding on every
+/// attempt before it posts.
 async fn process_ci_failure<S, Fut>(
     store: &PgSessionStore,
     repository: &str,
@@ -528,13 +598,13 @@ where
     Fut: Future<Output = Result<CreateWorkflowRunResponse, WorkflowRuntimeError>>,
 {
     request.validate()?;
-    let binding = store
-        .pr_binding(repository, number)
-        .await
-        .map_err(SessionRuntimeError::from)?
-        .ok_or_else(|| ApiError::NotFound(format!("no PR binding for {repository}#{number}")))?;
+    let binding = binding_for_pr(store, repository, number, &request.pr_node_id).await?;
 
-    let stale = request.head_sha != request.current_head_sha;
+    // The head is maintained only by the state route, from githubbot's fresh
+    // fetch; a failure report never moves it. It is current only when the
+    // binding, the failing check and the fresh fetch all name the same head.
+    let current =
+        binding.head_sha == request.head_sha && request.head_sha == request.current_head_sha;
     let reason = if !request.open {
         Some("not_open")
     } else if !request.assigned {
@@ -543,23 +613,22 @@ where
         Some("not_managed")
     } else if binding.closed {
         Some("closed")
-    } else if stale {
+    } else if !current {
         Some("stale_head")
     } else {
         None
     };
 
-    let mut update = PrBindingStateUpdate::default();
-    if !request.open && !binding.closed {
-        update.closed = Some(true);
-    }
-    if !request.assigned && binding.managed {
-        update.managed = Some(false);
-    }
-    if stale && binding.head_sha != request.current_head_sha {
-        update.head_sha = Some(request.current_head_sha.clone());
-    }
     if let Some(reason) = reason {
+        // Closure and unassignment are facts about the PR, recorded so later
+        // events for the same head stay dropped.
+        let mut update = PrBindingStateUpdate::default();
+        if !request.open && !binding.closed {
+            update.closed = Some(true);
+        }
+        if !request.assigned && binding.managed {
+            update.managed = Some(false);
+        }
         if update != PrBindingStateUpdate::default() {
             store
                 .update_pr_binding_state(&binding.repository, binding.number, &update)
@@ -569,19 +638,6 @@ where
         return Ok(json!({"notice": "skipped", "reason": reason}));
     }
 
-    if binding.head_sha != request.current_head_sha {
-        store
-            .update_pr_binding_state(
-                &binding.repository,
-                binding.number,
-                &PrBindingStateUpdate {
-                    head_sha: Some(request.current_head_sha.clone()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(SessionRuntimeError::from)?;
-    }
     let run = spawn(CreateWorkflowRunRequest {
         workflow_name: PR_CI_NOTICE_WORKFLOW.to_owned(),
         input: json!({
@@ -589,7 +645,7 @@ where
             "number": binding.number,
             "head_sha": request.head_sha,
             "check_name": request.check_name,
-            "details_url": request.details_url,
+            "details_url": request.usable_details_url(),
             "html_url": request.html_url,
         }),
         idempotency_key: Some(format!(
@@ -853,6 +909,31 @@ mod tests {
                 .await
                 .unwrap();
             thread_key
+        }
+
+        /// The node id GitHub reports for this harness's PR number 7.
+        fn node_id(&self) -> String {
+            format!("PR_{}_7", self.suffix)
+        }
+
+        /// A ci-failures report for this harness's PR.
+        fn ci(
+            &self,
+            head_sha: &str,
+            current_head_sha: &str,
+            open: bool,
+            assigned: bool,
+        ) -> CiFailureRequest {
+            CiFailureRequest {
+                pr_node_id: self.node_id(),
+                head_sha: head_sha.to_owned(),
+                current_head_sha: current_head_sha.to_owned(),
+                open,
+                assigned,
+                check_name: "unit tests".to_owned(),
+                details_url: Some("https://github.com/acme/widgets/actions/runs/1".to_owned()),
+                html_url: "https://github.com/acme/widgets/pull/7".to_owned(),
+            }
         }
 
         fn sandbox_id(&self, label: &str) -> String {
@@ -1412,6 +1493,7 @@ mod tests {
         assert_eq!(body["bound"], true);
         let base = format!("/api/pr-bindings/acme/widgets-{}/7", h.suffix);
         let ci = json!({
+            "pr_node_id": h.node_id(),
             "head_sha": "abcdef1234567890", "current_head_sha": "abcdef1234567890",
             "open": true, "assigned": true, "check_name": "unit tests",
             "html_url": "https://github.com/acme/widgets/pull/7",
@@ -1423,7 +1505,7 @@ mod tests {
                 (
                     Method::POST,
                     format!("{base}/state"),
-                    Some(json!({"managed": true})),
+                    Some(json!({"pr_node_id": h.node_id(), "managed": true})),
                 ),
                 (
                     Method::POST,
@@ -1497,7 +1579,7 @@ mod tests {
                 Method::POST,
                 &format!("{base}/state"),
                 GITHUBBOT_KEY,
-                Some(json!({"managed": true, "head_sha": "fedcba9876"})),
+                Some(json!({"pr_node_id": h.node_id(), "managed": true, "head_sha": "fedcba9876"})),
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -1512,7 +1594,7 @@ mod tests {
                 Method::POST,
                 &format!("{base}/state"),
                 GITHUBBOT_KEY,
-                Some(json!({"thread_key": "slack:T0TEST:C0TEST:1.1"})),
+                Some(json!({"pr_node_id": h.node_id(), "thread_key": "slack:T0TEST:C0TEST:1.1"})),
             )
             .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -1523,7 +1605,7 @@ mod tests {
                 Method::POST,
                 &format!("{unbound}/state"),
                 GITHUBBOT_KEY,
-                Some(json!({"managed": true})),
+                Some(json!({"pr_node_id": h.node_id(), "managed": true})),
             )
             .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -1539,23 +1621,6 @@ mod tests {
     }
 
     // ---- ci-failures ---------------------------------------------------------
-
-    fn ci_request(
-        head_sha: &str,
-        current_head_sha: &str,
-        open: bool,
-        assigned: bool,
-    ) -> CiFailureRequest {
-        CiFailureRequest {
-            head_sha: head_sha.to_owned(),
-            current_head_sha: current_head_sha.to_owned(),
-            open,
-            assigned,
-            check_name: "unit tests".to_owned(),
-            details_url: Some("https://github.com/acme/widgets/actions/runs/1".to_owned()),
-            html_url: "https://github.com/acme/widgets/pull/7".to_owned(),
-        }
-    }
 
     /// Records every spawn and answers `created` once per idempotency key,
     /// as the workflow runtime does.
@@ -1604,7 +1669,7 @@ mod tests {
                 number: 7,
                 thread_key,
                 pr_id: 1,
-                pr_node_id: format!("PR_{}", Uuid::new_v4().simple()),
+                pr_node_id: h.node_id(),
                 author_github_id: AUTHOR_ID,
                 author_login: "ada".to_owned(),
                 sandbox_id: sandbox,
@@ -1649,7 +1714,7 @@ mod tests {
         let outcome = report(
             &h,
             &repository,
-            &ci_request("abcdef1", "abcdef1", true, true),
+            &h.ci("abcdef1", "abcdef1", true, true),
             &spawns,
         )
         .await
@@ -1677,7 +1742,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_binding_head_follows_the_current_head_when_a_notice_is_queued() {
+    async fn a_failure_report_never_moves_the_binding_head() {
         let Some(h) = Harness::new().await else {
             return;
         };
@@ -1685,19 +1750,173 @@ mod tests {
         let spawns = Spawns::default();
 
         // githubbot missed the synchronize event: the binding still says
-        // `abcdef1`, but the fresh fetch says the failing head is current.
+        // `abcdef1`. A report for the newer head is stale until the state
+        // route, which carries a fresh fetch, records that head.
+        for request in [
+            h.ci("fedcba9", "fedcba9", true, true),
+            h.ci("abcdef1", "fedcba9", true, true),
+            h.ci("fedcba9", "abcdef1", true, true),
+        ] {
+            let outcome = report(&h, &repository, &request, &spawns).await.unwrap();
+            assert_eq!(
+                outcome,
+                json!({"notice": "skipped", "reason": "stale_head"})
+            );
+            let binding = h.store.pr_binding(&repository, 7).await.unwrap().unwrap();
+            assert_eq!(binding.head_sha, "abcdef1");
+        }
+        assert!(spawns.runs().is_empty());
+
+        h.store
+            .update_pr_binding_state(
+                &repository,
+                7,
+                &PrBindingStateUpdate {
+                    head_sha: Some("fedcba9".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         let outcome = report(
             &h,
             &repository,
-            &ci_request("fedcba9", "fedcba9", true, true),
+            &h.ci("fedcba9", "fedcba9", true, true),
             &spawns,
         )
         .await
         .unwrap();
-
         assert_eq!(outcome, json!({"notice": "queued"}));
-        let binding = h.store.pr_binding(&repository, 7).await.unwrap().unwrap();
-        assert_eq!(binding.head_sha, "fedcba9");
+    }
+
+    #[tokio::test]
+    async fn a_report_for_another_pr_reusing_the_number_changes_nothing() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let (repository, before) = bound_pr(&h, true).await;
+        let spawns = Spawns::default();
+
+        // ci-failures: a different PR node id (the number was reused).
+        let request = CiFailureRequest {
+            pr_node_id: "PR_someone_elses".to_owned(),
+            open: false,
+            ..h.ci("abcdef1", "abcdef1", true, true)
+        };
+        let error = report(&h, &repository, &request, &spawns)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, ApiError::Coded { code: "pr_identity_mismatch", status, .. } if *status == StatusCode::CONFLICT),
+            "{error:?}"
+        );
+        assert!(spawns.runs().is_empty());
+        // Not even the closure it reported was recorded.
+        assert_eq!(
+            h.store.pr_binding(&repository, 7).await.unwrap().unwrap(),
+            before
+        );
+
+        // state: same refusal over HTTP, binding untouched.
+        let base = format!("/api/pr-bindings/{repository}/7");
+        let (status, body) = h
+            .send(
+                Method::POST,
+                &format!("{base}/state"),
+                GITHUBBOT_KEY,
+                Some(json!({"pr_node_id": "PR_someone_elses", "managed": false, "closed": true, "head_sha": "ffff"})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "pr_identity_mismatch");
+        assert_eq!(
+            h.store.pr_binding(&repository, 7).await.unwrap().unwrap(),
+            before
+        );
+
+        // The node id is required on both routes.
+        for (suffix, body) in [
+            ("state", json!({"managed": false})),
+            (
+                "ci-failures",
+                json!({
+                    "head_sha": "abcdef1", "current_head_sha": "abcdef1", "open": true,
+                    "assigned": true, "check_name": "unit tests",
+                    "html_url": "https://github.com/acme/widgets/pull/7",
+                }),
+            ),
+        ] {
+            let (status, _) = h
+                .send(
+                    Method::POST,
+                    &format!("{base}/{suffix}"),
+                    GITHUBBOT_KEY,
+                    Some(body),
+                )
+                .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{suffix}");
+        }
+        assert_eq!(
+            h.store.pr_binding(&repository, 7).await.unwrap().unwrap(),
+            before
+        );
+
+        // The right node id is accepted.
+        let (status, body) = h
+            .send(
+                Method::POST,
+                &format!("{base}/state"),
+                GITHUBBOT_KEY,
+                Some(json!({"pr_node_id": h.node_id(), "closed": true})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["closed"], true);
+    }
+
+    #[tokio::test]
+    async fn an_unusable_details_url_is_dropped_and_the_notice_is_kept() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let (repository, _) = bound_pr(&h, true).await;
+        let spawns = Spawns::default();
+        let too_long = format!("https://github.com/{}", "a".repeat(MAX_URL_CHARS));
+        for (head, details_url) in [
+            (
+                "abcdef1",
+                Some("http://github.com/acme/widgets/actions/runs/1".to_owned()),
+            ),
+            ("abcdef1", Some("javascript:alert(1)".to_owned())),
+            ("abcdef1", Some(too_long)),
+            ("abcdef1", None),
+        ] {
+            let spawns = Spawns::default();
+            let request = CiFailureRequest {
+                details_url,
+                ..h.ci(head, head, true, true)
+            };
+            let outcome = report(&h, &repository, &request, &spawns).await.unwrap();
+            assert_eq!(outcome, json!({"notice": "queued"}));
+            let runs = spawns.runs();
+            assert_eq!(runs.len(), 1);
+            assert_eq!(runs[0].input["details_url"], Value::Null);
+            assert_eq!(runs[0].input["check_name"], "unit tests");
+        }
+        // A usable one is kept.
+        let outcome = report(
+            &h,
+            &repository,
+            &h.ci("abcdef1", "abcdef1", true, true),
+            &spawns,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, json!({"notice": "queued"}));
+        assert_eq!(
+            spawns.runs()[0].input["details_url"],
+            "https://github.com/acme/widgets/actions/runs/1"
+        );
     }
 
     #[tokio::test]
@@ -1707,7 +1926,7 @@ mod tests {
         };
         let (repository, _) = bound_pr(&h, true).await;
         let spawns = Spawns::default();
-        let request = ci_request("abcdef1", "abcdef1", true, true);
+        let request = h.ci("abcdef1", "abcdef1", true, true);
 
         let first = report(&h, &repository, &request, &spawns).await.unwrap();
         let second = report(&h, &repository, &request, &spawns).await.unwrap();
@@ -1716,8 +1935,19 @@ mod tests {
         assert_eq!(second, json!({"notice": "duplicate"}));
         assert_eq!(spawns.runs().len(), 1);
 
-        // A new head is a new notice.
-        let newer = ci_request("fedcba9", "fedcba9", true, true);
+        // A new head, once githubbot's state update records it, is a new notice.
+        h.store
+            .update_pr_binding_state(
+                &repository,
+                7,
+                &PrBindingStateUpdate {
+                    head_sha: Some("fedcba9".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let newer = h.ci("fedcba9", "fedcba9", true, true);
         assert_eq!(
             report(&h, &repository, &newer, &spawns).await.unwrap(),
             json!({"notice": "queued"})
@@ -1737,7 +1967,7 @@ mod tests {
         let outcome = report(
             &h,
             &repository,
-            &ci_request("abcdef1", "abcdef1", false, true),
+            &h.ci("abcdef1", "abcdef1", false, true),
             &spawns,
         )
         .await
@@ -1757,7 +1987,7 @@ mod tests {
         let outcome = report(
             &h,
             &repository,
-            &ci_request("abcdef1", "abcdef1", true, true),
+            &h.ci("abcdef1", "abcdef1", true, true),
             &spawns,
         )
         .await
@@ -1779,7 +2009,7 @@ mod tests {
         let outcome = report(
             &h,
             &repository,
-            &ci_request("abcdef1", "abcdef1", true, false),
+            &h.ci("abcdef1", "abcdef1", true, false),
             &spawns,
         )
         .await
@@ -1802,7 +2032,7 @@ mod tests {
         let outcome = report(
             &h,
             &repository,
-            &ci_request("abcdef1", "abcdef1", true, true),
+            &h.ci("abcdef1", "abcdef1", true, true),
             &spawns,
         )
         .await
@@ -1812,8 +2042,8 @@ mod tests {
             json!({"notice": "skipped", "reason": "not_managed"})
         );
 
-        // Managed again, but the failing head is stale: the newer head is
-        // recorded.
+        // Managed again, but the failing head is stale. The report does not
+        // move the binding's head.
         h.store
             .update_pr_binding_state(
                 &repository,
@@ -1828,7 +2058,7 @@ mod tests {
         let outcome = report(
             &h,
             &repository,
-            &ci_request("abcdef1", "fedcba9", true, true),
+            &h.ci("abcdef1", "fedcba9", true, true),
             &spawns,
         )
         .await
@@ -1844,7 +2074,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .head_sha,
-            "fedcba9"
+            "abcdef1"
         );
 
         assert!(spawns.runs().is_empty());
@@ -1859,7 +2089,7 @@ mod tests {
         let error = report(
             &h,
             &format!("acme/unbound-{}", h.suffix),
-            &ci_request("abcdef1", "abcdef1", true, true),
+            &h.ci("abcdef1", "abcdef1", true, true),
             &spawns,
         )
         .await
@@ -1868,20 +2098,16 @@ mod tests {
 
         let (repository, _) = bound_pr(&h, true).await;
         let malformed = [
-            ci_request("", "abcdef1", true, true),
-            ci_request("abcdef1", "", true, true),
-            ci_request("abc def", "abcdef1", true, true),
+            h.ci("", "abcdef1", true, true),
+            h.ci("abcdef1", "", true, true),
+            h.ci("abc def", "abcdef1", true, true),
             CiFailureRequest {
                 check_name: " ".to_owned(),
-                ..ci_request("abcdef1", "abcdef1", true, true)
+                ..h.ci("abcdef1", "abcdef1", true, true)
             },
             CiFailureRequest {
                 html_url: "http://github.com/acme/widgets/pull/7".to_owned(),
-                ..ci_request("abcdef1", "abcdef1", true, true)
-            },
-            CiFailureRequest {
-                details_url: Some("javascript:alert(1)".to_owned()),
-                ..ci_request("abcdef1", "abcdef1", true, true)
+                ..h.ci("abcdef1", "abcdef1", true, true)
             },
         ];
         for request in malformed {
@@ -2005,5 +2231,138 @@ mod tests {
                 "{method} {uri}"
             );
         }
+    }
+
+    // ---- internal workflow -----------------------------------------------------
+
+    #[test]
+    fn only_the_notice_workflow_is_internal() {
+        for name in ["pr_ci_notice", " pr_ci_notice\n"] {
+            let error = refuse_internal_workflow(name).unwrap_err();
+            assert!(
+                matches!(&error, ApiError::Coded { code: "internal_workflow", status, .. } if *status == StatusCode::FORBIDDEN),
+                "{name:?}: {error:?}"
+            );
+        }
+        for name in ["echo", "pr_ci_notice_2", "PR_CI_NOTICE", ""] {
+            assert!(refuse_internal_workflow(name).is_ok(), "{name:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_public_workflow_routes_refuse_the_notice_workflow_for_every_caller() {
+        let console = encode(
+            &Header::new(Algorithm::HS256),
+            &json!({
+                "iss": "centaur-console", "sub": "centaur-console", "aud": "centaur-api",
+                "iat": 1_700_000_000i64, "exp": 4_102_444_800i64, "token_use": "console_service",
+            }),
+            &EncodingKey::from_secret(b"test-secret"),
+        )
+        .unwrap();
+        // A sandbox principal that may write workflows.
+        let principal = encode(
+            &Header::new(Algorithm::HS256),
+            &json!({
+                "iss": "centaur-console", "sub": "prn_test", "aud": "centaur-api",
+                "iat": 1_700_000_000i64, "exp": 4_102_444_800i64,
+                "capabilities": {"sessions_read": true, "workflows_read": true, "workflows_write": true},
+            }),
+            &EncodingKey::from_secret(b"test-secret"),
+        )
+        .unwrap();
+        let body = json!({
+            "workflow_name": "pr_ci_notice",
+            "input": {
+                "repository": "acme/widgets", "number": 7, "head_sha": "abcdef1",
+                "check_name": "unit tests",
+                "html_url": "https://github.com/acme/widgets/pull/7",
+            },
+        });
+        for (caller, token) in [("console", console), ("principal", principal)] {
+            // Not ready: only the guard, which runs first, can answer 403.
+            let router = build_router_with_app_state(AppState::unready(
+                ApiAuthConfig::testing_with_ingresses("test-secret"),
+            ));
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/workflows/runs")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{caller}");
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let bytes: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(bytes["code"], "internal_workflow", "{caller}");
+        }
+
+        // Another workflow gets past the guard to the (not ready) runtime.
+        let router = build_router_with_app_state(AppState::unready(
+            ApiAuthConfig::testing_with_ingresses("test-secret"),
+        ));
+        let mut other = body.clone();
+        other["workflow_name"] = json!("echo");
+        let console = encode(
+            &Header::new(Algorithm::HS256),
+            &json!({
+                "iss": "centaur-console", "sub": "centaur-console", "aud": "centaur-api",
+                "iat": 1_700_000_000i64, "exp": 4_102_444_800i64, "token_use": "console_service",
+            }),
+            &EncodingKey::from_secret(b"test-secret"),
+        )
+        .unwrap();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/workflows/runs")
+                    .header(header::AUTHORIZATION, format!("Bearer {console}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(other.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_signed_button_cannot_start_the_notice_workflow() {
+        let mut message = json!({"channel": "C1", "blocks": [{"type": "actions", "elements": [{
+            "type": "button", "action_id": "centaur.workflow.action:00000000-0000-0000-0000-000000000001:approve",
+            "value": json!({"workflow_name": "pr_ci_notice", "input": {}}).to_string(),
+        }]}]});
+        centaur_workflows::slack_buttons::sign_message(&mut message, b"test-secret").unwrap();
+        let signed = message["blocks"][0]["elements"][0]["value"]
+            .as_str()
+            .unwrap();
+        let request = json!({"button": signed, "idempotency_key": "click-1", "click": {
+            "id": "00000000-0000-0000-0000-000000000001", "action": "approve", "channel_id": "C1", "user_id": "U1",
+        }});
+        let router = build_router_with_app_state(AppState::unready(
+            ApiAuthConfig::testing_with_ingresses("test-secret"),
+        ));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/workflows/actions/invoke")
+                    .header(header::AUTHORIZATION, "Bearer test-slackbot-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let bytes: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(bytes["code"], "internal_workflow");
     }
 }

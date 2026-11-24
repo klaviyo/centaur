@@ -218,12 +218,16 @@ export type PrBinding = {
   repository: string;
   number: number;
   thread_key: string;
+  /** GitHub node id of the exact PR this binding was created for. */
+  pr_node_id: string;
   head_sha: string;
   managed: boolean;
   closed: boolean;
 };
 
 export type PrBindingStateUpdate = {
+  /** Must equal the binding's `pr_node_id`; api-rs refuses a mismatch. */
+  pr_node_id: string;
   managed?: boolean;
   closed?: boolean;
   head_sha?: string;
@@ -231,6 +235,8 @@ export type PrBindingStateUpdate = {
 
 /** A failed-CI observation, filled from a fresh GitHub fetch just before sending. */
 export type PrCiFailureReport = {
+  /** Must equal the binding's `pr_node_id`; api-rs refuses a mismatch. */
+  pr_node_id: string;
   head_sha: string;
   current_head_sha: string;
   open: boolean;

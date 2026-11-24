@@ -18,6 +18,17 @@ from centaur_sdk.tool_sdk import create_pull_request
 __all__ = ["create_pull_request", "main"]
 
 _ERROR_BODY_LIMIT = 500
+# Codes that mean this session cannot open a bound PR; the agent may fall back.
+_FALLBACK_CODES = (
+    "slack_session_required",
+    "dm_not_supported",
+    "github_oauth_required",
+    "sandbox_mismatch",
+)
+_FALLBACK_HINT = (
+    "This session cannot open a session-bound pull request; "
+    "open the pull request as you normally would (for example with `gh pr create`)."
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -47,6 +58,8 @@ def main(argv: list[str] | None = None) -> int:
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", "replace")[:_ERROR_BODY_LIMIT]
         sys.stderr.write(f"create failed: HTTP {error.code} {detail}\n")
+        if any(code in detail for code in _FALLBACK_CODES):
+            sys.stderr.write(f"{_FALLBACK_HINT}\n")
         return 1
     except (OSError, RuntimeError, ValueError) as error:
         sys.stderr.write(f"create failed: {error}\n")

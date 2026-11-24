@@ -137,6 +137,9 @@ sources AS (
                 -- control plane can name the human behind a delivered token.
                 'broker_provider', oa.provider,
                 'broker_provider_subject', bc.provider_subject,
+                -- Whether Console delivers the app's tokens only through their
+                -- owner's own grant (see effective_grants above).
+                'broker_owner_only', oa.owner_only,
                 'broker_access_token',
                 -- An owner-only token is delivered only while live, from an
                 -- enabled app and an active owner, through its own wrapper.
