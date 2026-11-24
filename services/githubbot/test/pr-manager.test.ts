@@ -2050,6 +2050,54 @@ describe("PR session bindings", () => {
       expect("details_url" in body).toBe(false);
     });
 
+    describe("a details URL api-rs would drop never shadows a usable link", () => {
+      const overLong = `https://ci.example.test/${"a".repeat(2_048)}`;
+      const permalink = "https://github.com/base/repo/runs/9";
+      const failing = (extra: Record<string, unknown>) => ({
+        __typename: "CheckRun",
+        name: "build",
+        status: "COMPLETED",
+        conclusion: "FAILURE",
+        ...extra,
+      });
+      const sent = async (checkNode: Record<string, unknown>) => {
+        const api = makeApi({ binding: { managed: true, closed: false } });
+        await handleCiEvent(makeCtx({ api, checkNode }).ctx, "check_run", redCheckRun);
+        return api.posts("/ci-failures")[0]?.body as Record<string, unknown>;
+      };
+
+      test("an http:// detailsUrl alongside an HTTPS permalink sends the permalink", async () => {
+        const body = await sent(
+          failing({ detailsUrl: "http://ci.example.test/runs/1", permalink }),
+        );
+        expect(body.details_url).toBe(permalink);
+      });
+
+      test("an over-long detailsUrl alongside an HTTPS permalink sends the permalink", async () => {
+        const body = await sent(failing({ detailsUrl: overLong, permalink }));
+        expect(body.details_url).toBe(permalink);
+      });
+
+      test("a usable detailsUrl still wins over the permalink", async () => {
+        const body = await sent(
+          failing({ detailsUrl: "https://ci.example.test/runs/1", permalink }),
+        );
+        expect(body.details_url).toBe("https://ci.example.test/runs/1");
+      });
+
+      test("with no usable candidate, no details_url is sent", async () => {
+        for (const node of [
+          failing({ detailsUrl: "http://ci.example.test/runs/1", permalink: "http://github.com/x" }),
+          failing({ detailsUrl: overLong, permalink: "javascript:alert(1)" }),
+          { __typename: "StatusContext", context: "deploy", state: "FAILURE", targetUrl: "http://ci.example.test/d" },
+        ]) {
+          const body = await sent(node);
+          expect("details_url" in body).toBe(false);
+          expect(body.check_name).toBeTruthy();
+        }
+      });
+    });
+
     test("a repeat delivery for the same head sends at most one notice, because api-rs answers duplicate", async () => {
       const api = makeApi({ binding: { managed: true, closed: false } });
       const state = makeState();
@@ -2527,6 +2575,35 @@ describe("PR session bindings", () => {
         });
         await handleCiEvent(ctx, "check_run", eventFor(failedEvent));
         expect(api.posts("/ci-failures")).toHaveLength(0);
+      });
+
+      test("the confirmed check's http:// details_url yields to its HTTPS html_url, and to none", async () => {
+        const run = (extra: Record<string, unknown>) => ({ ...stillFailing, ...extra });
+        const urlFor = async (checkRun: Record<string, unknown>) => {
+          const api = bound();
+          await handleCiEvent(
+            makeCtx({ api, aggregateOnly: true, github: { checkRuns: [checkRun] } }).ctx,
+            "check_run",
+            eventFor(failedEvent),
+          );
+          return body(api) as Record<string, unknown>;
+        };
+        expect(
+          (await urlFor(run({ details_url: "http://ci.example.test/lint/9" }))).details_url,
+        ).toBe("https://github.com/base/repo/runs/9");
+        expect(
+          (
+            await urlFor(
+              run({ details_url: `https://ci.example.test/${"a".repeat(2_048)}` }),
+            )
+          ).details_url,
+        ).toBe("https://github.com/base/repo/runs/9");
+        // Nothing usable: the check is still named, with no link.
+        const none = await urlFor(
+          run({ details_url: "http://ci.example.test/lint/9", html_url: "http://github.com/x" }),
+        );
+        expect(none.check_name).toBe("lint");
+        expect("details_url" in none).toBe(false);
       });
 
       test("no identifiable check means no report, with no generic notice", async () => {

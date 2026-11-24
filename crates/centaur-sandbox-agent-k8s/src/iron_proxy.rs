@@ -1390,6 +1390,14 @@ impl AgentSandboxBackend {
 
 /// How long the GitHub pull-request create call may take end to end.
 const GITHUB_PULL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the Kubernetes preflight of the create call (the NetworkPolicy
+/// check and the CA certificate read) may take in all. api-rs holds its shared
+/// global PR-create lock across the whole call, and every authoritative
+/// binding lookup that misses waits on that lock, so a stalled Kubernetes API,
+/// whose own client timeouts are minutes long, must not be able to hold them.
+/// The GitHub request that follows has its own, separate
+/// [`GITHUB_PULL_REQUEST_TIMEOUT`].
+const GITHUB_PULL_REQUEST_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Most response bytes read back from the create call.
 const GITHUB_PULL_REQUEST_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// The generic GitHub placeholder: Console's canonical `github_token`
@@ -1456,10 +1464,9 @@ impl AgentSandboxBackend {
                 operation: "create_github_pull_request",
             });
         };
-        // Sandboxes created before the tunnel rule existed lack it; add it so
-        // their proxy admits this call.
-        self.ensure_api_tunnel_ingress(id, iron_proxy).await?;
-        let ca = self.proxy_ca_certificate(iron_proxy).await?;
+        let ca = self
+            .github_pull_request_preflight(id, iron_proxy, GITHUB_PULL_REQUEST_PREFLIGHT_TIMEOUT)
+            .await?;
         let proxy_url = format!(
             "http://{}.{}.svc:{PROXY_TUNNEL_PORT}",
             iron_proxy_service_name(id),
@@ -1467,6 +1474,30 @@ impl AgentSandboxBackend {
         );
         let client = github_pull_request_client(&proxy_url, ca)?;
         send_github_pull_request(&client, &path, placeholder, payload).await
+    }
+
+    /// The Kubernetes steps the create call needs before it can reach the
+    /// proxy, bounded together by `deadline`: the NetworkPolicy check (older
+    /// sandboxes lack the tunnel rule; add it so their proxy admits this call)
+    /// and the CA certificate read. A stalled Kubernetes API fails the call as
+    /// [`SandboxError::NotReady`], which api-rs reports as the sandbox proxy
+    /// being unavailable, without echoing anything to the caller.
+    async fn github_pull_request_preflight(
+        &self,
+        id: &SandboxId,
+        iron_proxy: &IronProxyConfig,
+        deadline: Duration,
+    ) -> SandboxResult<Vec<reqwest::Certificate>> {
+        tokio::time::timeout(deadline, async {
+            self.ensure_api_tunnel_ingress(id, iron_proxy).await?;
+            self.proxy_ca_certificate(iron_proxy).await
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(SandboxError::NotReady(
+                "the Kubernetes API did not answer in time".to_owned(),
+            ))
+        })
     }
 
     /// Makes sure the sandbox proxy's NetworkPolicy admits api-rs on the tunnel
@@ -4556,6 +4587,47 @@ AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
             .await
             .unwrap_err();
         assert!(matches!(error, SandboxError::Unsupported { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_stalled_kubernetes_api_fails_the_preflight_within_its_deadline() {
+        use std::time::{Duration, Instant};
+
+        // A stand-in API server that accepts connections and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let held = tokio::spawn(async move {
+            let mut streams = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                streams.push(stream);
+            }
+        });
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        let backend = backend_at(&url, Some(iron_proxy.clone()));
+
+        let started = Instant::now();
+        let error = backend
+            .github_pull_request_preflight(
+                &SandboxId::new("asbx-test"),
+                &iron_proxy,
+                Duration::from_millis(300),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        // `NotReady` is not one of the variants api-rs singles out (an invalid
+        // spec, an unsupported operation), so it reaches the default
+        // `sandbox_proxy_unavailable` arm, whose response echoes nothing.
+        assert!(matches!(error, SandboxError::NotReady(_)), "{error:?}");
+        held.abort();
+        // The named bound is finite and shorter than the GitHub request's.
+        assert!(GITHUB_PULL_REQUEST_PREFLIGHT_TIMEOUT <= Duration::from_secs(10));
+        assert!(GITHUB_PULL_REQUEST_PREFLIGHT_TIMEOUT < GITHUB_PULL_REQUEST_TIMEOUT);
     }
 
     /// One request a stub API server received.

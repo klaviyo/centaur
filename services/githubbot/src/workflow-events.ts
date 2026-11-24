@@ -75,6 +75,25 @@ export function isCentaurSkipCheck(name: string | null | undefined): boolean {
   return (name ?? "").toLowerCase().includes(CENTAUR_SKIP_MARKER);
 }
 
+const MAX_NOTICE_URL_BYTES = 2_048;
+
+/**
+ * The first candidate api-rs will keep as a notice link: it starts with
+ * `https://` and is at most 2,048 bytes. This mirrors api-rs's `is_usable_url`
+ * (which drops anything else, and keeps its own validation), so a check's
+ * unusable details URL never shadows a usable permalink or html URL.
+ */
+export function firstUsableUrl(
+  ...candidates: (string | null | undefined)[]
+): string | undefined {
+  return candidates.find(
+    (url): url is string =>
+      typeof url === "string" &&
+      url.startsWith("https://") &&
+      new TextEncoder().encode(url).length <= MAX_NOTICE_URL_BYTES,
+  );
+}
+
 export type CiCheck = {
   status: string;
   conclusion: string | null;
@@ -344,12 +363,12 @@ async function evaluateCiViaActions(
         status: job.status.toLowerCase(),
         conclusion: job.conclusion?.toLowerCase() ?? null,
         name: job.name,
-        url: job.htmlUrl,
+        url: firstUsableUrl(job.htmlUrl),
       })),
     statuses.map((node) => ({
       state: node.state.toLowerCase(),
       context: node.context,
-      url: node.targetUrl,
+      url: firstUsableUrl(node.targetUrl),
     })),
   );
 }
@@ -438,12 +457,12 @@ function evaluateCiRollupContexts(nodes: CiRollupContext[]): CiEvaluation {
       status: node.status.toLowerCase(),
       conclusion: node.conclusion?.toLowerCase() ?? null,
       name: node.name,
-      url: node.detailsUrl ?? node.permalink,
+      url: firstUsableUrl(node.detailsUrl, node.permalink),
     }));
   const statuses = latestCiStatuses(nodes).map((node) => ({
     state: node.state.toLowerCase(),
     context: node.context,
-    url: node.targetUrl,
+    url: firstUsableUrl(node.targetUrl),
   }));
   return evaluateCi(checks, statuses);
 }

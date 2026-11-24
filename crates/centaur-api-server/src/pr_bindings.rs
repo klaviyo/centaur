@@ -1174,9 +1174,15 @@ mod tests {
         _gate: Gate,
     }
 
-    /// Tests that kill the PR-create lock's connection by its (global) key
-    /// would kill other tests' creations too, so every harness holds this
-    /// gate shared and such a test holds it exclusively.
+    /// A test that kills the PR-create lock's connection must not disturb
+    /// another test's pool. It scopes the kill to its own pool by application
+    /// name and to this database, and also holds this gate exclusively
+    /// (every harness holds it shared), so no other test in the process has a
+    /// creation in flight beside it.
+    fn application_name(suffix: &str) -> String {
+        format!("c10-pr-bindings-{suffix}")
+    }
+
     static GATE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
     enum Gate {
@@ -1235,7 +1241,16 @@ mod tests {
                 eprintln!("skipping: SESSION_RUNTIME_TEST_DATABASE_URL not set");
                 return None;
             };
-            let store = PgSessionStore::connect(&url).await.unwrap();
+            let suffix = Uuid::new_v4().simple().to_string();
+            // This harness's pool names itself, so a test that kills
+            // connections can scope the kill to this pool alone.
+            let separator = if url.contains('?') { '&' } else { '?' };
+            let store = PgSessionStore::connect(&format!(
+                "{url}{separator}application_name={}",
+                application_name(&suffix)
+            ))
+            .await
+            .unwrap();
             store
                 .run_migrations(centaur_session_sqlx::TextSearchBackend::Postgres)
                 .await
@@ -1250,7 +1265,6 @@ mod tests {
             let state =
                 AppState::ready_with_pool(runtime, None, Some(store.pool().clone()), auth.clone());
             let router = build_router_with_app_state(state.clone());
-            let suffix = Uuid::new_v4().simple().to_string();
             Some(Self {
                 store,
                 backend,
@@ -1857,6 +1871,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stalled_kubernetes_preflight_is_reported_as_the_proxy_being_unavailable() {
+        // What the k8s backend returns when its Kubernetes preflight times out.
+        let error = sandbox_failure(SessionRuntimeError::Sandbox(SandboxError::NotReady(
+            "the Kubernetes API did not answer in time".to_owned(),
+        )));
+        let response = axum::response::IntoResponse::into_response(error);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "sandbox_proxy_unavailable");
+        // Nothing of the internal cause reaches the caller.
+        assert_eq!(
+            body["error"],
+            "could not reach GitHub through the sandbox proxy"
+        );
+        assert!(!body.to_string().contains("Kubernetes"));
+    }
+
+    #[tokio::test]
     async fn a_lookup_by_node_id_never_returns_another_prs_older_row_at_the_same_path() {
         use std::time::Duration;
 
@@ -2134,14 +2167,23 @@ mod tests {
             thread_key.as_str().to_owned(),
             request,
             || async {
+                // Only a backend that holds the (global) lock, in this
+                // database, and belongs to this harness's own pool.
                 let killed: i64 = sqlx::query_scalar(
                     "select count(*) from (
-                         select pg_terminate_backend(l.pid) from pg_locks l
+                         select pg_terminate_backend(l.pid)
+                         from pg_locks l
+                         join pg_stat_activity a on a.pid = l.pid
                          where l.locktype = 'advisory' and l.granted
+                           and l.database = (select oid from pg_database
+                                             where datname = current_database())
+                           and a.datname = current_database()
+                           and a.application_name = $1
                            and ((l.classid::bigint << 32) | l.objid::bigint)
                                = hashtextextended('centaur:pr-create', 0)
                      ) killed",
                 )
+                .bind(application_name(&h.suffix))
                 .fetch_one(h.store.pool())
                 .await
                 .unwrap();

@@ -7,6 +7,7 @@ import { runTurnStream, turnOutputChars } from "./turn";
 import {
   FAILED_CONCLUSIONS,
   fetchCiEvaluation,
+  firstUsableUrl,
   isCentaurSkipCheck,
   maybeEmitReviewSubmitted,
   prepareCiCompleted,
@@ -737,14 +738,14 @@ function ciEventFailure(
     const state = stringValue(payload.state);
     if (state !== "failure" && state !== "error") return undefined;
     name = stringValue(payload.context);
-    url = stringValue(payload.target_url);
+    url = firstUsableUrl(stringValue(payload.target_url));
   } else if (eventType === "check_run" || eventType === "workflow_run") {
     const node = eventType === "check_run" ? payload.check_run : payload.workflow_run;
     if (!isRecord(node)) return undefined;
     const conclusion = stringValue(node.conclusion)?.toLowerCase();
     if (!conclusion || !FAILED_CONCLUSIONS.has(conclusion)) return undefined;
     name = stringValue(node.name);
-    url = stringValue(node.details_url) ?? stringValue(node.html_url);
+    url = firstUsableUrl(stringValue(node.details_url), stringValue(node.html_url));
     if (eventType === "workflow_run") id = numberValue(node.workflow_id);
     if (eventType === "check_run" && isRecord(node.app)) appId = numberValue(node.app.id);
   }
@@ -824,7 +825,7 @@ async function readEventFailure(
       if (!latest || latest.status !== "completed" || !failedConclusion(latest.conclusion)) {
         return undefined;
       }
-      const url = latest.details_url ?? latest.html_url ?? undefined;
+      const url = firstUsableUrl(latest.details_url, latest.html_url);
       return { name: latest.name, ...(url ? { url } : {}) };
     }
     if (event.kind === "workflow_run") {
@@ -850,7 +851,8 @@ async function readEventFailure(
         return undefined;
       }
       const name = latest.name ?? event.name;
-      return name ? { name, ...(latest.html_url ? { url: latest.html_url } : {}) } : undefined;
+      const url = firstUsableUrl(latest.html_url);
+      return name ? { name, ...(url ? { url } : {}) } : undefined;
     }
     // A status: the combined status lists the latest one per context, a page
     // of 100 at a time, so follow every page to find the context.
@@ -867,7 +869,8 @@ async function readEventFailure(
     );
     const latest = statuses.find((status) => status.context === event.name);
     if (!latest || (latest.state !== "failure" && latest.state !== "error")) return undefined;
-    return { name: latest.context, ...(latest.target_url ? { url: latest.target_url } : {}) };
+    const url = firstUsableUrl(latest.target_url);
+    return { name: latest.context, ...(url ? { url } : {}) };
   } catch (error) {
     logger(ctx).warn("githubbot_ci_event_check_unconfirmed", {
       error: errorMessage(error),
