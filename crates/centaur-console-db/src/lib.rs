@@ -13,7 +13,7 @@ mod ssh_keys;
 
 pub use api_clients::{ApiClient, ApiClientPrincipal, api_client_principals, find_api_client};
 pub use config::{
-    PR_CREATE_GUARD_PATH, PR_OAUTH_PLACEHOLDER, REDACTED, SecretValues, Subject, build_config,
+    PR_CREATE_GUARD_PATH, REDACTED, SecretValues, Subject, build_config,
     build_config_with_github_user_id,
 };
 pub use credentials::{SlackChannels, slack_channels};

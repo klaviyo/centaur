@@ -1193,40 +1193,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_pr_create_lock_serializes_one_repository_and_only_that_one() {
+    async fn creations_share_the_pr_create_lock_and_an_exclusive_taker_waits_for_all() {
         use std::time::Duration;
 
         let Some(store) = test_store().await else {
             return;
         };
-        let repository = format!("Acme/lock-{}", Uuid::new_v4().simple());
-        let other = format!("acme/other-{}", Uuid::new_v4().simple());
-        let held = store.lock_pr_create(&repository).await.unwrap();
-
-        // The same repository, in any case, waits; another one does not.
-        let waiting = tokio::time::timeout(
-            Duration::from_millis(300),
-            store.lock_pr_create(&repository.to_ascii_lowercase()),
-        )
-        .await;
-        assert!(waiting.is_err(), "the same repository did not wait");
-        tokio::time::timeout(Duration::from_secs(5), store.lock_pr_create(&other))
+        // Other tests may hold the shared lock at the same time, so every wait
+        // below is relative to the guards this test holds itself.
+        let first = store.lock_pr_create().await.unwrap();
+        // A second creation does not wait for the first.
+        let second = tokio::time::timeout(Duration::from_secs(5), store.lock_pr_create())
             .await
-            .expect("another repository's lock is free")
+            .expect("creations must not wait on each other")
+            .unwrap();
+
+        // An exclusive taker waits for both.
+        let exclusive = tokio::spawn({
+            let store = store.clone();
+            async move { store.lock_pr_create_exclusive().await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!exclusive.is_finished(), "exclusive did not wait");
+        first.release().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !exclusive.is_finished(),
+            "exclusive did not wait for the second creation"
+        );
+        second.release().await.unwrap();
+        let exclusive = tokio::time::timeout(Duration::from_secs(10), exclusive)
+            .await
+            .expect("exclusive proceeds once every creation is done")
+            .unwrap();
+
+        // While it is held, a new creation waits.
+        let late = tokio::spawn({
+            let store = store.clone();
+            async move { store.lock_pr_create().await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !late.is_finished(),
+            "a creation ran under the exclusive lock"
+        );
+        exclusive.release().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), late)
+            .await
+            .expect("the creation proceeds after the exclusive release")
             .unwrap()
             .release()
             .await
             .unwrap();
-
-        held.release().await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), store.lock_pr_create(&repository))
-            .await
-            .expect("the lock is free once released")
-            .unwrap();
-        assert!(matches!(
-            store.lock_pr_create("not-a-repository").await,
-            Err(SessionStoreError::InvalidPrBinding(_))
-        ));
     }
 
     #[tokio::test]

@@ -8,11 +8,12 @@ use std::env;
 
 use active_record_encryption::ActiveRecordEncryption;
 use centaur_console_db::{
-    ApiClient, ApiClientPrincipal, PR_CREATE_GUARD_PATH, PR_OAUTH_PLACEHOLDER, REDACTED,
-    SecretValues, SlackChannelPermission, Subject, api_client_principals, build_config,
+    ApiClient, ApiClientPrincipal, PR_CREATE_GUARD_PATH, REDACTED, SecretValues,
+    SlackChannelPermission, Subject, api_client_principals, build_config,
     build_config_with_github_user_id, find_api_client, find_direct_slack_channel_permission,
     find_principal, find_principal_by_foreign_id, find_user_id_by_email, models::Config,
 };
+use centaur_sandbox_core::{PR_OAUTH_PLACEHOLDER_PREFIX, PrOauthPlaceholder};
 use serde_json::{Value, json};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 
@@ -61,6 +62,8 @@ struct App {
     /// The Console user who connected the credential.
     connected_by: i64,
     wrapper: Wrapper,
+    /// Whether any requester granted the wrapper directly may use it.
+    always_available: bool,
 }
 
 struct Fixture {
@@ -168,6 +171,7 @@ impl Fixture {
             shared: false,
             connected_by: self.admin,
             wrapper: Wrapper::Canonical,
+            always_available: false,
         }
     }
 
@@ -214,14 +218,15 @@ impl Fixture {
         app_shape: App,
     ) -> i64 {
         let app: i64 = sqlx::query_scalar(
-            "INSERT INTO oauth_apps (slug, provider, client_id, owner_only, shared, created_by_id, created_at, updated_at) \
-             VALUES ($1, $2, 'client', $3, $4, $5, now(), now()) RETURNING id",
+            "INSERT INTO oauth_apps (slug, provider, client_id, owner_only, shared, always_available, created_by_id, created_at, updated_at) \
+             VALUES ($1, $2, 'client', $3, $4, $6, $5, now(), now()) RETURNING id",
         )
         .bind(self.name(label))
         .bind(provider)
         .bind(app_shape.owner_only)
         .bind(app_shape.shared)
         .bind(self.admin)
+        .bind(app_shape.always_available)
         .fetch_one(&self.pool)
         .await
         .unwrap();
@@ -616,6 +621,14 @@ async fn reads_api_clients_and_their_principals() {
 
 /// The delivered config and the GitHub account derived with it, in one call.
 async fn github_config(fixture: &Fixture, principal: i64) -> (Config, Option<String>) {
+    github_config_for(fixture, principal, None).await
+}
+
+async fn github_config_for(
+    fixture: &Fixture,
+    principal: i64,
+    requester: Option<i64>,
+) -> (Config, Option<String>) {
     let encryption = ActiveRecordEncryption::new(PRIMARY_KEY, SALT);
     let empty = json!([]);
     let labels = json!({});
@@ -631,7 +644,7 @@ async fn github_config(fixture: &Fixture, principal: i64) -> (Config, Option<Str
         &fixture.pool,
         SecretValues::Live(&encryption),
         &subject,
-        None,
+        requester,
     )
     .await
     .unwrap()
@@ -653,6 +666,12 @@ fn github_secrets(config: &Config) -> Vec<&Value> {
         .collect()
 }
 
+fn is_pr_oauth_placeholder(value: &Value) -> bool {
+    value
+        .as_str()
+        .is_some_and(|value| value.starts_with(PR_OAUTH_PLACEHOLDER_PREFIX))
+}
+
 /// The guards in `config`: secrets under the PR-create OAuth placeholder, in
 /// `secrets` or inside any `secrets` transform. A healthy config has exactly
 /// one, in the last transform.
@@ -660,7 +679,7 @@ fn pr_oauth_secrets(config: &Config) -> Vec<&Value> {
     let in_secrets = config
         .secrets
         .iter()
-        .filter(|secret| secret["replace"]["proxy_value"] == PR_OAUTH_PLACEHOLDER);
+        .filter(|secret| is_pr_oauth_placeholder(&secret["replace"]["proxy_value"]));
     let in_transforms = config
         .transforms
         .iter()
@@ -671,13 +690,28 @@ fn pr_oauth_secrets(config: &Config) -> Vec<&Value> {
                 .into_iter()
                 .flatten()
         })
-        .filter(|secret| secret["replace"]["proxy_value"] == PR_OAUTH_PLACEHOLDER);
+        .filter(|secret| is_pr_oauth_placeholder(&secret["replace"]["proxy_value"]));
     in_secrets.chain(in_transforms).collect()
 }
 
 /// The sentinel the guard carries when no account is attested.
 fn sentinel() -> Value {
     json!({"type": "control_plane", "value": "centaur-unattested-oauth"})
+}
+
+/// The guard's placeholder, the `proxy_value` of the last transform's secret.
+fn guard_placeholder(config: &Config) -> String {
+    config.transforms.last().unwrap()["config"]["secrets"][0]["replace"]["proxy_value"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// The guard of a config with no attested account: the fixed unattested
+/// placeholder, with the sentinel source.
+fn assert_unattested_guard(config: &Config) {
+    assert_eq!(assert_guard_last(config), sentinel());
+    assert_eq!(guard_placeholder(config), "CENTAUR_PR_OAUTH_UNATTESTED");
 }
 
 /// Checks that `config` ends with exactly one PR-create guard: the last
@@ -691,7 +725,7 @@ fn assert_guard_last(config: &Config) -> Value {
         config
             .secrets
             .iter()
-            .all(|secret| secret["replace"]["proxy_value"] != PR_OAUTH_PLACEHOLDER),
+            .all(|secret| !is_pr_oauth_placeholder(&secret["replace"]["proxy_value"])),
         "the guard must not be in `secrets`"
     );
     let guards = pr_oauth_secrets(config);
@@ -700,10 +734,20 @@ fn assert_guard_last(config: &Config) -> Value {
     assert_eq!(last["name"], "secrets");
     assert_eq!(last["config"]["secrets"].as_array().map(Vec::len), Some(1));
     assert_eq!(&last["config"]["secrets"][0], guards[0]);
+    // An identity-bound placeholder: placeholder-safe, and never one the
+    // generic `GITHUB_TOKEN` replacement could match.
+    let placeholder = guard_placeholder(config);
+    assert!(
+        placeholder
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'),
+        "{placeholder}"
+    );
+    assert!(!placeholder.contains("GITHUB_TOKEN"), "{placeholder}");
     assert_eq!(
         guards[0]["replace"],
         json!({
-            "proxy_value": "CENTAUR_PR_OAUTH",
+            "proxy_value": placeholder,
             "match_headers": ["Authorization"],
             "require": true,
         })
@@ -732,7 +776,7 @@ async fn the_pr_create_guard_is_in_every_build_and_names_the_attested_credential
     let actor = fixture.owner_principal("pr-oauth").await;
     let (config, account) = github_config(&fixture, actor).await;
     assert_eq!(account, None);
-    assert_eq!(assert_guard_last(&config), sentinel());
+    assert_unattested_guard(&config);
 
     fixture
         .brokered_token(
@@ -755,6 +799,11 @@ async fn the_pr_create_guard_is_in_every_build_and_names_the_attested_credential
     assert_eq!(source, delivered[0]["source"]);
     assert_eq!(source["type"], "control_plane");
     assert_ne!(source, sentinel());
+    // Its placeholder names the account and, with no requester bound, NONE.
+    assert_eq!(
+        guard_placeholder(&config),
+        "CENTAUR_PR_OAUTH_U90210001_NONE"
+    );
 
     // The plain config (Console's effective-config preview, for one) never
     // carries it.
@@ -794,7 +843,80 @@ async fn the_pr_create_guard_is_in_every_build_and_names_the_attested_credential
         .await;
     let (config, account) = github_config(&fixture, actor).await;
     assert_eq!(account, None);
-    assert_eq!(assert_guard_last(&config), sentinel());
+    assert_unattested_guard(&config);
+}
+
+#[tokio::test]
+async fn the_guard_placeholder_differs_per_account_and_requester() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    // Alice's connection, usable by whoever's turn it is when she is the
+    // requester (an always-available wrapper granted to her directly).
+    let alice = fixture.owner_principal("placeholder-alice").await;
+    fixture
+        .brokered_token(
+            alice,
+            "github-placeholder-alice",
+            "github",
+            Some("90210001"),
+            "api.github.com",
+            100,
+            App {
+                always_available: true,
+                ..fixture.personal()
+            },
+        )
+        .await;
+    let channel = fixture.principal("placeholder-channel").await;
+
+    // Alone, Alice is her own actor: no requester in the placeholder.
+    let (config, account) = github_config(&fixture, alice).await;
+    assert_eq!(account.as_deref(), Some("90210001"));
+    let alone = guard_placeholder(&config);
+    assert_eq!(alone, "CENTAUR_PR_OAUTH_U90210001_NONE");
+
+    // On the channel's proxy with Alice as requester, the same account gets a
+    // placeholder naming her.
+    let (config, account) = github_config_for(&fixture, channel, Some(alice)).await;
+    assert_eq!(account.as_deref(), Some("90210001"));
+    let with_requester = guard_placeholder(&config);
+    assert_eq!(
+        with_requester,
+        PrOauthPlaceholder::derive("90210001", Some(&centaur_console_db::oid("prn", alice)))
+            .unwrap()
+            .as_str()
+    );
+    assert_ne!(with_requester, alone);
+    assert_guard_last(&config);
+
+    // A different account: a different placeholder, even for the same
+    // requester shape.
+    let bob = fixture.owner_principal("placeholder-bob").await;
+    fixture
+        .brokered_token(
+            bob,
+            "github-placeholder-bob",
+            "github",
+            Some("90210002"),
+            "api.github.com",
+            100,
+            App {
+                always_available: true,
+                ..fixture.personal()
+            },
+        )
+        .await;
+    let (config, account) = github_config_for(&fixture, channel, Some(bob)).await;
+    assert_eq!(account.as_deref(), Some("90210002"));
+    let bobs = guard_placeholder(&config);
+    assert_ne!(bobs, with_requester);
+
+    // Nothing attested: the fixed unattested placeholder.
+    let nobody = fixture.owner_principal("placeholder-nobody").await;
+    let (config, account) = github_config(&fixture, nobody).await;
+    assert_eq!(account, None);
+    assert_unattested_guard(&config);
 }
 
 #[tokio::test]
@@ -820,7 +942,7 @@ async fn a_direct_injector_or_a_narrow_rule_gives_no_claim_and_a_sentinel_guard(
         .await;
     let (config, account) = github_config(&fixture, injected).await;
     assert_eq!(account, None);
-    assert_eq!(assert_guard_last(&config), sentinel());
+    assert_unattested_guard(&config);
 
     // The canonical replacement, but only for GET.
     let read_only = fixture.owner_principal("read-only").await;
@@ -840,7 +962,7 @@ async fn a_direct_injector_or_a_narrow_rule_gives_no_claim_and_a_sentinel_guard(
         .await;
     let (config, account) = github_config(&fixture, read_only).await;
     assert_eq!(account, None);
-    assert_eq!(assert_guard_last(&config), sentinel());
+    assert_unattested_guard(&config);
 }
 
 #[tokio::test]
@@ -907,7 +1029,7 @@ async fn a_transform_targeting_the_api_host_withdraws_the_claim() {
     assert_eq!(account, None);
     assert_eq!(config.transforms.len(), 2);
     assert_eq!(config.transforms[0]["name"], "gcp_auth");
-    assert_eq!(assert_guard_last(&config), sentinel());
+    assert_unattested_guard(&config);
 }
 
 #[tokio::test]

@@ -330,12 +330,19 @@ export async function handlePullRequestEvent(
   // recorded before (and regardless of) the unbound handling below.
   // The PR's node id from the signed payload lets api-rs find a binding whose
   // repository was since renamed.
+  // A miss is only believed (made authoritative) where it would send an
+  // explicit assignment of the bot down the unbound path.
+  const botAssigned =
+    action === "assigned" &&
+    isRecord(payload.assignee) &&
+    stringValue(payload.assignee.login)?.toLowerCase() === ctx.userName.toLowerCase();
   const lookup = await lookupBindingWithRetry(
     ctx,
     repo.owner,
     repo.repo,
     number,
     stringValue(prNode.node_id),
+    botAssigned,
   );
   // A failed lookup is not "unbound": the invalidating writes (close, unassign,
   // reopen) are still attempted on the signed payload's node id, which api-rs
@@ -384,11 +391,17 @@ async function lookupBinding(
   repo: string,
   number: number,
   nodeId?: string,
+  authoritative = false,
 ): Promise<BindingLookup> {
   try {
     return {
       ok: true,
-      binding: await getPrBinding(ctx.options, bindingRef(owner, repo, number), nodeId),
+      binding: await getPrBinding(
+        ctx.options,
+        bindingRef(owner, repo, number),
+        nodeId,
+        authoritative,
+      ),
     };
   } catch (error) {
     logger(ctx).warn("githubbot_pr_binding_lookup_failed", {
@@ -410,11 +423,12 @@ async function lookupBindingWithRetry(
   repo: string,
   number: number,
   nodeId?: string,
+  authoritative = false,
 ): Promise<BindingLookup> {
   const delays = ctx.stateWriteRetryDelaysMs ?? DEFAULT_STATE_WRITE_RETRY_DELAYS_MS;
   const sleep = ctx.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   for (let attempt = 0; ; attempt += 1) {
-    const lookup = await lookupBinding(ctx, owner, repo, number, nodeId);
+    const lookup = await lookupBinding(ctx, owner, repo, number, nodeId, authoritative);
     if (lookup.ok || attempt >= delays.length || !isRetryableSessionApiError(lookup.error)) {
       return lookup;
     }
@@ -696,6 +710,8 @@ type CiEventFailure = {
   headSha: string;
   /** The workflow's id, which the latest run of that workflow is looked up by. */
   workflowId?: number;
+  /** The GitHub App that reported the check run; only its runs can confirm it. */
+  appId?: number;
   name: string;
   url?: string;
 };
@@ -716,6 +732,7 @@ function ciEventFailure(
   let name: string | undefined;
   let url: string | undefined;
   let id: number | undefined;
+  let appId: number | undefined;
   if (eventType === "status") {
     const state = stringValue(payload.state);
     if (state !== "failure" && state !== "error") return undefined;
@@ -729,6 +746,7 @@ function ciEventFailure(
     name = stringValue(node.name);
     url = stringValue(node.details_url) ?? stringValue(node.html_url);
     if (eventType === "workflow_run") id = numberValue(node.workflow_id);
+    if (eventType === "check_run" && isRecord(node.app)) appId = numberValue(node.app.id);
   }
   if (!name || isCentaurSkipCheck(name) || (eventType !== "status" && eventType !== "check_run" && eventType !== "workflow_run")) {
     return undefined;
@@ -739,6 +757,7 @@ function ciEventFailure(
     kind: eventType,
     name,
     ...(id !== undefined ? { workflowId: id } : {}),
+    ...(appId !== undefined ? { appId } : {}),
     ...(url ? { url } : {}),
   };
 }
@@ -782,17 +801,22 @@ async function readEventFailure(
     Boolean(conclusion && FAILED_CONCLUSIONS.has(conclusion.toLowerCase()));
   try {
     if (event.kind === "check_run") {
-      // The latest run for this check's name on this head, newest by start time.
+      // Only the event's own app can confirm it: another app's passing run of
+      // the same name says nothing about this one's failure.
+      if (event.appId === undefined) return undefined;
+      const appId = event.appId;
       const { data } = await ctx.octokit.rest.checks.listForRef({
         owner,
         repo,
         ref: headSha,
         check_name: event.name,
+        app_id: appId,
         filter: "latest",
         per_page: 100,
       });
+      // The latest run of that app for this check's name, newest by start time.
       const latest = [...data.check_runs]
-        .filter((run) => run.name === event.name && run.head_sha === headSha)
+        .filter((run) => run.name === event.name && run.head_sha === headSha && run.app?.id === appId)
         .sort(
           (a, b) =>
             (b.started_at ?? "").localeCompare(a.started_at ?? "") || b.id - a.id,
@@ -887,7 +911,8 @@ async function processCi(
   // early skip may already have consumed it). Only an explicit 404 means
   // unbound: if api-rs can't say, do nothing at all, and take no claim.
   if (evaluation.failed) {
-    const lookup = await lookupBinding(ctx, owner, repo, number, pr.nodeId ?? undefined);
+    // A miss here means the unfixed-by-binding flow, so it must be believed.
+    const lookup = await lookupBinding(ctx, owner, repo, number, pr.nodeId ?? undefined, true);
     if (!lookup.ok) return;
     if (lookup.binding) {
       // A binding for another PR (a recycled repo and number) says nothing

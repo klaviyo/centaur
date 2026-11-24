@@ -1704,6 +1704,7 @@ describe("PR session bindings", () => {
     const comments: string[] = [];
     // Every GitHub read, in order, so a test can see which one came last.
     const reads: string[] = [];
+    const checkQueries: Record<string, unknown>[] = [];
     const fresh = (kind: string, value: Record<string, unknown> | "throw" | undefined) =>
       async () => {
         reads.push(kind);
@@ -1761,8 +1762,9 @@ describe("PR session bindings", () => {
             },
           },
           checks: {
-            listForRef: async () => {
+            listForRef: async (args: Record<string, unknown>) => {
               reads.push("check");
+              checkQueries.push(args);
               const runs = input.github?.checkRuns;
               if (runs === undefined || runs === "throw") throw new Error("not confirmable");
               return { data: { check_runs: runs } };
@@ -1825,7 +1827,7 @@ describe("PR session bindings", () => {
         sleeps.push(ms);
       },
     } as unknown as PrManagerContext;
-    return { comments, ctx, reads, sleeps };
+    return { checkQueries, comments, ctx, reads, sleeps };
   }
 
   const PR_KEY = "centaur-githubbot:pr:base/repo#7";
@@ -1844,7 +1846,7 @@ describe("PR session bindings", () => {
         await drainBackgroundWork(2000);
         const gets = api.calls.filter((c) => c.method === "GET");
         expect(gets[0]?.path).toBe("/api/pr-bindings/base/repo/7");
-        expect(gets[0]?.search).toBe(`?node_id=${NODE_ID}`);
+        expect(gets[0]?.search).toBe(`?node_id=${NODE_ID}&authoritative=true`);
         // The head repair and the report both go to the stored coordinates.
         expect(
           api.calls.filter((c) => c.method === "POST").map((c) => c.path),
@@ -1909,6 +1911,58 @@ describe("PR session bindings", () => {
         await drainBackgroundWork(2000);
         expect(api.posts("/ci-failures")).toHaveLength(0);
         expect(api.sessionCalls.length).toBeGreaterThan(0);
+      });
+    });
+
+    describe("authoritative binding lookups", () => {
+      const eventGets = (api: ReturnType<typeof makeApi>) =>
+        api.calls.filter((c) => c.method === "GET").map((c) => c.search);
+
+      test("the red-CI lookup asks for an authoritative answer", async () => {
+        const api = makeApi({ binding: null });
+        await handleCiEvent(makeCtx({ api }).ctx, "check_run", redCheckRun);
+        await drainBackgroundWork(2000);
+        expect(eventGets(api)).toEqual([`?node_id=${NODE_ID}&authoritative=true`]);
+      });
+
+      test("an assignment of the bot asks for one; every other lifecycle lookup does not", async () => {
+        const lifecycle = (action: string, assignee?: string) =>
+          JSON.stringify({
+            action,
+            repository: { full_name: "base/repo" },
+            pull_request: { number: 7, node_id: NODE_ID, head: { sha: "old000" } },
+            ...(assignee ? { assignee: { login: assignee } } : {}),
+          });
+        const cases: [string, string | undefined, string][] = [
+          ["assigned", "centaur-bot", `?node_id=${NODE_ID}&authoritative=true`],
+          ["assigned", "a-human", `?node_id=${NODE_ID}`],
+          ["unassigned", "centaur-bot", `?node_id=${NODE_ID}`],
+          ["closed", undefined, `?node_id=${NODE_ID}`],
+          ["reopened", undefined, `?node_id=${NODE_ID}`],
+          ["synchronize", undefined, `?node_id=${NODE_ID}`],
+        ];
+        for (const [action, assignee, expected] of cases) {
+          const api = makeApi({ binding: null });
+          await handlePullRequestEvent(
+            makeCtx({ api, settled: false }).ctx,
+            lifecycle(action, assignee),
+          );
+          expect(eventGets(api)).toEqual([expected]);
+        }
+      });
+
+      test("re-reads after a conflict do not ask for one", async () => {
+        const api = makeApi({
+          binding: { managed: true, closed: false, head_sha: "old111" },
+          interveneBeforeState: 1,
+        });
+        await handleCiEvent(makeCtx({ api }).ctx, "check_run", redCheckRun);
+        const gets = eventGets(api);
+        // The red-path lookup is authoritative; the head repair's re-read is not.
+        expect(gets).toEqual([
+          `?node_id=${NODE_ID}&authoritative=true`,
+          `?node_id=${NODE_ID}`,
+        ]);
       });
     });
 
@@ -2283,11 +2337,19 @@ describe("PR session bindings", () => {
       const eventFor = (check: Record<string, unknown>) =>
         JSON.stringify({
           repository: { full_name: "base/repo" },
-          check_run: { head_sha: "abc123", pull_requests: [{ number: 7 }], id: 99, ...check },
+          check_run: {
+            head_sha: "abc123",
+            pull_requests: [{ number: 7 }],
+            id: 99,
+            app: { id: APP_ID },
+            ...check,
+          },
         });
       const bound = () => makeApi({ binding: { managed: true, closed: false } });
+      const APP_ID = 15368;
       const stillFailing = {
         id: 90,
+        app: { id: APP_ID },
         started_at: "2026-11-23T10:00:00Z",
         head_sha: "abc123",
         status: "completed",
@@ -2406,6 +2468,65 @@ describe("PR session bindings", () => {
         });
         await handleCiEvent(ctx, "check_run", eventFor(failedEvent));
         expect(body(api)).toMatchObject({ details_url: "https://ci.example.test/lint/10" });
+      });
+
+      test("asks for the event's own app's runs, and uses none for an event with no app", async () => {
+        const api = bound();
+        const { ctx, checkQueries } = makeCtx({ api, aggregateOnly: true, github: { checkRuns: [stillFailing] } });
+        await handleCiEvent(ctx, "check_run", eventFor(failedEvent));
+        expect(checkQueries).toEqual([
+          expect.objectContaining({ app_id: APP_ID, check_name: "lint", filter: "latest", ref: "abc123" }),
+        ]);
+
+        const noApp = bound();
+        const unattributed = makeCtx({ api: noApp, aggregateOnly: true, github: { checkRuns: [stillFailing] } });
+        await handleCiEvent(
+          unattributed.ctx,
+          "check_run",
+          eventFor({ ...failedEvent, app: undefined }),
+        );
+        // No app id on the event: the fallback is not used, and nothing is read for it.
+        expect(unattributed.checkQueries).toEqual([]);
+        expect(noApp.posts("/ci-failures")).toHaveLength(0);
+      });
+
+      test("a same-name passing run from a different app does not hide the event's app's failure", async () => {
+        const api = bound();
+        const { ctx } = makeCtx({
+          api,
+          aggregateOnly: true,
+          github: {
+            checkRuns: [
+              stillFailing,
+              // Newer, same name, passing: but another app's check.
+              {
+                ...stillFailing,
+                id: 91,
+                app: { id: 99999 },
+                started_at: "2026-11-23T10:05:00Z",
+                conclusion: "success",
+              },
+            ],
+          },
+        });
+        await handleCiEvent(ctx, "check_run", eventFor(failedEvent));
+        expect(body(api)).toMatchObject({
+          check_name: "lint",
+          details_url: "https://ci.example.test/lint/9",
+        });
+      });
+
+      test("a same-name failing run from a different app is not the event's check either", async () => {
+        const api = bound();
+        const { ctx } = makeCtx({
+          api,
+          aggregateOnly: true,
+          github: {
+            checkRuns: [{ ...stillFailing, app: { id: 99999 } }],
+          },
+        });
+        await handleCiEvent(ctx, "check_run", eventFor(failedEvent));
+        expect(api.posts("/ci-failures")).toHaveLength(0);
       });
 
       test("no identifiable check means no report, with no generic notice", async () => {

@@ -687,10 +687,14 @@ export async function getPrBinding(
   // The PR's immutable node id: lets api-rs find a binding whose repository was
   // since renamed or transferred.
   nodeId?: string,
+  // Make a miss wait for any trusted PR create still in flight, so it can be
+  // believed. Costs api-rs a lock, so only where a miss decides something.
+  authoritative = false,
 ): Promise<PrBinding | null> {
   const fetchFn = options.fetch ?? fetch;
   const url = new URL(prBindingUrl(options.apiUrl, ref));
   if (nodeId) url.searchParams.set("node_id", nodeId);
+  if (authoritative) url.searchParams.set("authoritative", "true");
   const response = await fetchFn(url.toString(), {
     method: "GET",
     headers: apiHeaders(options, false),

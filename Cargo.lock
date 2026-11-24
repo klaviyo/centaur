@@ -664,6 +664,7 @@ name = "centaur-console-db"
 version = "0.1.0"
 dependencies = [
  "active-record-encryption",
+ "centaur-sandbox-core",
  "hex",
  "rand 0.10.3",
  "serde",

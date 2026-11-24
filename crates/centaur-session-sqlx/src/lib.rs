@@ -113,8 +113,9 @@ pub struct ProxyBindingLock {
     _permit: OwnedSemaphorePermit,
 }
 
-/// A repository's PR-creation lock, returned by
-/// [`PgSessionStore::lock_pr_create`]. Dropping it releases the lock; call
+/// The PR-creation lock, returned by [`PgSessionStore::lock_pr_create`]
+/// (shared, held by a creation) or [`PgSessionStore::lock_pr_create_exclusive`]
+/// (held by an authoritative lookup). Dropping it releases the lock; call
 /// [`Self::release`] to release it at once.
 pub struct PrCreateLock {
     tx: sqlx::Transaction<'static, sqlx::Postgres>,
@@ -162,15 +163,6 @@ impl PrCreateLock {
     pub async fn commit(self) -> Result<(), SessionStoreError> {
         self.tx.commit().await?;
         Ok(())
-    }
-
-    /// The Postgres backend serving this lock's transaction, so a test can
-    /// kill it.
-    #[doc(hidden)]
-    pub async fn backend_pid(&mut self) -> Result<i32, SessionStoreError> {
-        Ok(sqlx::query_scalar("select pg_backend_pid()")
-            .fetch_one(&mut *self.tx)
-            .await?)
     }
 }
 
@@ -771,23 +763,40 @@ impl PgSessionStore {
         })
     }
 
-    /// Waits for, then holds, the repository's PR-creation lock until the
-    /// returned guard is released or dropped. Every api-rs replica shares it.
-    /// A trusted PR creation holds it from before its GitHub call through its
-    /// binding insert, and a binding lookup that finds nothing takes it once
-    /// (and lets go) before answering, so "no binding" is never reported while
-    /// a creation for that repository is still in flight.
+    /// Takes the PR-creation lock in **shared** mode and holds it until the
+    /// returned guard is committed, released or dropped. A trusted PR
+    /// creation holds it from before its GitHub call through its binding
+    /// insert and commit. Being shared, creations never wait on one another,
+    /// whatever repository they are for.
+    ///
+    /// It is one global lock, not one per repository: GitHub's response can
+    /// name the PR in a repository under a different name than the request
+    /// (a rename between the call and the commit), so only a lock that does
+    /// not depend on the name can be waited on by a lookup. Lookups that must
+    /// not miss a binding take it exclusively
+    /// ([`Self::lock_pr_create_exclusive`]) and so wait for every creation in
+    /// flight; other lookups do not lock at all.
     ///
     /// Lock order: a creation takes the thread's proxy-binding lock first and
     /// this one second; a lookup takes only this one. The two use separate
     /// replica-wide permit pools, so waiting for one kind can never starve the
-    /// holders of the other, and no cycle can form. `repository` is
-    /// case-insensitive.
-    pub async fn lock_pr_create(
+    /// holders of the other, and no cycle can form.
+    pub async fn lock_pr_create(&self) -> Result<PrCreateLock, SessionStoreError> {
+        self.lock_pr_create_in("pg_advisory_xact_lock_shared").await
+    }
+
+    /// Takes the PR-creation lock in **exclusive** mode: it waits for every
+    /// creation in flight (in any repository) and blocks new ones until the
+    /// guard is released. Held only for an authoritative binding lookup's
+    /// final read.
+    pub async fn lock_pr_create_exclusive(&self) -> Result<PrCreateLock, SessionStoreError> {
+        self.lock_pr_create_in("pg_advisory_xact_lock").await
+    }
+
+    async fn lock_pr_create_in(
         &self,
-        repository: &str,
+        lock_function: &'static str,
     ) -> Result<PrCreateLock, SessionStoreError> {
-        let repository = normalize_pr_repository(repository)?;
         let permit = self
             .pr_create_permits
             .clone()
@@ -795,10 +804,9 @@ impl PgSessionStore {
             .await
             .expect("the PR-create semaphore is never closed");
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "select pg_advisory_xact_lock(hashtextextended('centaur:pr-create:' || $1::text, 0))",
-        )
-        .bind(&repository)
+        sqlx::query(&format!(
+            "select {lock_function}(hashtextextended('centaur:pr-create', 0))"
+        ))
         .execute(&mut *tx)
         .await?;
         Ok(PrCreateLock {

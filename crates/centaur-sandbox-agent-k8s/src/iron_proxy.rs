@@ -3,8 +3,8 @@ use std::time::{Duration, SystemTime};
 
 use centaur_iron_proxy::{ProxyFragment, SourceKind, SourcePolicy};
 use centaur_sandbox_core::{
-    GITHUB_API_HOST, ProxyHttpsResponse, ResourceRequirements, SandboxError, SandboxId,
-    SandboxResult, SandboxSpec, github_pull_requests_path,
+    GITHUB_API_HOST, PrOauthPlaceholder, ProxyHttpsResponse, ResourceRequirements, SandboxError,
+    SandboxId, SandboxResult, SandboxSpec, github_pull_requests_path,
 };
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvFromSource,
@@ -1396,7 +1396,7 @@ const GITHUB_PULL_REQUEST_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// credential replaces it in `Authorization` on `api.github.com` whether that
 /// credential is an OAuth token or a personal access token. The create call
 /// does not use it, because the account check only means something for an
-/// OAuth token (see `GITHUB_PR_OAUTH_PLACEHOLDER_AUTHORIZATION`); tests assert
+/// OAuth token (see `github_pr_authorization`); tests assert
 /// the call never carries it.
 #[cfg(test)]
 const GITHUB_TOKEN_PLACEHOLDER_AUTHORIZATION: &str = "Bearer GITHUB_TOKEN";
@@ -1414,15 +1414,21 @@ const GITHUB_TOKEN_PLACEHOLDER_AUTHORIZATION: &str = "Bearer GITHUB_TOKEN";
 /// offline proof (`d1-oauth-placeholder-proof/`) must be rerun on any
 /// iron-proxy bump.
 const GITHUB_PR_CREATE_PATH_MARKER: &str = "/";
-/// `Authorization` value of the create call: a placeholder, not a credential.
-/// The sandbox's proxy replaces `CENTAUR_PR_OAUTH` only with the attested
-/// OAuth credential's token, and only for `POST api.github.com
-/// //repos/*/*/pulls` (see [`GITHUB_PR_CREATE_PATH_MARKER`]): proxy-sync adds that substitution in the same build that
-/// attests the account, and only when it does. If the credential has since
-/// turned into a personal access token (or is gone), the placeholder goes to
-/// GitHub unsubstituted and is rejected, so no pull request is created under a
+/// `Authorization` value of the create call: `Bearer` plus the identity-bound
+/// placeholder (see [`PrOauthPlaceholder`]), a placeholder and not a
+/// credential. The sandbox's proxy replaces it only with the attested OAuth
+/// credential's token, only for `POST api.github.com //repos/*/*/pulls` (see
+/// [`GITHUB_PR_CREATE_PATH_MARKER`]), and only if its guard was built for
+/// exactly this account and requester: Console's config builder derives the
+/// guard's placeholder from the same two values. If the credential has since
+/// turned into a personal access token, the account changed, or the proxy was
+/// rebound to another requester, the guard expects a different string and the
+/// proxy refuses the call (or, with no guard match, the placeholder reaches
+/// GitHub unsubstituted and is rejected), so no pull request is created under a
 /// credential the attestation does not describe.
-const GITHUB_PR_OAUTH_PLACEHOLDER_AUTHORIZATION: &str = "Bearer CENTAUR_PR_OAUTH";
+fn github_pr_authorization(placeholder: &PrOauthPlaceholder) -> String {
+    format!("Bearer {}", placeholder.as_str())
+}
 
 impl AgentSandboxBackend {
     /// Creates a pull request through the sandbox's own proxy: HTTP CONNECT to
@@ -1440,6 +1446,7 @@ impl AgentSandboxBackend {
         id: &SandboxId,
         owner: &str,
         repo: &str,
+        placeholder: &PrOauthPlaceholder,
         payload: &Value,
     ) -> SandboxResult<ProxyHttpsResponse> {
         let path = github_pull_requests_path(owner, repo)?;
@@ -1459,7 +1466,7 @@ impl AgentSandboxBackend {
             self.config.namespace
         );
         let client = github_pull_request_client(&proxy_url, ca)?;
-        send_github_pull_request(&client, &path, payload).await
+        send_github_pull_request(&client, &path, placeholder, payload).await
     }
 
     /// Makes sure the sandbox proxy's NetworkPolicy admits api-rs on the tunnel
@@ -1555,13 +1562,14 @@ fn github_pull_request_request(
     client: &reqwest::Client,
     base: &str,
     path: &str,
+    placeholder: &PrOauthPlaceholder,
     payload: &Value,
 ) -> reqwest::RequestBuilder {
     client
         .post(format!("{base}{GITHUB_PR_CREATE_PATH_MARKER}{path}"))
         .header(
             reqwest::header::AUTHORIZATION,
-            GITHUB_PR_OAUTH_PLACEHOLDER_AUTHORIZATION,
+            github_pr_authorization(placeholder),
         )
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
@@ -1572,18 +1580,27 @@ fn github_pull_request_request(
 async fn send_github_pull_request(
     client: &reqwest::Client,
     path: &str,
+    placeholder: &PrOauthPlaceholder,
     payload: &Value,
 ) -> SandboxResult<ProxyHttpsResponse> {
-    send_github_pull_request_to(client, &format!("https://{GITHUB_API_HOST}"), path, payload).await
+    send_github_pull_request_to(
+        client,
+        &format!("https://{GITHUB_API_HOST}"),
+        path,
+        placeholder,
+        payload,
+    )
+    .await
 }
 
 async fn send_github_pull_request_to(
     client: &reqwest::Client,
     base: &str,
     path: &str,
+    placeholder: &PrOauthPlaceholder,
     payload: &Value,
 ) -> SandboxResult<ProxyHttpsResponse> {
-    let mut response = github_pull_request_request(client, base, path, payload)
+    let mut response = github_pull_request_request(client, base, path, placeholder, payload)
         .send()
         .await
         .map_err(|err| {
@@ -2844,6 +2861,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    fn placeholder() -> PrOauthPlaceholder {
+        PrOauthPlaceholder::derive("90210001", Some("prn_alice")).unwrap()
+    }
 
     fn no_scheduling() -> ProxyPodScheduling<'static> {
         static EMPTY_SELECTOR: BTreeMap<String, String> = BTreeMap::new();
@@ -4310,6 +4331,7 @@ AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
             &client,
             "https://api.github.com",
             &github_pull_requests_path("acme", "widgets").unwrap(),
+            &placeholder(),
             &payload,
         )
         .build()
@@ -4323,9 +4345,19 @@ AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
         );
         assert_eq!(request.url().path(), "//repos/acme/widgets/pulls");
         let headers = request.headers();
-        // Only the OAuth-only placeholder, never the generic one that a
+        // Only the identity-bound OAuth placeholder derived from the caller's
+        // validated account and requester, never the generic one that a
         // personal access token would also satisfy.
-        assert_eq!(headers["authorization"], "Bearer CENTAUR_PR_OAUTH");
+        assert_eq!(
+            headers["authorization"],
+            format!("Bearer {}", placeholder().as_str()).as_str()
+        );
+        assert!(
+            headers["authorization"]
+                .to_str()
+                .unwrap()
+                .starts_with("Bearer CENTAUR_PR_OAUTH_U90210001_")
+        );
         assert_ne!(
             headers["authorization"],
             GITHUB_TOKEN_PLACEHOLDER_AUTHORIZATION
@@ -4369,6 +4401,7 @@ AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
             &reqwest::Client::new(),
             &base,
             &github_pull_requests_path("acme", "widgets").unwrap(),
+            &placeholder(),
             &json!({"title": "Fix"}),
         )
         .await
@@ -4382,6 +4415,15 @@ AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
             head.lines().next().unwrap(),
             "POST //repos/acme/widgets/pulls HTTP/1.1",
             "{head}"
+        );
+        // And the bearer is the identity-bound placeholder, nothing else.
+        let authorization = head
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+            .unwrap();
+        assert_eq!(
+            authorization.split_once(':').unwrap().1.trim(),
+            format!("Bearer {}", placeholder().as_str())
         );
     }
 
@@ -4429,6 +4471,7 @@ AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
         let result = send_github_pull_request(
             &client,
             &github_pull_requests_path("acme", "widgets").unwrap(),
+            &placeholder(),
             &json!({"title": "Fix"}),
         )
         .await;
@@ -4481,7 +4524,13 @@ AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
             ("acme", "wïdgets"),
         ] {
             let error = backend
-                .create_github_pull_request_through_proxy(&id, owner, repo, &json!({}))
+                .create_github_pull_request_through_proxy(
+                    &id,
+                    owner,
+                    repo,
+                    &placeholder(),
+                    &json!({}),
+                )
                 .await
                 .unwrap_err();
             // InvalidSpec, not a Kubernetes or network error: validation ran
@@ -4501,6 +4550,7 @@ AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
                 &SandboxId::new("asbx-test"),
                 "acme",
                 "widgets",
+                &placeholder(),
                 &json!({}),
             )
             .await
@@ -4745,6 +4795,7 @@ AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
                 &SandboxId::new("asbx-gone"),
                 "acme",
                 "widgets",
+                &placeholder(),
                 &json!({}),
             )
             .await

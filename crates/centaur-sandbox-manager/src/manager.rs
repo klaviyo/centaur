@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use centaur_sandbox_core::{
-    ObservedSandbox, ProxyHttpsResponse, SandboxBackend, SandboxHandle, SandboxId, SandboxIo,
-    SandboxResult, SandboxSpec, SandboxStatus,
+    ObservedSandbox, PrOauthPlaceholder, ProxyHttpsResponse, SandboxBackend, SandboxHandle,
+    SandboxId, SandboxIo, SandboxResult, SandboxSpec, SandboxStatus,
 };
 use centaur_telemetry::{record_sandbox_operation, record_sandbox_startup_duration};
 use tokio::time::Instant;
@@ -230,10 +230,11 @@ impl SandboxManager {
         id: &SandboxId,
         owner: &str,
         repo: &str,
+        placeholder: &PrOauthPlaceholder,
         payload: serde_json::Value,
     ) -> SandboxResult<ProxyHttpsResponse> {
         self.backend
-            .create_github_pull_request(id, owner, repo, payload)
+            .create_github_pull_request(id, owner, repo, placeholder, payload)
             .await
     }
 
@@ -267,7 +268,7 @@ mod tests {
 
     use super::*;
 
-    type PullRequestCall = (String, String, String, serde_json::Value);
+    type PullRequestCall = (String, String, String, String, serde_json::Value);
 
     #[derive(Default)]
     struct Backend {
@@ -308,12 +309,14 @@ mod tests {
             id: &SandboxId,
             owner: &str,
             repo: &str,
+            placeholder: &PrOauthPlaceholder,
             payload: serde_json::Value,
         ) -> SandboxResult<ProxyHttpsResponse> {
             self.calls.lock().unwrap().push((
                 id.as_str().to_owned(),
                 owner.to_owned(),
                 repo.to_owned(),
+                placeholder.as_str().to_owned(),
                 payload,
             ));
             Ok(ProxyHttpsResponse {
@@ -328,11 +331,13 @@ mod tests {
         let backend = Arc::new(Backend::default());
         let manager = SandboxManager::new(backend.clone());
 
+        let placeholder = PrOauthPlaceholder::derive("90210001", Some("prn_a")).unwrap();
         let response = manager
             .create_github_pull_request(
                 &SandboxId::new("sbx-1"),
                 "acme",
                 "widgets",
+                &placeholder,
                 json!({"title": "Fix"}),
             )
             .await
@@ -345,6 +350,7 @@ mod tests {
                 "sbx-1".to_owned(),
                 "acme".to_owned(),
                 "widgets".to_owned(),
+                placeholder.as_str().to_owned(),
                 json!({"title": "Fix"})
             )]
         );

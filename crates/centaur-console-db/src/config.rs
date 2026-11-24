@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use active_record_encryption::ActiveRecordEncryption;
+use centaur_sandbox_core::PrOauthPlaceholder;
 use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 
@@ -84,8 +85,8 @@ pub async fn build_config(
 /// including `oauth_token`, `aws_auth`, `gcp_*` and `hmac` transforms that
 /// could overwrite `Authorization`. The guard is therefore the last writer of
 /// `Authorization` for `POST api.github.com //repos/*/*/pulls` (see
-/// [`PR_CREATE_GUARD_PATH`]): it replaces the
-/// placeholder [`PR_OAUTH_PLACEHOLDER`] and is `require: true`, so the proxy
+/// [`PR_CREATE_GUARD_PATH`]): it replaces an identity-bound placeholder (see
+/// below) and is `require: true`, so the proxy
 /// refuses the request outright if an earlier secret or transform has already
 /// written that header. (Placed in `secrets` instead, a later transform would
 /// overwrite it and the guard would fail open.) Callers must append nothing
@@ -95,6 +96,14 @@ pub async fn build_config(
 /// in force at that moment: if the credential has since become a personal
 /// access token, or something injects or rewrites `Authorization`, the call
 /// fails closed instead of going out under another token.
+///
+/// The placeholder is bound to the attested GitHub account and to the
+/// requester this proxy is bound to (`PrOauthPlaceholder::derive`, which
+/// api-rs calls with the claims it validated). A rebind to another requester,
+/// or a change of the account behind the token, between api-rs's checks and
+/// its POST makes the guard expect a different string, so the proxy refuses the
+/// call before it reaches GitHub. When nothing is attested the placeholder is
+/// the fixed unattested one.
 ///
 /// The guard is in every configuration, not only attested ones, because a
 /// guard that exists only while OAuth is attested could vanish in the very
@@ -109,11 +118,6 @@ pub async fn build_config_with_github_user_id(
 ) -> Result<(Config, Option<String>)> {
     build(pool, values, subject, requester_id, true).await
 }
-
-/// The placeholder api-rs's pull-request create call sends as its bearer
-/// token, replaced by the proxy only with the attested OAuth credential's
-/// token and only on that one operation.
-pub const PR_OAUTH_PLACEHOLDER: &str = "CENTAUR_PR_OAUTH";
 
 /// The path the guard rule matches: `//repos/*/*/pulls`, with a literal
 /// leading double slash. api-rs's one create call sends to exactly that path,
@@ -190,17 +194,26 @@ async fn build(
     }
     append_postgres(subject, &credentials, values, &mut config)?;
     if pr_oauth_guard {
-        // The attested credential's own delivered source, or, when none is
-        // attested, a sentinel that is not a credential.
-        let source = match attested {
-            Some((credential, _)) => source_value(&credential.sources[0], values)?,
-            None => None,
-        }
-        .unwrap_or_else(|| UNATTESTED_OAUTH_SOURCE.clone());
+        // The attested credential's own delivered source and a placeholder bound
+        // to its account and the requester this proxy is bound to; or, when
+        // none is attested, a sentinel that is not a credential and the
+        // matching placeholder nothing real sends.
+        let (source, placeholder) = match attested {
+            Some((credential, account)) => (
+                source_value(&credential.sources[0], values)?,
+                PrOauthPlaceholder::derive(
+                    account,
+                    requester_id.map(|id| oid("prn", id)).as_deref(),
+                )
+                .map_err(|error| Error::InvalidData(error.to_string()))?,
+            ),
+            None => (None, PrOauthPlaceholder::unattested()),
+        };
+        let source = source.unwrap_or_else(|| UNATTESTED_OAUTH_SOURCE.clone());
         let guard = json!({
             "source": source,
             "replace": {
-                "proxy_value": PR_OAUTH_PLACEHOLDER,
+                "proxy_value": placeholder.as_str(),
                 "match_headers": ["Authorization"],
                 "require": true,
             },

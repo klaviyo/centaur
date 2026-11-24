@@ -965,18 +965,27 @@ impl SessionRuntime {
     /// proxy (see [`SandboxBackend::create_github_pull_request`]), so GitHub
     /// authors it as the human that proxy is bound to. The caller must have
     /// established that the sandbox belongs to the session it acts for, and
-    /// must verify the response before trusting it.
+    /// must verify the response before trusting it. `placeholder` binds the
+    /// call to the identity the caller validated (see
+    /// [`centaur_sandbox_core::PrOauthPlaceholder`]).
     pub async fn create_github_pull_request(
         &self,
         sandbox_id: &str,
         owner: &str,
         repo: &str,
+        placeholder: &centaur_sandbox_core::PrOauthPlaceholder,
         payload: Value,
     ) -> Result<centaur_sandbox_core::ProxyHttpsResponse, SessionRuntimeError> {
         Ok(self
             .sandbox_runtime
             .manager
-            .create_github_pull_request(&SandboxId::new(sandbox_id), owner, repo, payload)
+            .create_github_pull_request(
+                &SandboxId::new(sandbox_id),
+                owner,
+                repo,
+                placeholder,
+                payload,
+            )
             .await?)
     }
 

@@ -528,7 +528,7 @@ fn secret_hosts(body: &Value) -> Vec<String> {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|secret| secret["replace"]["proxy_value"] != "CENTAUR_PR_OAUTH")
+        .filter(|secret| !is_pr_oauth_placeholder(&secret["replace"]["proxy_value"]))
         .map(|secret| secret["rules"][0]["host"].as_str().unwrap_or("").to_owned())
         .collect()
 }
@@ -1092,6 +1092,13 @@ async fn api_jwt_names_the_requester_the_proxy_is_bound_to() {
     );
 }
 
+/// Whether a `proxy_value` is one of the PR-create guard's placeholders.
+fn is_pr_oauth_placeholder(value: &Value) -> bool {
+    value
+        .as_str()
+        .is_some_and(|value| value.starts_with("CENTAUR_PR_OAUTH"))
+}
+
 /// Whether `transform` is a `secrets` transform holding the PR-create guard.
 fn is_guard_transform(transform: &Value) -> bool {
     transform["name"] == "secrets"
@@ -1100,7 +1107,7 @@ fn is_guard_transform(transform: &Value) -> bool {
             .is_some_and(|secrets| {
                 secrets
                     .iter()
-                    .any(|secret| secret["replace"]["proxy_value"] == "CENTAUR_PR_OAUTH")
+                    .any(|secret| is_pr_oauth_placeholder(&secret["replace"]["proxy_value"]))
             })
 }
 
@@ -1116,7 +1123,7 @@ fn pr_oauth_secrets(body: &Value) -> Vec<Value> {
         .flat_map(|transform| transform["config"]["secrets"].as_array().unwrap().iter());
     in_secrets
         .chain(in_transforms)
-        .filter(|secret| secret["replace"]["proxy_value"] == "CENTAUR_PR_OAUTH")
+        .filter(|secret| is_pr_oauth_placeholder(&secret["replace"]["proxy_value"]))
         .cloned()
         .collect()
 }
@@ -1135,7 +1142,7 @@ fn assert_guard(body: &Value, source: Option<&Value>) {
             .as_array()
             .unwrap()
             .iter()
-            .all(|secret| secret["replace"]["proxy_value"] != "CENTAUR_PR_OAUTH"),
+            .all(|secret| !is_pr_oauth_placeholder(&secret["replace"]["proxy_value"])),
         "the guard must not be in `secrets`"
     );
     let last = body["transforms"].as_array().unwrap().last().unwrap();
@@ -1143,9 +1150,18 @@ fn assert_guard(body: &Value, source: Option<&Value>) {
         last,
         &json!({"name": "secrets", "config": {"secrets": [guards[0].clone()]}})
     );
+    // Attested: bound to the account (and the requester, `NONE` here, as
+    // these proxies have none). Unattested: the fixed placeholder. Either
+    // way placeholder-safe and never matching `GITHUB_TOKEN`.
+    let placeholder = guards[0]["replace"]["proxy_value"].as_str().unwrap();
+    match source {
+        Some(_) => assert_eq!(placeholder, "CENTAUR_PR_OAUTH_U90210001_NONE"),
+        None => assert_eq!(placeholder, "CENTAUR_PR_OAUTH_UNATTESTED"),
+    }
+    assert!(!placeholder.contains("GITHUB_TOKEN"));
     assert_eq!(
         guards[0]["replace"],
-        json!({"proxy_value": "CENTAUR_PR_OAUTH", "match_headers": ["Authorization"], "require": true})
+        json!({"proxy_value": placeholder, "match_headers": ["Authorization"], "require": true})
     );
     assert_eq!(
         guards[0]["rules"],
