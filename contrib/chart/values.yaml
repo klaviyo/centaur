@@ -659,6 +659,12 @@ apiRs:
   # metadata. Empty falls back to slackbotv2.mcpPublicUrl.
   mcpPublicUrl: ""
   runMigrations: true
+  # Enables trusted pull request creation (POST /api/session/{thread_key}/
+  # pull-requests). Turn it on only after every proxy-sync and githubbot
+  # replica runs a version with the PR-create guard and the coded-miss rules,
+  # and turn it off (letting in-flight creates drain) before rolling any of
+  # them back.
+  trustedPrCreateEnabled: false
   # Controls whether a missing automatically derived session principal may be
   # created. "preapproved" admits only principals already present in the
   # Console; missing requester principals are omitted rather than created.

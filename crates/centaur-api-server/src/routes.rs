@@ -75,6 +75,9 @@ pub struct AppState {
     auth: ApiAuthConfig,
     /// Console's database, read for API client authentication.
     console_db: Option<PgPool>,
+    /// Whether `POST /api/session/{thread_key}/pull-requests` is enabled.
+    /// Off by default (see `--trusted-pr-create-enabled`).
+    trusted_pr_create: bool,
 }
 
 #[derive(Clone)]
@@ -91,7 +94,18 @@ impl AppState {
             metrics: prometheus_handle().expect("failed to initialize Prometheus metrics recorder"),
             auth,
             console_db: None,
+            trusted_pr_create: false,
         }
+    }
+
+    /// Turns trusted pull-request creation on or off. Off by default.
+    pub fn with_trusted_pr_create(mut self, enabled: bool) -> Self {
+        self.trusted_pr_create = enabled;
+        self
+    }
+
+    pub(crate) fn trusted_pr_create_enabled(&self) -> bool {
+        self.trusted_pr_create
     }
 
     /// Enables API clients, which Console stores in its database.

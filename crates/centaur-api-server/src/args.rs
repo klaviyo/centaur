@@ -764,6 +764,16 @@ pub(crate) struct ServerArgs {
     pub(crate) bind_addr: SocketAddr,
     #[arg(long, env = "RUN_MIGRATIONS", default_value_t = false)]
     pub(crate) run_migrations: bool,
+    /// Enables `POST /api/session/{thread_key}/pull-requests`, which opens a
+    /// pull request as the session's requesting human and binds it to the
+    /// session. Off, that route answers 501 `pull_requests_unsupported` and the
+    /// SDK falls back to the ordinary flow.
+    ///
+    /// Turn it on only after every proxy-sync and githubbot replica runs a
+    /// version with the PR-create guard and the coded-miss rules. Turn it off,
+    /// and let in-flight creates drain, before rolling any of them back.
+    #[arg(long, env = "TRUSTED_PR_CREATE_ENABLED", default_value_t = false)]
+    pub(crate) trusted_pr_create_enabled: bool,
     /// Keyword search backend that migrations install: `paradedb` (requires
     /// the pg_search extension) or `postgres` (built-in full-text search). A
     /// database keeps the backend it was first migrated with.
@@ -2777,6 +2787,41 @@ mod tests {
                 what: "unsupported transform".to_owned(),
             })
         ));
+    }
+
+    #[test]
+    fn trusted_pr_create_is_off_unless_enabled() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "centaur-api-server",
+                "--database-url",
+                "postgres://postgres:postgres@localhost/centaur",
+            ];
+            argv.extend_from_slice(extra);
+            Args::try_parse_from(argv).unwrap()
+        };
+        {
+            let _unset = EnvGuard::set(&[]);
+            // SAFETY: ENV_LOCK is held, so no other test touches the env.
+            unsafe { env::remove_var("TRUSTED_PR_CREATE_ENABLED") };
+            assert!(!parse(&[]).server.trusted_pr_create_enabled);
+            assert!(
+                parse(&["--trusted-pr-create-enabled"])
+                    .server
+                    .trusted_pr_create_enabled
+            );
+        }
+        {
+            let _env = EnvGuard::set(&[("TRUSTED_PR_CREATE_ENABLED", "true")]);
+            assert!(parse(&[]).server.trusted_pr_create_enabled);
+        }
+        {
+            let _env = EnvGuard::set(&[("TRUSTED_PR_CREATE_ENABLED", "false")]);
+            assert!(!parse(&[]).server.trusted_pr_create_enabled);
+        }
     }
 
     #[test]

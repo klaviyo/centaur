@@ -245,6 +245,15 @@ where
     B: FnOnce() -> BFut,
     BFut: Future<Output = ()>,
 {
+    // Off, nothing below runs: no session read, no lock and no sandbox call.
+    // The SDK treats this code as "use the ordinary flow".
+    if !state.trusted_pr_create_enabled() {
+        return Err(ApiError::coded(
+            StatusCode::NOT_IMPLEMENTED,
+            "pull_requests_unsupported",
+            "trusted pull request creation is not enabled in this deployment",
+        ));
+    }
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
     let request = request.validate()?;
     let runtime = state.runtime()?;
@@ -1271,8 +1280,11 @@ mod tests {
                 Registrar,
             );
             let auth = ApiAuthConfig::testing_with_ingresses("test-secret");
+            // Trusted creation is off in a real deployment unless enabled; the
+            // harness enables it so the create routes can be exercised.
             let state =
-                AppState::ready_with_pool(runtime, None, Some(store.pool().clone()), auth.clone());
+                AppState::ready_with_pool(runtime, None, Some(store.pool().clone()), auth.clone())
+                    .with_trusted_pr_create(true);
             let router = build_router_with_app_state(state.clone());
             Some(Self {
                 store,
@@ -3002,6 +3014,77 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
         assert_eq!(body["code"], "pr_binding_not_found", "{body}");
         assert_eq!(body["ok"], false, "{body}");
+    }
+
+    #[tokio::test]
+    async fn trusted_creation_is_off_by_default_and_answers_unsupported() {
+        use std::time::Duration;
+
+        // Exclusive, so this test may hold the PR-create lock without holding
+        // up another test's create.
+        let Some(h) = Harness::exclusive().await else {
+            return;
+        };
+        // The deployment default: the setting off, on the same runtime.
+        assert!(!AppState::unready(h.auth.clone()).trusted_pr_create_enabled());
+        let off = build_router_with_app_state(h.state.clone().with_trusted_pr_create(false));
+        let sandbox = h.sandbox_id("off");
+        let thread_key = h.session("C0TEST", &sandbox).await;
+        h.backend.respond(
+            201,
+            h.github_pull_request(7, AUTHOR_ID, "User", &h.repository()),
+        );
+
+        // Both locks a create would take are held elsewhere, so a create that
+        // reached either would wait instead of answering.
+        let _thread_lock = h.store.lock_proxy_binding(&thread_key).await.unwrap();
+        let _create_lock = h.store.lock_pr_create_exclusive().await.unwrap();
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "/api/session/{}/pull-requests",
+                urlencoding::encode(thread_key.as_str())
+            ))
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", h.token(&sandbox)),
+            )
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(h.create_body().to_string()))
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(3), off.clone().oneshot(request))
+            .await
+            .expect("a disabled create waited on a lock")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "pull_requests_unsupported", "{body}");
+        assert_eq!(
+            body["error"],
+            "trusted pull request creation is not enabled in this deployment"
+        );
+
+        // Nothing happened: no sandbox call, no binding.
+        assert!(h.backend.calls().is_empty());
+        assert_eq!(h.store.pr_binding(&h.repository(), 7).await.unwrap(), None);
+
+        // The binding routes are unaffected: a lookup still answers, as a
+        // coded miss.
+        let response = off
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/pr-bindings/{}/7", h.repository()))
+                    .header(header::AUTHORIZATION, format!("Bearer {GITHUBBOT_KEY}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_binding_miss(status, &serde_json::from_slice(&body).unwrap());
     }
 
     #[tokio::test]
