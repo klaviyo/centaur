@@ -16,7 +16,7 @@ use crate::{PgSessionStore, SessionStoreError, parse_persisted};
 
 const BINDING_COLUMNS: &str = "repository, number, thread_key, pr_id, pr_node_id, \
      author_github_id, author_login, sandbox_id, head_ref, base_ref, head_sha, \
-     managed, closed, created_at, updated_at";
+     managed, closed, github_updated_at, created_at, updated_at";
 
 /// A binding as api-rs verified it from GitHub's create response.
 ///
@@ -58,6 +58,9 @@ pub struct PrBinding {
     pub head_sha: String,
     pub managed: bool,
     pub closed: bool,
+    /// The fetched PR's `updated_at` behind the latest applied state write.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub github_updated_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -75,6 +78,16 @@ pub struct PrBindingStateUpdate {
     pub closed: Option<bool>,
     #[serde(default)]
     pub head_sha: Option<String>,
+}
+
+/// The result of [`PgSessionStore::update_pr_binding_state`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrBindingStateOutcome {
+    /// The binding after the call: the updated row, or the unchanged one when
+    /// the write was older than what the binding already reflects.
+    pub binding: PrBinding,
+    /// Whether the write was applied.
+    pub applied: bool,
 }
 
 /// Lowercases and validates `owner/repo`, the shape the table's check
@@ -197,15 +210,26 @@ impl PgSessionStore {
         .transpose()
     }
 
-    /// Applies `update` to an existing binding and returns it. Fails with
+    /// Applies `update` to an existing binding. Fails with
     /// [`SessionStoreError::PrBindingNotFound`] when none exists: state
     /// updates never create or rebind a row.
+    ///
+    /// `observed_updated_at` is the `updated_at` of the PR as fetched from
+    /// GitHub when the caller formed this write. A write is applied only when
+    /// the binding has no observation yet or its latest one is not later, and
+    /// then records this one; an older write changes nothing and reports
+    /// `applied: false`. Webhook handlers run concurrently and arrive out of
+    /// order, so this is what makes close, reopen, assignment and head writes
+    /// converge on the newest fetch. `None` writes unconditionally and leaves
+    /// the stored observation alone; only server-side callers that did not
+    /// fetch the PR use it.
     pub async fn update_pr_binding_state(
         &self,
         repository: &str,
         number: i64,
         update: &PrBindingStateUpdate,
-    ) -> Result<PrBinding, SessionStoreError> {
+        observed_updated_at: Option<OffsetDateTime>,
+    ) -> Result<PrBindingStateOutcome, SessionStoreError> {
         let repository = normalize_pr_repository(repository)?;
         validate_number(number)?;
         if update
@@ -217,14 +241,18 @@ impl PgSessionStore {
                 "head_sha must not be empty".to_owned(),
             ));
         }
-        sqlx::query_as::<_, PrBindingRow>(&format!(
+        let updated = sqlx::query_as::<_, PrBindingRow>(&format!(
             r#"
             update pr_session_bindings
             set managed = coalesce($3, managed),
                 closed = coalesce($4, closed),
                 head_sha = coalesce($5, head_sha),
+                github_updated_at = coalesce($6, github_updated_at),
                 updated_at = now()
             where repository = $1 and number = $2
+              and ($6::timestamptz is null
+                   or github_updated_at is null
+                   or github_updated_at <= $6)
             returning {BINDING_COLUMNS}
             "#
         ))
@@ -233,11 +261,67 @@ impl PgSessionStore {
         .bind(update.managed)
         .bind(update.closed)
         .bind(update.head_sha.as_deref())
+        .bind(observed_updated_at)
         .fetch_optional(&self.pool)
-        .await?
-        .map(TryInto::try_into)
-        .transpose()?
-        .ok_or(SessionStoreError::PrBindingNotFound { repository, number })
+        .await?;
+        if let Some(row) = updated {
+            return Ok(PrBindingStateOutcome {
+                binding: row.try_into()?,
+                applied: true,
+            });
+        }
+        match self.pr_binding(&repository, number).await? {
+            Some(binding) => Ok(PrBindingStateOutcome {
+                binding,
+                applied: false,
+            }),
+            None => Err(SessionStoreError::PrBindingNotFound { repository, number }),
+        }
+    }
+
+    /// Claims the failed-CI notice for the PR `pr_node_id` at `head_sha`, for
+    /// the bound thread `thread_key`. Returns `true` for exactly one caller per
+    /// `(pr_node_id, head_sha)`; everyone else gets `false` and must not post.
+    /// Release the claim if the post fails, so a later event can retry.
+    pub async fn claim_pr_ci_notice(
+        &self,
+        pr_node_id: &str,
+        head_sha: &str,
+        thread_key: &ThreadKey,
+    ) -> Result<bool, SessionStoreError> {
+        let result = sqlx::query(
+            r#"
+            insert into pr_ci_notices (pr_node_id, head_sha, thread_key)
+            values ($1, $2, $3)
+            on conflict (pr_node_id, head_sha) do nothing
+            "#,
+        )
+        .bind(pr_node_id)
+        .bind(head_sha)
+        .bind(thread_key.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|error| match database_error_code(&error).as_deref() {
+            Some("23503") => SessionStoreError::NotFound {
+                thread_key: thread_key.as_str().to_owned(),
+            },
+            _ => error.into(),
+        })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Releases a claim from [`Self::claim_pr_ci_notice`] whose post failed.
+    pub async fn release_pr_ci_notice(
+        &self,
+        pr_node_id: &str,
+        head_sha: &str,
+    ) -> Result<(), SessionStoreError> {
+        sqlx::query("delete from pr_ci_notices where pr_node_id = $1 and head_sha = $2")
+            .bind(pr_node_id)
+            .bind(head_sha)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// The thread key of the one session assigned `sandbox_id`, or `None` when
@@ -282,6 +366,7 @@ struct PrBindingRow {
     head_sha: String,
     managed: bool,
     closed: bool,
+    github_updated_at: Option<OffsetDateTime>,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
 }
@@ -304,6 +389,7 @@ impl TryFrom<PrBindingRow> for PrBinding {
             head_sha: row.head_sha,
             managed: row.managed,
             closed: row.closed,
+            github_updated_at: row.github_updated_at,
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
@@ -508,9 +594,11 @@ mod tests {
                     head_sha: Some("def4567890".to_owned()),
                     ..Default::default()
                 },
+                None,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .binding;
         assert!(managed.managed);
         assert!(!managed.closed);
         assert_eq!(managed.head_sha, "def4567890");
@@ -525,16 +613,23 @@ mod tests {
                     managed: Some(false),
                     ..Default::default()
                 },
+                None,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .binding;
         assert!(closed.closed);
         assert!(!closed.managed);
         assert_eq!(closed.head_sha, "def4567890");
 
         assert!(matches!(
             store
-                .update_pr_binding_state(&new.repository, 99, &PrBindingStateUpdate::default())
+                .update_pr_binding_state(
+                    &new.repository,
+                    99,
+                    &PrBindingStateUpdate::default(),
+                    None
+                )
                 .await,
             Err(SessionStoreError::PrBindingNotFound { .. })
         ));
@@ -547,9 +642,166 @@ mod tests {
                         head_sha: Some(" ".to_owned()),
                         ..Default::default()
                     },
+                    None,
                 )
                 .await,
             Err(SessionStoreError::InvalidPrBinding(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn reordered_state_writes_converge_on_the_newest_observation() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key = session(&store).await;
+        let new = new_binding(&thread_key);
+        store.insert_pr_binding(&new).await.unwrap();
+        let at = |seconds: i64| {
+            Some(OffsetDateTime::from_unix_timestamp(1_800_000_000 + seconds).unwrap())
+        };
+        let write = |update: PrBindingStateUpdate, observed| {
+            let store = store.clone();
+            let (repository, number) = (new.repository.clone(), new.number);
+            async move {
+                store
+                    .update_pr_binding_state(&repository, number, &update, observed)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // The reopen (observed later) is handled before the close it follows.
+        let reopen = PrBindingStateUpdate {
+            closed: Some(false),
+            ..Default::default()
+        };
+        let close = PrBindingStateUpdate {
+            closed: Some(true),
+            ..Default::default()
+        };
+        let outcome = write(close.clone(), at(10)).await;
+        assert!(outcome.applied && outcome.binding.closed);
+        let outcome = write(reopen.clone(), at(30)).await;
+        assert!(outcome.applied && !outcome.binding.closed);
+        // The older close arrives last and changes nothing.
+        let outcome = write(close.clone(), at(10)).await;
+        assert!(!outcome.applied);
+        assert!(!outcome.binding.closed);
+        assert_eq!(outcome.binding.github_updated_at, at(30));
+        // Nor does an older head or assignment write.
+        let outcome = write(
+            PrBindingStateUpdate {
+                managed: Some(true),
+                head_sha: Some("old0000".to_owned()),
+                ..Default::default()
+            },
+            at(20),
+        )
+        .await;
+        assert!(!outcome.applied);
+        assert!(!outcome.binding.managed);
+        assert_eq!(outcome.binding.head_sha, "abc1234567");
+        // The same observation, or a newer one, applies.
+        assert!(write(close, at(30)).await.applied);
+        let outcome = write(
+            PrBindingStateUpdate {
+                managed: Some(true),
+                ..Default::default()
+            },
+            at(40),
+        )
+        .await;
+        assert!(outcome.applied && outcome.binding.managed);
+        assert_eq!(outcome.binding.github_updated_at, at(40));
+        // An unobserved server-side write applies and keeps the observation.
+        let outcome = write(reopen, None).await;
+        assert!(outcome.applied && !outcome.binding.closed);
+        assert_eq!(outcome.binding.github_updated_at, at(40));
+    }
+
+    #[tokio::test]
+    async fn the_first_observation_applies_whatever_its_time() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key = session(&store).await;
+        let new = new_binding(&thread_key);
+        store.insert_pr_binding(&new).await.unwrap();
+        assert_eq!(
+            store
+                .pr_binding(&new.repository, 7)
+                .await
+                .unwrap()
+                .unwrap()
+                .github_updated_at,
+            None
+        );
+        let outcome = store
+            .update_pr_binding_state(
+                &new.repository,
+                7,
+                &PrBindingStateUpdate {
+                    managed: Some(true),
+                    ..Default::default()
+                },
+                Some(OffsetDateTime::from_unix_timestamp(1).unwrap()),
+            )
+            .await
+            .unwrap();
+        assert!(outcome.applied);
+    }
+
+    #[tokio::test]
+    async fn a_ci_notice_is_claimed_once_per_pr_and_head_until_released() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key = session(&store).await;
+        let node = format!("PR_{}", Uuid::new_v4().simple());
+
+        assert!(
+            store
+                .claim_pr_ci_notice(&node, "abc", &thread_key)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .claim_pr_ci_notice(&node, "abc", &thread_key)
+                .await
+                .unwrap()
+        );
+        // Another head, and another PR at the same head, are separate notices.
+        assert!(
+            store
+                .claim_pr_ci_notice(&node, "def", &thread_key)
+                .await
+                .unwrap()
+        );
+        let other = format!("PR_{}", Uuid::new_v4().simple());
+        assert!(
+            store
+                .claim_pr_ci_notice(&other, "abc", &thread_key)
+                .await
+                .unwrap()
+        );
+
+        store.release_pr_ci_notice(&node, "abc").await.unwrap();
+        assert!(
+            store
+                .claim_pr_ci_notice(&node, "abc", &thread_key)
+                .await
+                .unwrap()
+        );
+        // Releasing what was never claimed is harmless.
+        store.release_pr_ci_notice("PR_never", "abc").await.unwrap();
+
+        let missing =
+            ThreadKey::parse(format!("slack:T0TEST:C0TEST:{}.1", Uuid::new_v4().simple())).unwrap();
+        assert!(matches!(
+            store.claim_pr_ci_notice(&node, "zzz", &missing).await,
+            Err(SessionStoreError::NotFound { .. })
         ));
     }
 

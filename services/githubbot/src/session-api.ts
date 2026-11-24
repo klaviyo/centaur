@@ -695,17 +695,29 @@ export async function getPrBinding(
   return parsePrBinding(await response.json());
 }
 
+/**
+ * Record lifecycle state. api-rs applies a write only if it is not older than
+ * the last one; an unapplied write (`applied: false`) is not an error.
+ */
 export async function updatePrBindingState(
   options: GithubbotOptions,
   ref: PrBindingRef,
   update: PrBindingStateUpdate,
-): Promise<PrBinding> {
-  return parsePrBinding(
-    await postPrBinding(options, ref, "state", update, "update pr binding state"),
-  );
+): Promise<{ applied: boolean; binding: PrBinding }> {
+  const payload = await postPrBinding(options, ref, "state", update, "update pr binding state");
+  // Accept the binding flat with `applied` beside it, or `{binding, applied}`.
+  const binding =
+    isJsonObject(payload) && isJsonObject(payload.binding) ? payload.binding : payload;
+  return {
+    applied: !isJsonObject(payload) || payload.applied !== false,
+    binding: parsePrBinding(binding),
+  };
 }
 
-/** Report a failed check; api-rs revalidates and queues at most one notice per head. */
+/**
+ * Report a failed check. api-rs revalidates and posts the Slack notice inside
+ * this request, at most once per head; a failed post is an HTTP 502 and throws.
+ */
 export async function reportPrCiFailure(
   options: GithubbotOptions,
   ref: PrBindingRef,
@@ -719,7 +731,7 @@ export async function reportPrCiFailure(
     "report pr ci failure",
   );
   const notice = isJsonObject(payload) ? payload.notice : undefined;
-  if (notice === "queued" || notice === "duplicate") return { notice };
+  if (notice === "posted" || notice === "duplicate") return { notice };
   if (notice === "skipped") {
     return {
       notice,
@@ -747,10 +759,17 @@ async function postPrBinding(
 }
 
 function parsePrBinding(payload: unknown): PrBinding {
+  const nonEmpty = (value: unknown) => typeof value === "string" && value.length > 0;
   if (
     !isJsonObject(payload) ||
-    typeof payload.thread_key !== "string" ||
-    typeof payload.pr_node_id !== "string" ||
+    typeof payload.repository !== "string" ||
+    !/^[^/\s]+\/[^/\s]+$/.test(payload.repository) ||
+    typeof payload.number !== "number" ||
+    !Number.isInteger(payload.number) ||
+    payload.number <= 0 ||
+    !nonEmpty(payload.head_sha) ||
+    !nonEmpty(payload.thread_key) ||
+    !nonEmpty(payload.pr_node_id) ||
     typeof payload.managed !== "boolean" ||
     typeof payload.closed !== "boolean"
   ) {

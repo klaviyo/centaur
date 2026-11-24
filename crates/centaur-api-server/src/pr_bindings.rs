@@ -1,6 +1,7 @@
 //! PR session continuity: create a pull request as the authorized human from
 //! inside a Slack session, bind it to exactly that session, and route one
-//! failed-CI notice back to the session's Slack thread.
+//! failed-CI notice back to the session's Slack thread, posted synchronously
+//! while githubbot's fresh read of the PR is still true.
 //!
 //! Trust model. A binding is established in one place only: the trusted
 //! creation route below. It accepts a call only from the sandbox's own proxy
@@ -27,11 +28,10 @@ use centaur_session_sqlx::{
     NewPrBinding, PgSessionStore, PrBinding, PrBindingStateUpdate, SessionStoreError,
     normalize_pr_repository,
 };
-use centaur_workflows::{
-    CreateWorkflowRunRequest, CreateWorkflowRunResponse, WorkflowRuntimeError,
-};
+use centaur_workflows::{WorkflowRuntimeError, send_slack_request};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 
 use crate::{
     ApiError,
@@ -39,24 +39,6 @@ use crate::{
     routes::{AppState, principal_subject_owns_session},
 };
 
-/// The built-in workflow that posts the failed-CI notice.
-const PR_CI_NOTICE_WORKFLOW: &str = "pr_ci_notice";
-
-/// Refuses workflows only api-rs itself may start. `pr_ci_notice` posts into
-/// whatever Slack thread a binding names, on the strength of a ci-failures
-/// report that githubbot has just verified; no external caller, whatever its
-/// class, may start it through a generic workflow route. The ci-failures
-/// route spawns it in-process and does not pass through this check.
-pub(crate) fn refuse_internal_workflow(workflow_name: &str) -> Result<(), ApiError> {
-    if workflow_name.trim() == PR_CI_NOTICE_WORKFLOW {
-        return Err(ApiError::coded(
-            StatusCode::FORBIDDEN,
-            "internal_workflow",
-            "this workflow is started only by api-rs",
-        ));
-    }
-    Ok(())
-}
 const MAX_TITLE_CHARS: usize = 256;
 const MAX_BODY_CHARS: usize = 65_536;
 const MAX_REF_CHARS: usize = 255;
@@ -441,11 +423,15 @@ pub(crate) async fn get_pr_binding(
 /// `POST /api/pr-bindings/{owner}/{repo}/{number}/state` body. `pr_node_id`
 /// names the pull request githubbot is talking about; a repository name and
 /// number can be reused by a different PR, so the update applies only to a
-/// binding for that exact PR.
+/// binding for that exact PR. `observed_updated_at` is the fetched PR's
+/// `updated_at`, which orders writes (see
+/// [`PgSessionStore::update_pr_binding_state`]).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StateUpdateRequest {
     pr_node_id: String,
+    #[serde(with = "time::serde::rfc3339")]
+    observed_updated_at: OffsetDateTime,
     #[serde(default)]
     managed: Option<bool>,
     #[serde(default)]
@@ -479,31 +465,34 @@ async fn binding_for_pr(
 }
 
 /// `POST /api/pr-bindings/{owner}/{repo}/{number}/state`: records `managed`,
-/// `closed` and `head_sha` on an existing binding for the named PR. It cannot
-/// create or rebind one.
+/// `closed` and `head_sha` on an existing binding for the named PR, unless a
+/// later observation already did (`applied: false`, nothing changed). It
+/// cannot create or rebind a binding. Returns the binding and `applied`.
 pub(crate) async fn update_pr_binding_state(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
     Json(request): Json<StateUpdateRequest>,
-) -> Result<Json<PrBinding>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let (repository, number) = pr_path(&owner, &repo, number);
     let runtime = state.runtime()?;
     let store = runtime.store();
     binding_for_pr(store, &repository, number, &request.pr_node_id).await?;
-    Ok(Json(
-        store
-            .update_pr_binding_state(
-                &repository,
-                number,
-                &PrBindingStateUpdate {
-                    managed: request.managed,
-                    closed: request.closed,
-                    head_sha: request.head_sha,
-                },
-            )
-            .await
-            .map_err(SessionRuntimeError::from)?,
-    ))
+    let outcome = store
+        .update_pr_binding_state(
+            &repository,
+            number,
+            &PrBindingStateUpdate {
+                managed: request.managed,
+                closed: request.closed,
+                head_sha: request.head_sha,
+            },
+            Some(request.observed_updated_at),
+        )
+        .await
+        .map_err(SessionRuntimeError::from)?;
+    let mut body = serde_json::to_value(&outcome.binding)?;
+    body["applied"] = json!(outcome.applied);
+    Ok(Json(body))
 }
 
 /// `POST /api/pr-bindings/{owner}/{repo}/{number}/ci-failures` body: what
@@ -513,6 +502,10 @@ pub(crate) async fn update_pr_binding_state(
 pub(crate) struct CiFailureRequest {
     /// The pull request's GraphQL node id; must be the bound PR's.
     pr_node_id: String,
+    /// The fetched PR's `updated_at`; orders the closure and unassignment this
+    /// report records against other state writes.
+    #[serde(with = "time::serde::rfc3339")]
+    observed_updated_at: OffsetDateTime,
     /// The head the failing check ran on.
     head_sha: String,
     /// The PR's head now.
@@ -558,7 +551,9 @@ fn is_usable_url(url: &str) -> bool {
     url.starts_with("https://") && url.len() <= MAX_URL_CHARS
 }
 
-/// `POST /api/pr-bindings/{owner}/{repo}/{number}/ci-failures`.
+/// `POST /api/pr-bindings/{owner}/{repo}/{number}/ci-failures`: posts the
+/// failed-CI notice to the bound Slack thread, once per `(PR, head)`, before
+/// the request returns.
 pub(crate) async fn report_pr_ci_failure(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
@@ -566,36 +561,34 @@ pub(crate) async fn report_pr_ci_failure(
 ) -> Result<Json<Value>, ApiError> {
     let (repository, number) = pr_path(&owner, &repo, number);
     let runtime = state.runtime()?;
-    let workflows = state.workflows()?;
-    process_ci_failure(
-        runtime.store(),
-        &repository,
-        number,
-        &request,
-        |run| async move { workflows.create_run(run).await },
-    )
+    process_ci_failure(runtime.store(), &repository, number, &request, |message| {
+        send_slack_request("chat.postMessage", message)
+    })
     .await
     .map(Json)
 }
 
-/// Decides whether a failed check still deserves a notice and, if so, spawns
-/// the notice workflow once per `(PR, head)`.
+/// Decides whether a failed check still deserves a notice and, if so, posts it.
 ///
-/// Nothing is spawned unless the request is for the bound PR and the PR is
-/// open, assigned, managed, not closed, and the failing head is the binding's
-/// head and the PR's fresh head. Closure and unassignment are recorded on the
-/// binding; the head never is. The workflow rechecks the binding on every
-/// attempt before it posts.
-async fn process_ci_failure<S, Fut>(
+/// Nothing is posted unless the request is for the bound PR and, in the fresh
+/// read githubbot made just before calling, the PR is open and assigned, the
+/// binding is managed and not closed, and the failing head is the binding's
+/// head and the PR's current head. Closure and unassignment are recorded on
+/// the binding (ordered by `observed_updated_at`); the head never is. The post
+/// happens here, in the same request, so the checks cannot go stale in a
+/// queue. It is claimed once per `(PR node id, head)` first; a failed post
+/// releases the claim and fails the request, so githubbot releases its own
+/// claim and a later event can try again.
+async fn process_ci_failure<P, Fut>(
     store: &PgSessionStore,
     repository: &str,
     number: i64,
     request: &CiFailureRequest,
-    spawn: S,
+    post: P,
 ) -> Result<Value, ApiError>
 where
-    S: FnOnce(CreateWorkflowRunRequest) -> Fut,
-    Fut: Future<Output = Result<CreateWorkflowRunResponse, WorkflowRuntimeError>>,
+    P: FnOnce(Value) -> Fut,
+    Fut: Future<Output = Result<Value, WorkflowRuntimeError>>,
 {
     request.validate()?;
     let binding = binding_for_pr(store, repository, number, &request.pr_node_id).await?;
@@ -631,40 +624,127 @@ where
         }
         if update != PrBindingStateUpdate::default() {
             store
-                .update_pr_binding_state(&binding.repository, binding.number, &update)
+                .update_pr_binding_state(
+                    &binding.repository,
+                    binding.number,
+                    &update,
+                    Some(request.observed_updated_at),
+                )
                 .await
                 .map_err(SessionRuntimeError::from)?;
         }
         return Ok(json!({"notice": "skipped", "reason": reason}));
     }
 
-    let run = spawn(CreateWorkflowRunRequest {
-        workflow_name: PR_CI_NOTICE_WORKFLOW.to_owned(),
-        input: json!({
-            "repository": binding.repository,
-            "number": binding.number,
-            "head_sha": request.head_sha,
-            "check_name": request.check_name,
-            "details_url": request.usable_details_url(),
-            "html_url": request.html_url,
-        }),
-        idempotency_key: Some(format!(
-            "pr-ci-notice:{}#{}:{}",
-            binding.repository, binding.number, request.head_sha
-        )),
-        harness_type: None,
-        max_attempts: None,
-    })
-    .await?;
-    Ok(json!({"notice": if run.created { "queued" } else { "duplicate" }}))
+    // Only a Slack thread outside a DM is ever a binding's destination, and
+    // the link in the notice must be the pull request itself.
+    let Some(message) = notice_message(&binding, request) else {
+        let reason = match binding.thread_key.chat_destination() {
+            Some(ChatDestination::Slack { channel_id, .. }) if !channel_id.starts_with('D') => {
+                "invalid_html_url"
+            }
+            _ => "not_slack_thread",
+        };
+        return Ok(json!({"notice": "skipped", "reason": reason}));
+    };
+
+    let claimed = store
+        .claim_pr_ci_notice(&binding.pr_node_id, &request.head_sha, &binding.thread_key)
+        .await
+        .map_err(SessionRuntimeError::from)?;
+    if !claimed {
+        return Ok(json!({"notice": "duplicate"}));
+    }
+    if let Err(error) = post(message).await {
+        tracing::warn!(
+            event = "pr_ci_notice_post_failed",
+            repository = %binding.repository,
+            number = binding.number,
+            error = %error,
+            "failed to post the CI notice"
+        );
+        store
+            .release_pr_ci_notice(&binding.pr_node_id, &request.head_sha)
+            .await
+            .map_err(SessionRuntimeError::from)?;
+        return Err(ApiError::coded(
+            StatusCode::BAD_GATEWAY,
+            "slack_post_failed",
+            "could not post the CI notice to Slack",
+        ));
+    }
+    Ok(json!({"notice": "posted"}))
+}
+
+/// The `chat.postMessage` payload for the failed-CI notice of a binding, or
+/// `None` when the notice must not be posted: the binding's thread is not a
+/// Slack thread outside a DM, or `html_url` is not the pull request's own URL
+/// (compared without regard to the case of owner and repo).
+///
+/// The channel and `thread_ts` come only from the bound thread key; the text
+/// only from the check's own fields, escaped for Slack mrkdwn.
+fn notice_message(binding: &PrBinding, request: &CiFailureRequest) -> Option<Value> {
+    let Some(ChatDestination::Slack {
+        channel_id,
+        thread_ts,
+    }) = binding.thread_key.chat_destination()
+    else {
+        return None;
+    };
+    if channel_id.starts_with('D') {
+        return None;
+    }
+    let pull_request_url = format!(
+        "https://github.com/{}/pull/{}",
+        binding.repository, binding.number
+    );
+    if !request.html_url.eq_ignore_ascii_case(&pull_request_url) {
+        return None;
+    }
+    let sha7: String = request.head_sha.chars().take(7).collect();
+    let pull_request = slack_link(
+        Some(&request.html_url),
+        &format!("{}#{}", binding.repository, binding.number),
+    );
+    let check = slack_link(request.usable_details_url(), &request.check_name);
+    Some(json!({
+        "channel": channel_id,
+        "thread_ts": thread_ts,
+        "text": format!(
+            "CI failed on {pull_request} at `{sha7}`: {check}\nReply in this thread if you'd like me to fix it."
+        ),
+        "unfurl_links": false,
+        "unfurl_media": false,
+        "client_msg_id": format!("pr-ci-notice:{}:{}", binding.pr_node_id, request.head_sha),
+    }))
+}
+
+/// `<url|label>` for an https `url`, otherwise just the escaped label. A URL
+/// that could break out of the link markup is never embedded.
+fn slack_link(url: Option<&str>, label: &str) -> String {
+    let label = escape_slack_mrkdwn(label);
+    match url {
+        Some(url)
+            if url.starts_with("https://")
+                && !url.chars().any(|c| {
+                    c.is_whitespace() || c.is_control() || matches!(c, '<' | '>' | '|')
+                }) =>
+        {
+            format!("<{url}|{label}>")
+        }
+        _ => label,
+    }
+}
+
+fn escape_slack_mrkdwn(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::BTreeSet,
-        sync::{Arc, Mutex},
-    };
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use axum::{
@@ -926,13 +1006,14 @@ mod tests {
         ) -> CiFailureRequest {
             CiFailureRequest {
                 pr_node_id: self.node_id(),
+                observed_updated_at: observed_at(0),
                 head_sha: head_sha.to_owned(),
                 current_head_sha: current_head_sha.to_owned(),
                 open,
                 assigned,
                 check_name: "unit tests".to_owned(),
                 details_url: Some("https://github.com/acme/widgets/actions/runs/1".to_owned()),
-                html_url: "https://github.com/acme/widgets/pull/7".to_owned(),
+                html_url: format!("https://github.com/{}/pull/7", self.repository()),
             }
         }
 
@@ -1505,7 +1586,9 @@ mod tests {
                 (
                     Method::POST,
                     format!("{base}/state"),
-                    Some(json!({"pr_node_id": h.node_id(), "managed": true})),
+                    Some(
+                        json!({"pr_node_id": h.node_id(), "observed_updated_at": "2026-11-20T10:00:10Z", "managed": true}),
+                    ),
                 ),
                 (
                     Method::POST,
@@ -1579,7 +1662,7 @@ mod tests {
                 Method::POST,
                 &format!("{base}/state"),
                 GITHUBBOT_KEY,
-                Some(json!({"pr_node_id": h.node_id(), "managed": true, "head_sha": "fedcba9876"})),
+                Some(json!({"pr_node_id": h.node_id(), "observed_updated_at": "2026-11-20T10:00:10Z", "managed": true, "head_sha": "fedcba9876"})),
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -1594,7 +1677,7 @@ mod tests {
                 Method::POST,
                 &format!("{base}/state"),
                 GITHUBBOT_KEY,
-                Some(json!({"pr_node_id": h.node_id(), "thread_key": "slack:T0TEST:C0TEST:1.1"})),
+                Some(json!({"pr_node_id": h.node_id(), "observed_updated_at": "2026-11-20T10:00:10Z", "thread_key": "slack:T0TEST:C0TEST:1.1"})),
             )
             .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -1605,7 +1688,7 @@ mod tests {
                 Method::POST,
                 &format!("{unbound}/state"),
                 GITHUBBOT_KEY,
-                Some(json!({"pr_node_id": h.node_id(), "managed": true})),
+                Some(json!({"pr_node_id": h.node_id(), "observed_updated_at": "2026-11-20T10:00:10Z", "managed": true})),
             )
             .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -1622,46 +1705,43 @@ mod tests {
 
     // ---- ci-failures ---------------------------------------------------------
 
-    /// Records every spawn and answers `created` once per idempotency key,
-    /// as the workflow runtime does.
+    /// A fixed observation time, `seconds` after a base.
+    fn observed_at(seconds: i64) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_800_000_000 + seconds).unwrap()
+    }
+
+    /// A Slack double: records every post, and fails the next `fail` of them.
     #[derive(Default, Clone)]
-    struct Spawns {
-        runs: Arc<Mutex<Vec<CreateWorkflowRunRequest>>>,
-        keys: Arc<Mutex<BTreeSet<String>>>,
+    struct Slack {
+        posts: Arc<Mutex<Vec<Value>>>,
+        fail: Arc<Mutex<usize>>,
     }
 
-    impl Spawns {
-        async fn spawn(
-            &self,
-            run: CreateWorkflowRunRequest,
-        ) -> Result<CreateWorkflowRunResponse, WorkflowRuntimeError> {
-            let created = self
-                .keys
-                .lock()
-                .unwrap()
-                .insert(run.idempotency_key.clone().unwrap_or_default());
-            if created {
-                self.runs.lock().unwrap().push(run);
+    impl Slack {
+        async fn post(&self, message: Value) -> Result<Value, WorkflowRuntimeError> {
+            let mut fail = self.fail.lock().unwrap();
+            if *fail > 0 {
+                *fail -= 1;
+                return Err(WorkflowRuntimeError::Upstream("Slack is down".to_owned()));
             }
-            Ok(CreateWorkflowRunResponse {
-                ok: true,
-                run_id: "run".to_owned(),
-                initial_run_id: "run".to_owned(),
-                task_id: "task".to_owned(),
-                status: "queued".to_owned(),
-                created,
-            })
+            self.posts.lock().unwrap().push(message);
+            Ok(json!({"ok": true}))
         }
 
-        fn runs(&self) -> Vec<CreateWorkflowRunRequest> {
-            self.runs.lock().unwrap().clone()
+        fn fail_next(&self, count: usize) {
+            *self.fail.lock().unwrap() = count;
+        }
+
+        fn posts(&self) -> Vec<Value> {
+            self.posts.lock().unwrap().clone()
         }
     }
 
-    /// A store with one bound PR at head `abcdef1`, managed as asked.
-    async fn bound_pr(h: &Harness, managed: bool) -> (String, PrBinding) {
+    /// A store with one bound PR at head `abcdef1` in a Slack channel,
+    /// managed as asked.
+    async fn bound_pr_in(h: &Harness, channel: &str, managed: bool) -> (String, PrBinding) {
         let sandbox = h.sandbox_id("ci");
-        let thread_key = h.session("C0TEST", &sandbox).await;
+        let thread_key = h.session(channel, &sandbox).await;
         let repository = h.repository();
         h.store
             .insert_pr_binding(&NewPrBinding {
@@ -1688,105 +1768,277 @@ mod tests {
                     managed: Some(managed),
                     ..Default::default()
                 },
+                None,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .binding;
         (repository, binding)
+    }
+
+    async fn bound_pr(h: &Harness, managed: bool) -> (String, PrBinding) {
+        bound_pr_in(h, "C0TEST", managed).await
     }
 
     async fn report(
         h: &Harness,
         repository: &str,
         request: &CiFailureRequest,
-        spawns: &Spawns,
+        slack: &Slack,
     ) -> Result<Value, ApiError> {
-        process_ci_failure(&h.store, repository, 7, request, |run| spawns.spawn(run)).await
+        process_ci_failure(&h.store, repository, 7, request, |message| {
+            slack.post(message)
+        })
+        .await
+    }
+
+    async fn set_state(h: &Harness, repository: &str, update: PrBindingStateUpdate) {
+        h.store
+            .update_pr_binding_state(repository, 7, &update, None)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
-    async fn a_failure_at_the_current_head_of_a_managed_open_pr_queues_one_notice() {
+    async fn a_failure_at_the_current_head_of_a_managed_open_pr_posts_once_to_its_thread() {
         let Some(h) = Harness::new().await else {
             return;
         };
-        let (repository, _) = bound_pr(&h, true).await;
-        let spawns = Spawns::default();
+        let (repository, binding) = bound_pr(&h, true).await;
+        let slack = Slack::default();
 
         let outcome = report(
             &h,
             &repository,
             &h.ci("abcdef1", "abcdef1", true, true),
-            &spawns,
+            &slack,
         )
         .await
         .unwrap();
 
-        assert_eq!(outcome, json!({"notice": "queued"}));
-        let runs = spawns.runs();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].workflow_name, "pr_ci_notice");
+        assert_eq!(outcome, json!({"notice": "posted"}));
+        let posts = slack.posts();
+        assert_eq!(posts.len(), 1, "{posts:?}");
+        let ChatDestination::Slack {
+            channel_id,
+            thread_ts,
+        } = binding.thread_key.chat_destination().unwrap()
+        else {
+            unreachable!()
+        };
+        // The destination is the bound thread's, and nothing else.
+        assert_eq!(posts[0]["channel"], channel_id);
+        assert_eq!(posts[0]["thread_ts"], thread_ts);
+        assert_eq!(posts[0]["unfurl_links"], false);
+        assert_eq!(posts[0]["unfurl_media"], false);
         assert_eq!(
-            runs[0].idempotency_key.as_deref(),
-            Some(format!("pr-ci-notice:{repository}#7:abcdef1").as_str())
-        );
-        assert_eq!(
-            runs[0].input,
-            json!({
-                "repository": repository,
-                "number": 7,
-                "head_sha": "abcdef1",
-                "check_name": "unit tests",
-                "details_url": "https://github.com/acme/widgets/actions/runs/1",
-                "html_url": "https://github.com/acme/widgets/pull/7",
-            })
+            posts[0]["text"],
+            format!(
+                "CI failed on <https://github.com/{repository}/pull/7|{repository}#7> at `abcdef1`: <https://github.com/acme/widgets/actions/runs/1|unit tests>\nReply in this thread if you'd like me to fix it."
+            )
         );
     }
 
     #[tokio::test]
-    async fn a_failure_report_never_moves_the_binding_head() {
+    async fn a_repeat_for_the_same_pr_and_head_is_a_duplicate_and_posts_nothing() {
         let Some(h) = Harness::new().await else {
             return;
         };
         let (repository, _) = bound_pr(&h, true).await;
-        let spawns = Spawns::default();
+        let slack = Slack::default();
+        let request = h.ci("abcdef1", "abcdef1", true, true);
 
-        // githubbot missed the synchronize event: the binding still says
-        // `abcdef1`. A report for the newer head is stale until the state
-        // route, which carries a fresh fetch, records that head.
+        let first = report(&h, &repository, &request, &slack).await.unwrap();
+        let second = report(&h, &repository, &request, &slack).await.unwrap();
+
+        assert_eq!(first, json!({"notice": "posted"}));
+        assert_eq!(second, json!({"notice": "duplicate"}));
+        assert_eq!(slack.posts().len(), 1);
+
+        // A new head, once githubbot's state update records it, is a new notice.
+        set_state(
+            &h,
+            &repository,
+            PrBindingStateUpdate {
+                head_sha: Some("fedcba9".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let newer = h.ci("fedcba9", "fedcba9", true, true);
+        assert_eq!(
+            report(&h, &repository, &newer, &slack).await.unwrap(),
+            json!({"notice": "posted"})
+        );
+        assert_eq!(slack.posts().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_post_releases_the_claim_so_a_retry_posts() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let (repository, _) = bound_pr(&h, true).await;
+        let slack = Slack::default();
+        let request = h.ci("abcdef1", "abcdef1", true, true);
+        slack.fail_next(1);
+
+        let error = report(&h, &repository, &request, &slack).await.unwrap_err();
+
+        assert!(
+            matches!(&error, ApiError::Coded { code: "slack_post_failed", status, .. } if *status == StatusCode::BAD_GATEWAY),
+            "{error:?}"
+        );
+        assert!(slack.posts().is_empty());
+        // The failure leaves nothing claimed: the next event posts.
+        assert_eq!(
+            report(&h, &repository, &request, &slack).await.unwrap(),
+            json!({"notice": "posted"})
+        );
+        assert_eq!(slack.posts().len(), 1);
+        assert_eq!(
+            report(&h, &repository, &request, &slack).await.unwrap(),
+            json!({"notice": "duplicate"})
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_is_posted_unless_open_assigned_managed_and_current() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let (repository, _) = bound_pr(&h, true).await;
+        let slack = Slack::default();
+        let binding = || async { h.store.pr_binding(&repository, 7).await.unwrap().unwrap() };
+
+        // Not open: recorded as closed.
+        let outcome = report(
+            &h,
+            &repository,
+            &h.ci("abcdef1", "abcdef1", false, true),
+            &slack,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, json!({"notice": "skipped", "reason": "not_open"}));
+        assert!(binding().await.closed);
+
+        // Closed stays skipped even if githubbot calls again as open (a
+        // reopen event has to clear it first).
+        let outcome = report(
+            &h,
+            &repository,
+            &h.ci("abcdef1", "abcdef1", true, true),
+            &slack,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, json!({"notice": "skipped", "reason": "closed"}));
+
+        // Reopened, but no longer assigned: recorded as unmanaged.
+        set_state(
+            &h,
+            &repository,
+            PrBindingStateUpdate {
+                closed: Some(false),
+                ..Default::default()
+            },
+        )
+        .await;
+        let outcome = report(
+            &h,
+            &repository,
+            &h.ci("abcdef1", "abcdef1", true, false),
+            &slack,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            json!({"notice": "skipped", "reason": "not_assigned"})
+        );
+        assert!(!binding().await.managed);
+
+        // Assigned in the fresh fetch, but the binding never recorded the
+        // bot's explicit assignment.
+        let outcome = report(
+            &h,
+            &repository,
+            &h.ci("abcdef1", "abcdef1", true, true),
+            &slack,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            json!({"notice": "skipped", "reason": "not_managed"})
+        );
+
+        // Managed again, but the failing head is stale, in each way it can be.
+        set_state(
+            &h,
+            &repository,
+            PrBindingStateUpdate {
+                managed: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
         for request in [
-            h.ci("fedcba9", "fedcba9", true, true),
             h.ci("abcdef1", "fedcba9", true, true),
+            h.ci("fedcba9", "fedcba9", true, true),
             h.ci("fedcba9", "abcdef1", true, true),
         ] {
-            let outcome = report(&h, &repository, &request, &spawns).await.unwrap();
+            let outcome = report(&h, &repository, &request, &slack).await.unwrap();
             assert_eq!(
                 outcome,
                 json!({"notice": "skipped", "reason": "stale_head"})
             );
-            let binding = h.store.pr_binding(&repository, 7).await.unwrap().unwrap();
-            assert_eq!(binding.head_sha, "abcdef1");
+            // A report never moves the binding's head.
+            assert_eq!(binding().await.head_sha, "abcdef1");
         }
-        assert!(spawns.runs().is_empty());
 
+        assert!(slack.posts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn recorded_closure_and_unassignment_follow_the_observation_order() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let (repository, _) = bound_pr(&h, true).await;
+        let slack = Slack::default();
+        // The binding already reflects an observation at +30.
         h.store
             .update_pr_binding_state(
                 &repository,
                 7,
-                &PrBindingStateUpdate {
-                    head_sha: Some("fedcba9".to_owned()),
-                    ..Default::default()
-                },
+                &PrBindingStateUpdate::default(),
+                Some(observed_at(30)),
             )
             .await
             .unwrap();
-        let outcome = report(
-            &h,
-            &repository,
-            &h.ci("fedcba9", "fedcba9", true, true),
-            &spawns,
-        )
-        .await
-        .unwrap();
-        assert_eq!(outcome, json!({"notice": "queued"}));
+
+        // A report from an older fetch (+10) saying "closed, unassigned" is
+        // skipped but does not change the binding.
+        let old = CiFailureRequest {
+            observed_updated_at: observed_at(10),
+            ..h.ci("abcdef1", "abcdef1", false, false)
+        };
+        let outcome = report(&h, &repository, &old, &slack).await.unwrap();
+        assert_eq!(outcome, json!({"notice": "skipped", "reason": "not_open"}));
+        let binding = h.store.pr_binding(&repository, 7).await.unwrap().unwrap();
+        assert!(!binding.closed && binding.managed);
+
+        // The same report from a newer fetch is recorded.
+        let new = CiFailureRequest {
+            observed_updated_at: observed_at(40),
+            ..old
+        };
+        report(&h, &repository, &new, &slack).await.unwrap();
+        let binding = h.store.pr_binding(&repository, 7).await.unwrap().unwrap();
+        assert!(binding.closed && !binding.managed);
+        assert!(slack.posts().is_empty());
     }
 
     #[tokio::test]
@@ -1795,7 +2047,7 @@ mod tests {
             return;
         };
         let (repository, before) = bound_pr(&h, true).await;
-        let spawns = Spawns::default();
+        let slack = Slack::default();
 
         // ci-failures: a different PR node id (the number was reused).
         let request = CiFailureRequest {
@@ -1803,14 +2055,12 @@ mod tests {
             open: false,
             ..h.ci("abcdef1", "abcdef1", true, true)
         };
-        let error = report(&h, &repository, &request, &spawns)
-            .await
-            .unwrap_err();
+        let error = report(&h, &repository, &request, &slack).await.unwrap_err();
         assert!(
             matches!(&error, ApiError::Coded { code: "pr_identity_mismatch", status, .. } if *status == StatusCode::CONFLICT),
             "{error:?}"
         );
-        assert!(spawns.runs().is_empty());
+        assert!(slack.posts().is_empty());
         // Not even the closure it reported was recorded.
         assert_eq!(
             h.store.pr_binding(&repository, 7).await.unwrap().unwrap(),
@@ -1824,7 +2074,7 @@ mod tests {
                 Method::POST,
                 &format!("{base}/state"),
                 GITHUBBOT_KEY,
-                Some(json!({"pr_node_id": "PR_someone_elses", "managed": false, "closed": true, "head_sha": "ffff"})),
+                Some(json!({"pr_node_id": "PR_someone_elses", "observed_updated_at": "2026-11-20T10:00:10Z", "managed": false, "closed": true, "head_sha": "ffff"})),
             )
             .await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
@@ -1834,12 +2084,29 @@ mod tests {
             before
         );
 
-        // The node id is required on both routes.
+        // The node id and the observation time are required on both routes.
         for (suffix, body) in [
-            ("state", json!({"managed": false})),
+            (
+                "state",
+                json!({"observed_updated_at": "2026-11-20T10:00:10Z", "managed": false}),
+            ),
+            (
+                "state",
+                json!({"pr_node_id": h.node_id(), "managed": false}),
+            ),
             (
                 "ci-failures",
                 json!({
+                    "observed_updated_at": "2026-11-20T10:00:10Z",
+                    "head_sha": "abcdef1", "current_head_sha": "abcdef1", "open": true,
+                    "assigned": true, "check_name": "unit tests",
+                    "html_url": "https://github.com/acme/widgets/pull/7",
+                }),
+            ),
+            (
+                "ci-failures",
+                json!({
+                    "pr_node_id": h.node_id(),
                     "head_sha": "abcdef1", "current_head_sha": "abcdef1", "open": true,
                     "assigned": true, "check_name": "unit tests",
                     "html_url": "https://github.com/acme/widgets/pull/7",
@@ -1860,18 +2127,130 @@ mod tests {
             h.store.pr_binding(&repository, 7).await.unwrap().unwrap(),
             before
         );
+    }
 
-        // The right node id is accepted.
-        let (status, body) = h
-            .send(
-                Method::POST,
-                &format!("{base}/state"),
-                GITHUBBOT_KEY,
-                Some(json!({"pr_node_id": h.node_id(), "closed": true})),
-            )
-            .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["closed"], true);
+    #[tokio::test]
+    async fn reordered_state_writes_over_http_converge_on_the_newest_fetch() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let (repository, _) = bound_pr(&h, true).await;
+        let uri = format!("/api/pr-bindings/{repository}/7/state");
+        let write = |closed: bool, observed: &str| {
+            let body = json!({
+                "pr_node_id": h.node_id(),
+                "observed_updated_at": observed,
+                "closed": closed,
+            });
+            let uri = uri.clone();
+            let h = &h;
+            async move {
+                let (status, body) = h.send(Method::POST, &uri, GITHUBBOT_KEY, Some(body)).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                body
+            }
+        };
+
+        let body = write(true, "2026-11-20T10:00:10Z").await;
+        assert_eq!(
+            (body["applied"].clone(), body["closed"].clone()),
+            (json!(true), json!(true))
+        );
+        let body = write(false, "2026-11-20T10:00:30Z").await;
+        assert_eq!(
+            (body["applied"].clone(), body["closed"].clone()),
+            (json!(true), json!(false))
+        );
+        // The earlier close is handled last and must not win.
+        let body = write(true, "2026-11-20T10:00:10Z").await;
+        assert_eq!(
+            (body["applied"].clone(), body["closed"].clone()),
+            (json!(false), json!(false))
+        );
+        assert_eq!(body["github_updated_at"], "2026-11-20T10:00:30Z");
+        let binding = h.store.pr_binding(&repository, 7).await.unwrap().unwrap();
+        assert!(!binding.closed);
+    }
+
+    #[tokio::test]
+    async fn a_pr_rebound_with_a_new_node_id_gets_its_own_notice_and_never_the_old_ones() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let (repository, first) = bound_pr(&h, true).await;
+        let slack = Slack::default();
+        let request = h.ci("abcdef1", "abcdef1", true, true);
+        assert_eq!(
+            report(&h, &repository, &request, &slack).await.unwrap(),
+            json!({"notice": "posted"})
+        );
+
+        // The repository's PR number is reused: the old binding is deleted and
+        // a new PR with the same repository, number and head is bound to
+        // another session under a different node id.
+        sqlx::query("delete from pr_session_bindings where repository = $1 and number = 7")
+            .bind(&repository)
+            .execute(h.store.pool())
+            .await
+            .unwrap();
+        let sandbox = h.sandbox_id("rebound");
+        let second_thread = h.session("C0OTHER", &sandbox).await;
+        let new_node = format!("PR_rebound_{}", h.suffix);
+        h.store
+            .insert_pr_binding(&NewPrBinding {
+                repository: repository.clone(),
+                number: 7,
+                thread_key: second_thread.clone(),
+                pr_id: 2,
+                pr_node_id: new_node.clone(),
+                author_github_id: AUTHOR_ID,
+                author_login: "ada".to_owned(),
+                sandbox_id: sandbox,
+                head_ref: "fix".to_owned(),
+                base_ref: "main".to_owned(),
+                head_sha: "abcdef1".to_owned(),
+            })
+            .await
+            .unwrap();
+        set_state(
+            &h,
+            &repository,
+            PrBindingStateUpdate {
+                managed: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // A report still naming the old PR cannot drive the new binding.
+        let error = report(&h, &repository, &request, &slack).await.unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ApiError::Coded {
+                    code: "pr_identity_mismatch",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(slack.posts().len(), 1);
+
+        // The new PR's report is not a duplicate of the old one's, and goes to
+        // the new binding's thread.
+        let new_request = CiFailureRequest {
+            pr_node_id: new_node,
+            ..request
+        };
+        assert_eq!(
+            report(&h, &repository, &new_request, &slack).await.unwrap(),
+            json!({"notice": "posted"})
+        );
+        let posts = slack.posts();
+        assert_eq!(posts.len(), 2);
+        assert_eq!(posts[0]["channel"], "C0TEST");
+        assert_eq!(posts[1]["channel"], "C0OTHER");
+        assert_ne!(first.thread_key, second_thread);
     }
 
     #[tokio::test]
@@ -1880,217 +2259,116 @@ mod tests {
             return;
         };
         let (repository, _) = bound_pr(&h, true).await;
-        let spawns = Spawns::default();
         let too_long = format!("https://github.com/{}", "a".repeat(MAX_URL_CHARS));
-        for (head, details_url) in [
-            (
-                "abcdef1",
-                Some("http://github.com/acme/widgets/actions/runs/1".to_owned()),
-            ),
-            ("abcdef1", Some("javascript:alert(1)".to_owned())),
-            ("abcdef1", Some(too_long)),
-            ("abcdef1", None),
-        ] {
-            let spawns = Spawns::default();
+        for (index, details_url) in [
+            Some("http://github.com/acme/widgets/actions/runs/1".to_owned()),
+            Some("javascript:alert(1)".to_owned()),
+            Some("https://x.example/a|b".to_owned()),
+            Some(too_long),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Each attempt is a new head so each posts.
+            let head = format!("abcdef{index}");
+            set_state(
+                &h,
+                &repository,
+                PrBindingStateUpdate {
+                    head_sha: Some(head.clone()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let slack = Slack::default();
             let request = CiFailureRequest {
                 details_url,
-                ..h.ci(head, head, true, true)
+                ..h.ci(&head, &head, true, true)
             };
-            let outcome = report(&h, &repository, &request, &spawns).await.unwrap();
-            assert_eq!(outcome, json!({"notice": "queued"}));
-            let runs = spawns.runs();
-            assert_eq!(runs.len(), 1);
-            assert_eq!(runs[0].input["details_url"], Value::Null);
-            assert_eq!(runs[0].input["check_name"], "unit tests");
+            let outcome = report(&h, &repository, &request, &slack).await.unwrap();
+            assert_eq!(outcome, json!({"notice": "posted"}));
+            let text = slack.posts()[0]["text"].as_str().unwrap().to_owned();
+            assert!(
+                text.contains(&format!("`{}`: unit tests\n", &head[..7])),
+                "{text}"
+            );
         }
-        // A usable one is kept.
-        let outcome = report(
-            &h,
-            &repository,
-            &h.ci("abcdef1", "abcdef1", true, true),
-            &spawns,
-        )
-        .await
-        .unwrap();
-        assert_eq!(outcome, json!({"notice": "queued"}));
-        assert_eq!(
-            spawns.runs()[0].input["details_url"],
-            "https://github.com/acme/widgets/actions/runs/1"
-        );
     }
 
     #[tokio::test]
-    async fn a_duplicate_head_reports_duplicate_and_does_not_spawn_twice() {
+    async fn the_notice_is_never_posted_for_a_foreign_link_or_a_dm_thread() {
         let Some(h) = Harness::new().await else {
             return;
         };
         let (repository, _) = bound_pr(&h, true).await;
-        let spawns = Spawns::default();
-        let request = h.ci("abcdef1", "abcdef1", true, true);
-
-        let first = report(&h, &repository, &request, &spawns).await.unwrap();
-        let second = report(&h, &repository, &request, &spawns).await.unwrap();
-
-        assert_eq!(first, json!({"notice": "queued"}));
-        assert_eq!(second, json!({"notice": "duplicate"}));
-        assert_eq!(spawns.runs().len(), 1);
-
-        // A new head, once githubbot's state update records it, is a new notice.
-        h.store
-            .update_pr_binding_state(
-                &repository,
-                7,
-                &PrBindingStateUpdate {
-                    head_sha: Some("fedcba9".to_owned()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let newer = h.ci("fedcba9", "fedcba9", true, true);
+        let slack = Slack::default();
+        for url in [
+            "https://evil.example/acme/widgets/pull/7".to_owned(),
+            format!("https://github.com/{repository}/pull/8"),
+            format!("https://github.com/{repository}/pull/7/files"),
+            format!("https://github.com/{repository}/issues/7"),
+        ] {
+            let request = CiFailureRequest {
+                html_url: url.clone(),
+                ..h.ci("abcdef1", "abcdef1", true, true)
+            };
+            assert_eq!(
+                report(&h, &repository, &request, &slack).await.unwrap(),
+                json!({"notice": "skipped", "reason": "invalid_html_url"}),
+                "{url}"
+            );
+        }
+        assert!(slack.posts().is_empty());
+        // Owner and repository compare without regard to case.
+        let request = CiFailureRequest {
+            html_url: format!(
+                "https://github.com/{}/pull/7",
+                repository.to_ascii_uppercase()
+            ),
+            ..h.ci("abcdef1", "abcdef1", true, true)
+        };
         assert_eq!(
-            report(&h, &repository, &newer, &spawns).await.unwrap(),
-            json!({"notice": "queued"})
+            report(&h, &repository, &request, &slack).await.unwrap(),
+            json!({"notice": "posted"})
         );
-        assert_eq!(spawns.runs().len(), 2);
     }
 
     #[tokio::test]
-    async fn work_is_skipped_without_a_spawn_unless_open_assigned_managed_and_current() {
+    async fn a_binding_on_a_dm_thread_is_never_posted_into() {
         let Some(h) = Harness::new().await else {
             return;
         };
-        let (repository, _) = bound_pr(&h, true).await;
-        let spawns = Spawns::default();
+        let (repository, _) = bound_pr_in(&h, "D0TEST", true).await;
+        let slack = Slack::default();
 
-        // Not open: recorded as closed.
-        let outcome = report(
-            &h,
-            &repository,
-            &h.ci("abcdef1", "abcdef1", false, true),
-            &spawns,
-        )
-        .await
-        .unwrap();
-        assert_eq!(outcome, json!({"notice": "skipped", "reason": "not_open"}));
-        assert!(
-            h.store
-                .pr_binding(&repository, 7)
-                .await
-                .unwrap()
-                .unwrap()
-                .closed
-        );
-
-        // Closed stays skipped even if githubbot calls again as open (a
-        // reopen event has to clear it first).
         let outcome = report(
             &h,
             &repository,
             &h.ci("abcdef1", "abcdef1", true, true),
-            &spawns,
+            &slack,
         )
         .await
         .unwrap();
-        assert_eq!(outcome, json!({"notice": "skipped", "reason": "closed"}));
 
-        // Reopened, but no longer assigned: recorded as unmanaged.
-        h.store
-            .update_pr_binding_state(
-                &repository,
-                7,
-                &PrBindingStateUpdate {
-                    closed: Some(false),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let outcome = report(
-            &h,
-            &repository,
-            &h.ci("abcdef1", "abcdef1", true, false),
-            &spawns,
-        )
-        .await
-        .unwrap();
         assert_eq!(
             outcome,
-            json!({"notice": "skipped", "reason": "not_assigned"})
+            json!({"notice": "skipped", "reason": "not_slack_thread"})
         );
-        assert!(
-            !h.store
-                .pr_binding(&repository, 7)
-                .await
-                .unwrap()
-                .unwrap()
-                .managed
-        );
-
-        // Assigned in the fresh fetch, but the binding never recorded the
-        // bot's explicit assignment.
-        let outcome = report(
-            &h,
-            &repository,
-            &h.ci("abcdef1", "abcdef1", true, true),
-            &spawns,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            outcome,
-            json!({"notice": "skipped", "reason": "not_managed"})
-        );
-
-        // Managed again, but the failing head is stale. The report does not
-        // move the binding's head.
-        h.store
-            .update_pr_binding_state(
-                &repository,
-                7,
-                &PrBindingStateUpdate {
-                    managed: Some(true),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let outcome = report(
-            &h,
-            &repository,
-            &h.ci("abcdef1", "fedcba9", true, true),
-            &spawns,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            outcome,
-            json!({"notice": "skipped", "reason": "stale_head"})
-        );
-        assert_eq!(
-            h.store
-                .pr_binding(&repository, 7)
-                .await
-                .unwrap()
-                .unwrap()
-                .head_sha,
-            "abcdef1"
-        );
-
-        assert!(spawns.runs().is_empty());
+        assert!(slack.posts().is_empty());
     }
 
     #[tokio::test]
-    async fn an_unbound_pr_and_a_malformed_report_spawn_nothing() {
+    async fn an_unbound_pr_and_a_malformed_report_post_nothing() {
         let Some(h) = Harness::new().await else {
             return;
         };
-        let spawns = Spawns::default();
+        let slack = Slack::default();
         let error = report(
             &h,
             &format!("acme/unbound-{}", h.suffix),
             &h.ci("abcdef1", "abcdef1", true, true),
-            &spawns,
+            &slack,
         )
         .await
         .unwrap_err();
@@ -2111,12 +2389,10 @@ mod tests {
             },
         ];
         for request in malformed {
-            let error = report(&h, &repository, &request, &spawns)
-                .await
-                .unwrap_err();
+            let error = report(&h, &repository, &request, &slack).await.unwrap_err();
             assert!(matches!(error, ApiError::BadRequest(_)), "{error:?}");
         }
-        assert!(spawns.runs().is_empty());
+        assert!(slack.posts().is_empty());
     }
 
     // ---- validation helpers (no database) -------------------------------------
@@ -2231,138 +2507,5 @@ mod tests {
                 "{method} {uri}"
             );
         }
-    }
-
-    // ---- internal workflow -----------------------------------------------------
-
-    #[test]
-    fn only_the_notice_workflow_is_internal() {
-        for name in ["pr_ci_notice", " pr_ci_notice\n"] {
-            let error = refuse_internal_workflow(name).unwrap_err();
-            assert!(
-                matches!(&error, ApiError::Coded { code: "internal_workflow", status, .. } if *status == StatusCode::FORBIDDEN),
-                "{name:?}: {error:?}"
-            );
-        }
-        for name in ["echo", "pr_ci_notice_2", "PR_CI_NOTICE", ""] {
-            assert!(refuse_internal_workflow(name).is_ok(), "{name:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn the_public_workflow_routes_refuse_the_notice_workflow_for_every_caller() {
-        let console = encode(
-            &Header::new(Algorithm::HS256),
-            &json!({
-                "iss": "centaur-console", "sub": "centaur-console", "aud": "centaur-api",
-                "iat": 1_700_000_000i64, "exp": 4_102_444_800i64, "token_use": "console_service",
-            }),
-            &EncodingKey::from_secret(b"test-secret"),
-        )
-        .unwrap();
-        // A sandbox principal that may write workflows.
-        let principal = encode(
-            &Header::new(Algorithm::HS256),
-            &json!({
-                "iss": "centaur-console", "sub": "prn_test", "aud": "centaur-api",
-                "iat": 1_700_000_000i64, "exp": 4_102_444_800i64,
-                "capabilities": {"sessions_read": true, "workflows_read": true, "workflows_write": true},
-            }),
-            &EncodingKey::from_secret(b"test-secret"),
-        )
-        .unwrap();
-        let body = json!({
-            "workflow_name": "pr_ci_notice",
-            "input": {
-                "repository": "acme/widgets", "number": 7, "head_sha": "abcdef1",
-                "check_name": "unit tests",
-                "html_url": "https://github.com/acme/widgets/pull/7",
-            },
-        });
-        for (caller, token) in [("console", console), ("principal", principal)] {
-            // Not ready: only the guard, which runs first, can answer 403.
-            let router = build_router_with_app_state(AppState::unready(
-                ApiAuthConfig::testing_with_ingresses("test-secret"),
-            ));
-            let response = router
-                .oneshot(
-                    Request::builder()
-                        .method(Method::POST)
-                        .uri("/api/workflows/runs")
-                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(body.to_string()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{caller}");
-            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            let bytes: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(bytes["code"], "internal_workflow", "{caller}");
-        }
-
-        // Another workflow gets past the guard to the (not ready) runtime.
-        let router = build_router_with_app_state(AppState::unready(
-            ApiAuthConfig::testing_with_ingresses("test-secret"),
-        ));
-        let mut other = body.clone();
-        other["workflow_name"] = json!("echo");
-        let console = encode(
-            &Header::new(Algorithm::HS256),
-            &json!({
-                "iss": "centaur-console", "sub": "centaur-console", "aud": "centaur-api",
-                "iat": 1_700_000_000i64, "exp": 4_102_444_800i64, "token_use": "console_service",
-            }),
-            &EncodingKey::from_secret(b"test-secret"),
-        )
-        .unwrap();
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/workflows/runs")
-                    .header(header::AUTHORIZATION, format!("Bearer {console}"))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(other.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_ne!(response.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn a_signed_button_cannot_start_the_notice_workflow() {
-        let mut message = json!({"channel": "C1", "blocks": [{"type": "actions", "elements": [{
-            "type": "button", "action_id": "centaur.workflow.action:00000000-0000-0000-0000-000000000001:approve",
-            "value": json!({"workflow_name": "pr_ci_notice", "input": {}}).to_string(),
-        }]}]});
-        centaur_workflows::slack_buttons::sign_message(&mut message, b"test-secret").unwrap();
-        let signed = message["blocks"][0]["elements"][0]["value"]
-            .as_str()
-            .unwrap();
-        let request = json!({"button": signed, "idempotency_key": "click-1", "click": {
-            "id": "00000000-0000-0000-0000-000000000001", "action": "approve", "channel_id": "C1", "user_id": "U1",
-        }});
-        let router = build_router_with_app_state(AppState::unready(
-            ApiAuthConfig::testing_with_ingresses("test-secret"),
-        ));
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/api/workflows/actions/invoke")
-                    .header(header::AUTHORIZATION, "Bearer test-slackbot-key")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(request.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let bytes: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(bytes["code"], "internal_workflow");
     }
 }

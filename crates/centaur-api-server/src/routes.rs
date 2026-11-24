@@ -54,8 +54,7 @@ use crate::{
     auth::{ApiAuthConfig, AuthenticatedCaller, CallerClass, Capability, LINEARBOT_IDENTITY},
     mcp::{mcp_get, mcp_post, mcp_protected_resource_metadata},
     pr_bindings::{
-        create_session_pull_request, get_pr_binding, refuse_internal_workflow,
-        report_pr_ci_failure, update_pr_binding_state,
+        create_session_pull_request, get_pr_binding, report_pr_ci_failure, update_pr_binding_state,
     },
     slack_external_teams::{get_slack_external_team_ids, replace_slack_external_team_ids},
     slack_proxy::slack_proxy_router,
@@ -172,7 +171,7 @@ impl AppState {
             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))
     }
 
-    pub(crate) fn workflows(&self) -> Result<WorkflowRuntime, ApiError> {
+    fn workflows(&self) -> Result<WorkflowRuntime, ApiError> {
         let initialized = self
             .initialized()
             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))?;
@@ -2682,7 +2681,6 @@ async fn invoke_workflow_button(
     let feedback =
         centaur_workflows::slack_button_feedback::ButtonFeedback::from_invocation(&request);
     let request = state.auth.verify_workflow_button(request)?;
-    refuse_internal_workflow(&request.workflow_name)?;
     let run = workflow_runtime(&state)?
         .create_button_run(request, feedback)
         .await?;
@@ -2694,7 +2692,6 @@ async fn create_workflow_run(
     Extension(caller): Extension<AuthenticatedCaller>,
     Json(request): Json<CreateWorkflowRunRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    refuse_internal_workflow(&request.workflow_name)?;
     let workflows = workflow_runtime(&state)?;
     let starters = workflows.workflow_starters(&request.workflow_name);
     if !caller_may_start_workflow(starters.as_ref(), caller.class()) {

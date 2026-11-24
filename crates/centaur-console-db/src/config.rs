@@ -147,12 +147,18 @@ const GITHUB_API_HOST: &str = "api.github.com";
 /// authored as, so callers may compare it with the author GitHub reports.
 /// It is `Some` only when exactly one delivered credential writes that header
 /// on that host and it is a static secret fed by a token-broker credential of
-/// an `owner_only` `github` OAuth app. Console delivers an owner-only token
-/// only through its owner's own grant to the acting principal or requester,
-/// so the person in the turn is the token's owner. A shared app's token can
-/// reach anyone it is granted to, so it names no one. Any other shape (no
-/// credential, a shared or non-OAuth token, a competing credential, a missing
-/// subject) is `None`, never a guess.
+/// a `github` OAuth app that:
+///
+/// - records a numeric subject, which is the GitHub user id Console stores for
+///   an app that is neither shared nor owner-only (an owner-only connection
+///   stores `owner-<console user>` instead, so it names no GitHub account);
+/// - is not shared, so one connection does not serve many people;
+/// - was connected by the acting human (the requester, else the principal),
+///   so the token is theirs and not another person's that a channel or role
+///   grant happens to deliver.
+///
+/// Any other shape (no credential, a non-OAuth token, a competing credential,
+/// a missing or non-numeric subject) is `None`, never a guess.
 pub async fn github_user_id(
     pool: &PgPool,
     values: SecretValues<'_>,
@@ -175,7 +181,9 @@ fn github_user_id_of(credentials: &[Credential]) -> Option<String> {
     let source = credential.sources.first()?;
     if source.source_type != "token_broker"
         || source.broker_provider.as_deref() != Some("github")
-        || source.broker_owner_only != Some(true)
+        || source.broker_owner_only != Some(false)
+        || source.broker_shared != Some(false)
+        || source.broker_owned_by_actor != Some(true)
     {
         return None;
     }
@@ -183,7 +191,7 @@ fn github_user_id_of(credentials: &[Credential]) -> Option<String> {
         .broker_provider_subject
         .as_deref()
         .map(str::trim)
-        .filter(|subject| !subject.is_empty())
+        .filter(|subject| !subject.is_empty() && subject.bytes().all(|b| b.is_ascii_digit()))
         .map(str::to_owned)
 }
 
@@ -535,7 +543,9 @@ mod tests {
             broker_access_token: Some("token".to_owned()),
             broker_provider: provider.map(str::to_owned),
             broker_provider_subject: subject.map(str::to_owned),
-            broker_owner_only: Some(true),
+            broker_owner_only: Some(false),
+            broker_shared: Some(false),
+            broker_owned_by_actor: Some(true),
             role: None,
             role_kind: None,
         }
@@ -586,12 +596,28 @@ mod tests {
         other_provider.sources = vec![source("token_broker", Some("slack"), Some("U1"))];
         let mut no_provider = github_token(3, 100, "api.github.com");
         no_provider.sources = vec![source("token_broker", None, Some("90210001"))];
-        // A shared app's token can reach anyone it is granted to; one whose
-        // ownership is unknown is treated the same way.
+        // A shared app's token can reach anyone it is granted to.
         let mut shared_app = github_token(9, 100, "api.github.com");
-        shared_app.sources[0].broker_owner_only = Some(false);
-        let mut unknown_app = github_token(10, 100, "api.github.com");
-        unknown_app.sources[0].broker_owner_only = None;
+        shared_app.sources[0].broker_shared = Some(true);
+        // An owner-only connection records `owner-<console user>`, not a
+        // GitHub id, so it can never name an author.
+        let mut owner_only_app = github_token(10, 100, "api.github.com");
+        owner_only_app.sources[0].broker_owner_only = Some(true);
+        owner_only_app.sources[0].broker_provider_subject = Some("owner-usr_abc123".to_owned());
+        let mut owner_only_numeric = github_token(11, 100, "api.github.com");
+        owner_only_numeric.sources[0].broker_owner_only = Some(true);
+        // A token someone else connected, delivered by a channel or role grant.
+        let mut not_the_actors = github_token(12, 100, "api.github.com");
+        not_the_actors.sources[0].broker_owned_by_actor = Some(false);
+        // Unknown ownership is no ownership.
+        let mut unknown_owner = github_token(13, 100, "api.github.com");
+        unknown_owner.sources[0].broker_owned_by_actor = None;
+        let mut unknown_shared = github_token(14, 100, "api.github.com");
+        unknown_shared.sources[0].broker_shared = None;
+        let mut unknown_owner_only = github_token(15, 100, "api.github.com");
+        unknown_owner_only.sources[0].broker_owner_only = None;
+        let mut non_numeric = github_token(16, 100, "api.github.com");
+        non_numeric.sources[0].broker_provider_subject = Some("ada-lovelace".to_owned());
         let mut no_subject = github_token(4, 100, "api.github.com");
         no_subject.sources = vec![source("token_broker", Some("github"), None)];
         let mut blank_subject = github_token(5, 100, "api.github.com");
@@ -612,7 +638,13 @@ mod tests {
         for credential in [
             shared,
             shared_app,
-            unknown_app,
+            owner_only_app,
+            owner_only_numeric,
+            not_the_actors,
+            unknown_owner,
+            unknown_shared,
+            unknown_owner_only,
+            non_numeric,
             other_provider,
             no_provider,
             no_subject,

@@ -228,6 +228,11 @@ export type PrBinding = {
 export type PrBindingStateUpdate = {
   /** Must equal the binding's `pr_node_id`; api-rs refuses a mismatch. */
   pr_node_id: string;
+  /**
+   * `updated_at` (RFC3339) of the fetched PR the write was derived from. api-rs
+   * applies a write only if it is not older than the last one it applied.
+   */
+  observed_updated_at: string;
   managed?: boolean;
   closed?: boolean;
   head_sha?: string;
@@ -237,6 +242,8 @@ export type PrBindingStateUpdate = {
 export type PrCiFailureReport = {
   /** Must equal the binding's `pr_node_id`; api-rs refuses a mismatch. */
   pr_node_id: string;
+  /** `updated_at` (RFC3339) of the fresh PR fetch this report was built from. */
+  observed_updated_at: string;
   head_sha: string;
   current_head_sha: string;
   open: boolean;
@@ -247,7 +254,7 @@ export type PrCiFailureReport = {
 };
 
 export type PrCiFailureResult =
-  | { notice: "queued" | "duplicate"; reason?: undefined }
+  | { notice: "posted" | "duplicate"; reason?: undefined }
   | { notice: "skipped"; reason: string };
 
 export type GithubbotRendererSource = RustSessionStreamEvent | JsonObject;

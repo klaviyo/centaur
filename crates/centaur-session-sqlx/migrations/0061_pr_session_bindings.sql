@@ -17,6 +17,10 @@ create table pr_session_bindings (
     head_sha text not null,                 -- latest head githubbot has seen; starts at the created head
     managed boolean not null default false, -- set only by an explicit assignment of the bot
     closed boolean not null default false,
+    -- The `updated_at` of the fetched PR behind the latest lifecycle write
+    -- (managed, closed, head_sha). Writes observed earlier are ignored, so
+    -- reordered webhook handlers converge on the newest observation.
+    github_updated_at timestamptz,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
     primary key (repository, number),
@@ -25,3 +29,14 @@ create table pr_session_bindings (
 );
 
 create index pr_session_bindings_thread_key_idx on pr_session_bindings (thread_key);
+
+-- One row per failed-CI notice posted (or being posted) for a pull request at
+-- a head, so repeat deliveries never notify the thread twice. Keyed by the PR's
+-- node id, not its number, so a reused repository and number is a new PR.
+create table pr_ci_notices (
+    pr_node_id text not null,
+    head_sha text not null,
+    thread_key text not null references sessions(thread_key) on delete cascade,
+    created_at timestamptz not null default now(),
+    primary key (pr_node_id, head_sha)
+);

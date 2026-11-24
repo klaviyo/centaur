@@ -936,21 +936,45 @@ async fn api_jwt_names_the_sandbox_and_the_github_account_behind_its_token() {
     )
     .await;
     f.bump(principal).await;
-    // A shared (not owner-only) app's token can reach anyone it is granted
-    // to, so it names no account.
+    // The token was connected by the Console admin, but the principal is not
+    // that person (it is a plain `user` principal), so it is not the actor's.
     let claims = api_jwt_claims(&f.sync(&token).await);
     assert_eq!(claims["sandbox_id"], f.name("proxy"));
     assert!(claims.get("github_user_id").is_none());
 
-    // Owner-only: Console serves the token only to its owner's own principal.
-    f.update("UPDATE oauth_apps SET owner_only = true WHERE id = $1", app)
-        .await;
+    // Once the acting principal is the connecting Console user, the token is
+    // theirs and its numeric GitHub id is the claim.
     sqlx::query("UPDATE principals SET kind = 'console_user', console_user_id = $2 WHERE id = $1")
         .bind(principal)
         .bind(f.admin)
         .execute(&f.pool)
         .await
         .unwrap();
+    f.bump(principal).await;
+    let claims = api_jwt_claims(&f.sync(&token).await);
+    assert_eq!(claims["github_user_id"], "90210001");
+
+    // A shared app serves one connection to many people: no claim.
+    f.update("UPDATE oauth_apps SET shared = true WHERE id = $1", app)
+        .await;
+    f.bump(principal).await;
+    assert!(
+        api_jwt_claims(&f.sync(&token).await)
+            .get("github_user_id")
+            .is_none()
+    );
+    f.update("UPDATE oauth_apps SET shared = false WHERE id = $1", app)
+        .await;
+
+    // An owner-only connection is stored as `owner-<console user>`, as
+    // Console's callback does, and names no GitHub account.
+    f.update("UPDATE oauth_apps SET owner_only = true WHERE id = $1", app)
+        .await;
+    f.update(
+        "UPDATE broker_credentials SET provider_subject = 'owner-usr_Xk3D9a' WHERE id = $1",
+        broker,
+    )
+    .await;
     // An owner-only token is delivered only while its owner is active.
     sqlx::query("UPDATE users SET status = 'active' WHERE id = $1")
         .bind(f.admin)
@@ -958,9 +982,31 @@ async fn api_jwt_names_the_sandbox_and_the_github_account_behind_its_token() {
         .await
         .unwrap();
     f.bump(principal).await;
-    let claims = api_jwt_claims(&f.sync(&token).await);
-    assert_eq!(claims["sandbox_id"], f.name("proxy"));
-    assert_eq!(claims["github_user_id"], "90210001");
+    let body = f.sync(&token).await;
+    assert!(
+        body["secrets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|secret| secret["rules"] == json!([{ "host": "api.github.com" }])),
+        "the owner-only token is still delivered"
+    );
+    assert!(api_jwt_claims(&body).get("github_user_id").is_none());
+    f.update(
+        "UPDATE oauth_apps SET owner_only = false WHERE id = $1",
+        app,
+    )
+    .await;
+    f.update(
+        "UPDATE broker_credentials SET provider_subject = '90210001' WHERE id = $1",
+        broker,
+    )
+    .await;
+    f.bump(principal).await;
+    assert_eq!(
+        api_jwt_claims(&f.sync(&token).await)["github_user_id"],
+        "90210001"
+    );
 
     // A second credential writing Authorization on the host makes the
     // account ambiguous, so the claim disappears rather than guessing.

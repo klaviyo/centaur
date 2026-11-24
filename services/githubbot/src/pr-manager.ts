@@ -12,6 +12,7 @@ import {
 } from "./workflow-events";
 import {
   getPrBinding,
+  isRetryableSessionApiError,
   reportPrCiFailure,
   updatePrBindingState,
   type PrBindingRef,
@@ -46,11 +47,18 @@ export type PrManagerContext = {
   options: GithubbotOptions;
   state: StateAdapter;
   userName: string;
+  /** Delays between in-process attempts at a critical state write; tests inject their own. */
+  stateWriteRetryDelaysMs?: number[];
+  /** Timer for those delays; tests inject an instant one. */
+  sleep?: (ms: number) => Promise<void>;
 };
 
 const STATE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 const CLAIM_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_CI_FIX_MAX_ATTEMPTS = 3;
+// Close, unassign and reopen writes invalidate a notice, so they get 3 attempts
+// over about 30s (10s then 20s apart) before githubbot gives up and logs.
+const DEFAULT_STATE_WRITE_RETRY_DELAYS_MS = [10_000, 20_000];
 
 // ---------------------------------------------------------------------------
 // Pure decision helpers (unit-tested without GitHub).
@@ -200,6 +208,7 @@ type PullRequestSummary = {
   number: number;
   state: string;
   title: string;
+  updatedAt: string | null;
 };
 
 function assigneeLogins(
@@ -220,6 +229,7 @@ function summarizePr(pr: {
   number: number;
   state: string;
   title: string;
+  updated_at?: string | null;
   assignees?: ({ login?: string } | null)[] | null;
 }): PullRequestSummary {
   return {
@@ -236,6 +246,7 @@ function summarizePr(pr: {
     number: pr.number,
     state: pr.state,
     title: pr.title,
+    updatedAt: pr.updated_at ?? null,
   };
 }
 
@@ -313,11 +324,14 @@ export async function handlePullRequestEvent(
   // A PR opened through a session binding keeps its lifecycle state in api-rs,
   // recorded before (and regardless of) the unbound handling below.
   const lookup = await lookupBinding(ctx, repo.owner, repo.repo, number);
-  if (lookup.ok && lookup.binding) {
+  // A failed lookup is not "unbound": the invalidating writes (close, unassign,
+  // reopen) are still attempted on the signed payload's node id, which api-rs
+  // checks against the binding.
+  if (!lookup.ok || lookup.binding) {
     await recordBindingState(
       ctx,
       bindingRef(repo.owner, repo.repo, number),
-      lookup.binding,
+      lookup.ok ? lookup.binding : null,
       action,
       payload,
       prNode,
@@ -370,15 +384,19 @@ async function lookupBinding(
 
 /**
  * Record a lifecycle event on the binding, only for the PR the binding was
- * created for (`pr_node_id`). Management is enabled only by an explicit
- * assignment: the event's own `assignee` is the bot, and the bot is still
- * assigned on a fresh read, so a late or reordered delivery can't flip it.
- * Heads come from a fresh read, never the payload.
+ * created for (`pr_node_id`). Every write is derived from a fresh fetch, never
+ * the payload, and carries that fetch's `updated_at` so api-rs can drop a write
+ * a later one has superseded: reordered or concurrent deliveries converge.
+ * Management is enabled only by an explicit assignment: the event's own
+ * `assignee` is the bot and the bot is still assigned on the fresh read.
+ *
+ * `binding` is null when the binding lookup failed; only the invalidating
+ * actions are attempted then, on the signed payload's node id.
  */
 async function recordBindingState(
   ctx: PrManagerContext,
   ref: PrBindingRef,
-  binding: PrBinding,
+  binding: PrBinding | null,
   action: string,
   payload: Record<string, unknown>,
   prNode: Record<string, unknown>,
@@ -387,42 +405,82 @@ async function recordBindingState(
   const assigneeIsBot =
     isRecord(payload.assignee) &&
     stringValue(payload.assignee.login)?.toLowerCase() === ctx.userName.toLowerCase();
-  const needsFresh =
-    action === "synchronize" ||
-    (assigneeIsBot && (action === "assigned" || action === "unassigned"));
-  if (action !== "closed" && action !== "reopened" && !needsFresh) return;
+  const botAssignment = assigneeIsBot && (action === "assigned" || action === "unassigned");
+  if (!["closed", "reopened", "synchronize"].includes(action) && !botAssignment) return;
+  const invalidating = action === "closed" || action === "reopened" || action === "unassigned";
+  if (!binding && !invalidating) return;
 
   const [owner = "", repo = ""] = ref.repository.split("/", 2);
-  const fresh = needsFresh ? await fetchPr(ctx, owner, repo, ref.number) : null;
+  const fresh = await fetchPr(ctx, owner, repo, ref.number);
+  if (!fresh?.updatedAt) {
+    logger(ctx).warn("githubbot_pr_binding_no_fresh_state", { action, pr: prLabel });
+    return;
+  }
   // The binding only speaks for the PR it was created for.
-  const seenNodeIds = [stringValue(prNode.node_id), fresh?.nodeId ?? undefined].filter(
-    (id): id is string => Boolean(id),
-  );
-  if (seenNodeIds.length === 0 || seenNodeIds.some((id) => id !== binding.pr_node_id)) {
+  const payloadNodeId = stringValue(prNode.node_id);
+  const expectedNodeId = binding?.pr_node_id ?? payloadNodeId;
+  if (!expectedNodeId || (payloadNodeId && payloadNodeId !== expectedNodeId) || fresh.nodeId !== expectedNodeId) {
     logger(ctx).warn("githubbot_pr_binding_identity_mismatch", { action, pr: prLabel });
     return;
   }
 
-  let update: Omit<PrBindingStateUpdate, "pr_node_id"> | undefined;
-  if (action === "closed") update = { closed: true };
-  else if (action === "reopened") update = { closed: false };
-  else if (action === "synchronize") update = fresh ? { head_sha: fresh.headSha } : undefined;
+  let update: Partial<PrBindingStateUpdate> | undefined;
+  if (action === "closed" || action === "reopened") {
+    update = { closed: fresh.state !== "open" || fresh.merged };
+  } else if (action === "synchronize") update = { head_sha: fresh.headSha };
   else if (action === "assigned") {
-    update = fresh && owns(ctx, fresh) ? { managed: true, head_sha: fresh.headSha } : undefined;
+    update = owns(ctx, fresh) ? { managed: true, head_sha: fresh.headSha } : undefined;
   } else if (action === "unassigned") {
-    // Keep management only when the bot is demonstrably still assigned. If the
-    // fresh read failed, disabling is the safe direction.
-    update = fresh && owns(ctx, fresh) ? undefined : { managed: false };
+    update = owns(ctx, fresh) ? undefined : { managed: false };
   }
   if (!update) return;
-  try {
-    await updatePrBindingState(ctx.options, ref, { pr_node_id: binding.pr_node_id, ...update });
-  } catch (error) {
-    logger(ctx).warn("githubbot_pr_binding_state_failed", {
-      action,
-      error: errorMessage(error),
-      pr: prLabel,
-    });
+  await writeBindingState(
+    ctx,
+    ref,
+    { ...update, pr_node_id: expectedNodeId, observed_updated_at: fresh.updatedAt },
+    invalidating,
+    action,
+  );
+}
+
+/**
+ * Write binding state; with `retry`, up to three attempts with bounded backoff
+ * for retryable and network errors. Resolves true when api-rs accepted the call
+ * (an unapplied, superseded write counts), false after giving up.
+ */
+async function writeBindingState(
+  ctx: PrManagerContext,
+  ref: PrBindingRef,
+  update: PrBindingStateUpdate,
+  retry: boolean,
+  action: string,
+): Promise<boolean> {
+  const delays = retry ? (ctx.stateWriteRetryDelaysMs ?? DEFAULT_STATE_WRITE_RETRY_DELAYS_MS) : [];
+  const sleep = ctx.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const { applied } = await updatePrBindingState(ctx.options, ref, update);
+      if (!applied) {
+        logger(ctx).debug("githubbot_pr_binding_state_superseded", {
+          action,
+          pr: `${ref.repository}#${ref.number}`,
+        });
+      }
+      return true;
+    } catch (error) {
+      const last = attempt >= delays.length || !isRetryableSessionApiError(error);
+      logger(ctx).warn(
+        last ? "githubbot_pr_binding_state_failed" : "githubbot_pr_binding_state_retrying",
+        {
+          action,
+          attempt: attempt + 1,
+          error: errorMessage(error),
+          pr: `${ref.repository}#${ref.number}`,
+        },
+      );
+      if (last) return false;
+      await sleep(delays[attempt] ?? 0);
+    }
   }
 }
 
@@ -636,28 +694,49 @@ async function reportBoundCiFailure(
     traceLog(ctx.options, "githubbot_bound_ci_skipped", trace, { pr: prLabel, reason });
   if (!binding.managed) return skip("not_managed");
   if (binding.closed) return skip("closed");
-  // api-rs revalidates, but its inputs must be fresh.
+  // api-rs revalidates and posts inside the report request, so its inputs must
+  // be fresh: this is the last GitHub read before the report, and it fails
+  // closed (no read, no report, and no claim has been taken yet).
   const fresh = await fetchPr(ctx, owner, repo, number);
   if (!fresh) return skip("pr_unreadable");
   if (!fresh.nodeId || fresh.nodeId !== binding.pr_node_id) return skip("identity_mismatch");
-  if (fresh.state !== "open" || fresh.merged) return skip("not_open");
-  if (!owns(ctx, fresh)) return skip("not_assigned");
+  if (!fresh.updatedAt) return skip("pr_unreadable");
   if (fresh.headSha !== headSha) return skip("stale_head");
 
+  // The failing head is confirmed current. If the binding still records an
+  // older one (CI beat the synchronize event), record it first so api-rs
+  // doesn't refuse the report as stale.
+  if (binding.head_sha !== fresh.headSha) {
+    const recorded = await writeBindingState(
+      ctx,
+      bindingRef(owner, repo, number),
+      {
+        pr_node_id: fresh.nodeId,
+        observed_updated_at: fresh.updatedAt,
+        head_sha: fresh.headSha,
+      },
+      false,
+      "ci_head_sync",
+    );
+    if (!recorded) return skip("head_not_recorded");
+  }
+
+  // open and assigned come from the fresh read; api-rs decides and records.
   const claimKey = `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:ci-notice:${owner}/${repo}#${number}:${headSha}`;
   if (!(await claim(ctx, claimKey))) return skip("already_reported");
   try {
     const result = await reportPrCiFailure(ctx.options, bindingRef(owner, repo, number), {
       pr_node_id: fresh.nodeId,
+      observed_updated_at: fresh.updatedAt,
       head_sha: headSha,
       current_head_sha: fresh.headSha,
-      open: true,
-      assigned: true,
+      open: fresh.state === "open" && !fresh.merged,
+      assigned: owns(ctx, fresh),
       check_name: evaluation.failingNames[0] ?? "CI checks",
       ...(evaluation.firstFailingUrl ? { details_url: evaluation.firstFailingUrl } : {}),
       html_url: fresh.htmlUrl ?? `https://github.com/${owner}/${repo}/pull/${number}`,
     });
-    // api-rs judged it ineligible: keep no claim, so a later event can retry.
+    // Keep the claim only for a notice that is, or already was, posted.
     if (result.notice === "skipped") await release(ctx, claimKey);
     traceLog(ctx.options, "githubbot_bound_ci_reported", trace, {
       notice: result.notice,
