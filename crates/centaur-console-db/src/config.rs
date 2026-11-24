@@ -83,7 +83,8 @@ pub async fn build_config(
 /// transform in list order, so a transform here runs after everything else,
 /// including `oauth_token`, `aws_auth`, `gcp_*` and `hmac` transforms that
 /// could overwrite `Authorization`. The guard is therefore the last writer of
-/// `Authorization` for `POST api.github.com /repos/*/*/pulls`: it replaces the
+/// `Authorization` for `POST api.github.com //repos/*/*/pulls` (see
+/// [`PR_CREATE_GUARD_PATH`]): it replaces the
 /// placeholder [`PR_OAUTH_PLACEHOLDER`] and is `require: true`, so the proxy
 /// refuses the request outright if an earlier secret or transform has already
 /// written that header. (Placed in `secrets` instead, a later transform would
@@ -113,6 +114,20 @@ pub async fn build_config_with_github_user_id(
 /// token, replaced by the proxy only with the attested OAuth credential's
 /// token and only on that one operation.
 pub const PR_OAUTH_PLACEHOLDER: &str = "CENTAUR_PR_OAUTH";
+
+/// The path the guard rule matches: `//repos/*/*/pulls`, with a literal
+/// leading double slash. api-rs's one create call sends to exactly that path,
+/// and only that call does.
+///
+/// A guard on the ordinary `/repos/*/*/pulls` would also refuse a sandbox's
+/// own REST PR creation with `GITHUB_TOKEN` (`require: true` fails any request
+/// whose `Authorization` was already written). In the pinned iron-proxy
+/// 0.56.0 rules match on the raw request path while the request forwarded to
+/// GitHub is normalized to `/repos/{owner}/{repo}/pulls`, so the marker routes
+/// api-rs's call through the guard and leaves ordinary creation untouched.
+/// That depends on this proxy version's matcher and forwarder, so the offline
+/// proof (`d1-oauth-placeholder-proof/`) must be rerun on any iron-proxy bump.
+pub const PR_CREATE_GUARD_PATH: &str = "//repos/*/*/pulls";
 
 /// The guard's source when no account is attested: a fixed non-credential
 /// string, so the guard is present and fails closed without any token to leak.
@@ -192,7 +207,7 @@ async fn build(
             "rules": [{
                 "host": GITHUB_API_HOST,
                 "methods": ["POST"],
-                "paths": ["/repos/*/*/pulls"],
+                "paths": [PR_CREATE_GUARD_PATH],
             }],
         });
         config

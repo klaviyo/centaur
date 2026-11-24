@@ -1400,10 +1400,24 @@ const GITHUB_PULL_REQUEST_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// the call never carries it.
 #[cfg(test)]
 const GITHUB_TOKEN_PLACEHOLDER_AUTHORIZATION: &str = "Bearer GITHUB_TOKEN";
+/// The marker the create call puts in front of its path: the request goes to
+/// `//repos/{owner}/{repo}/pulls`, with a literal leading double slash.
+///
+/// proxy-sync's PR-create guard (`require: true`, last writer of
+/// `Authorization`) matches `POST api.github.com //repos/*/*/pulls`. In the
+/// pinned iron-proxy 0.56.0 rules match on the raw request path, while the
+/// request forwarded to GitHub is normalized to the ordinary
+/// `/repos/{owner}/{repo}/pulls`. The marker therefore sends only this call
+/// through the guard: a sandbox's ordinary `/repos/...` PR creation with
+/// `GITHUB_TOKEN` never matches the guard rule and is untouched. The pairing
+/// with the guard's path depends on that matcher/forwarder behaviour, so the
+/// offline proof (`d1-oauth-placeholder-proof/`) must be rerun on any
+/// iron-proxy bump.
+const GITHUB_PR_CREATE_PATH_MARKER: &str = "/";
 /// `Authorization` value of the create call: a placeholder, not a credential.
 /// The sandbox's proxy replaces `CENTAUR_PR_OAUTH` only with the attested
 /// OAuth credential's token, and only for `POST api.github.com
-/// /repos/*/*/pulls`: proxy-sync adds that substitution in the same build that
+/// //repos/*/*/pulls` (see [`GITHUB_PR_CREATE_PATH_MARKER`]): proxy-sync adds that substitution in the same build that
 /// attests the account, and only when it does. If the credential has since
 /// turned into a personal access token (or is gone), the placeholder goes to
 /// GitHub unsubstituted and is rejected, so no pull request is created under a
@@ -1534,14 +1548,17 @@ fn github_pull_request_client(
         .map_err(|err| SandboxError::backend_source("build sandbox proxy client", err))
 }
 
-/// The fixed pull-request create request. GitHub requires a `User-Agent`.
+/// The fixed pull-request create request, to `base` (the API host, or a test
+/// stand-in for it) with the path sent verbatim behind
+/// [`GITHUB_PR_CREATE_PATH_MARKER`]. GitHub requires a `User-Agent`.
 fn github_pull_request_request(
     client: &reqwest::Client,
+    base: &str,
     path: &str,
     payload: &Value,
 ) -> reqwest::RequestBuilder {
     client
-        .post(format!("https://{GITHUB_API_HOST}{path}"))
+        .post(format!("{base}{GITHUB_PR_CREATE_PATH_MARKER}{path}"))
         .header(
             reqwest::header::AUTHORIZATION,
             GITHUB_PR_OAUTH_PLACEHOLDER_AUTHORIZATION,
@@ -1557,7 +1574,16 @@ async fn send_github_pull_request(
     path: &str,
     payload: &Value,
 ) -> SandboxResult<ProxyHttpsResponse> {
-    let mut response = github_pull_request_request(client, path, payload)
+    send_github_pull_request_to(client, &format!("https://{GITHUB_API_HOST}"), path, payload).await
+}
+
+async fn send_github_pull_request_to(
+    client: &reqwest::Client,
+    base: &str,
+    path: &str,
+    payload: &Value,
+) -> SandboxResult<ProxyHttpsResponse> {
+    let mut response = github_pull_request_request(client, base, path, payload)
         .send()
         .await
         .map_err(|err| {
@@ -4282,6 +4308,7 @@ AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
             json!({"title": "Fix", "head": "fix", "base": "main", "body": "", "draft": false});
         let request = github_pull_request_request(
             &client,
+            "https://api.github.com",
             &github_pull_requests_path("acme", "widgets").unwrap(),
             &payload,
         )
@@ -4289,10 +4316,12 @@ AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
         .unwrap();
 
         assert_eq!(request.method(), reqwest::Method::POST);
+        // The marker's literal double slash survives URL parsing.
         assert_eq!(
             request.url().as_str(),
-            "https://api.github.com/repos/acme/widgets/pulls"
+            "https://api.github.com//repos/acme/widgets/pulls"
         );
+        assert_eq!(request.url().path(), "//repos/acme/widgets/pulls");
         let headers = request.headers();
         // Only the OAuth-only placeholder, never the generic one that a
         // personal access token would also satisfy.
@@ -4308,6 +4337,52 @@ AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
         let body: Value =
             serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
         assert_eq!(body, payload);
+    }
+
+    #[tokio::test]
+    async fn the_create_call_sends_the_marker_path_verbatim_on_the_wire() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A plain-HTTP stand-in for the API host, so the request line is
+        // observable (the real call is inside TLS).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..read]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 201 Created\r\ncontent-length: 2\r\n\r\n{}")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&head).into_owned()
+        });
+
+        let response = send_github_pull_request_to(
+            &reqwest::Client::new(),
+            &base,
+            &github_pull_requests_path("acme", "widgets").unwrap(),
+            &json!({"title": "Fix"}),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status, 201);
+        let head = server.await.unwrap();
+        // The request line is `POST //repos/...`: not collapsed to one slash,
+        // which would send it past the guard that matches the marker.
+        assert_eq!(
+            head.lines().next().unwrap(),
+            "POST //repos/acme/widgets/pulls HTTP/1.1",
+            "{head}"
+        );
     }
 
     #[test]

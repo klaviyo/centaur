@@ -1149,7 +1149,7 @@ fn assert_guard(body: &Value, source: Option<&Value>) {
     );
     assert_eq!(
         guards[0]["rules"],
-        json!([{"host": "api.github.com", "methods": ["POST"], "paths": ["/repos/*/*/pulls"]}])
+        json!([{"host": "api.github.com", "methods": ["POST"], "paths": ["//repos/*/*/pulls"]}])
     );
     match source {
         Some(source) => assert_eq!(&guards[0]["source"], source),

@@ -62,6 +62,19 @@ const DEFAULT_CI_FIX_MAX_ATTEMPTS = 3;
 // Close, unassign and reopen writes invalidate a notice, so they get 3 attempts
 // over about 30s (10s then 20s apart) before githubbot gives up and logs.
 const DEFAULT_STATE_WRITE_RETRY_DELAYS_MS = [10_000, 20_000];
+// api-rs inserts a binding a moment after GitHub creates the PR, so a very
+// early event can find none yet. Two re-checks (2s, then 5s later) settle that
+// before a PR is taken as unbound.
+const BINDING_RECHECK_DELAYS_MS = [2_000, 5_000];
+// ...and only a PR this young can be in that window; an older one with no
+// binding is simply unbound.
+const BINDING_RECHECK_MAX_PR_AGE_MS = 60_000;
+
+function isJustCreated(pr: PullRequestSummary): boolean {
+  const created = pr.createdAt ? Date.parse(pr.createdAt) : Number.NaN;
+  const age = Date.now() - created;
+  return Number.isFinite(age) && age <= BINDING_RECHECK_MAX_PR_AGE_MS;
+}
 
 // ---------------------------------------------------------------------------
 // Pure decision helpers (unit-tested without GitHub).
@@ -211,6 +224,7 @@ type PullRequestSummary = {
   number: number;
   state: string;
   title: string;
+  createdAt: string | null;
   updatedAt: string | null;
 };
 
@@ -232,6 +246,7 @@ function summarizePr(pr: {
   number: number;
   state: string;
   title: string;
+  created_at?: string | null;
   updated_at?: string | null;
   assignees?: ({ login?: string } | null)[] | null;
 }): PullRequestSummary {
@@ -249,6 +264,7 @@ function summarizePr(pr: {
     number: pr.number,
     state: pr.state,
     title: pr.title,
+    createdAt: pr.created_at ?? null,
     updatedAt: pr.updated_at ?? null,
   };
 }
@@ -326,7 +342,17 @@ export async function handlePullRequestEvent(
   if (number === undefined) return;
   // A PR opened through a session binding keeps its lifecycle state in api-rs,
   // recorded before (and regardless of) the unbound handling below.
-  const lookup = await lookupBindingWithRetry(ctx, repo.owner, repo.repo, number);
+  let lookup = await lookupBindingWithRetry(ctx, repo.owner, repo.repo, number);
+  const assigneeLogin = isRecord(payload.assignee) ? stringValue(payload.assignee.login) : undefined;
+  if (
+    action === "assigned" &&
+    assigneeLogin?.toLowerCase() === ctx.userName.toLowerCase() &&
+    lookup.ok &&
+    !lookup.binding
+  ) {
+    // An automatic assignment can beat the binding's insert.
+    lookup = await recheckForBinding(ctx, repo.owner, repo.repo, number);
+  }
   // A failed lookup is not "unbound": the invalidating writes (close, unassign,
   // reopen) are still attempted on the signed payload's node id, which api-rs
   // checks against the binding.
@@ -383,6 +409,28 @@ async function lookupBinding(
     });
     return { ok: false, error };
   }
+}
+
+/**
+ * After an explicit 404, look again a couple of times before believing it: the
+ * binding may be inserted just after the event that asked. Returns the first
+ * lookup that finds one or fails, else the last 404. Callers use this only
+ * where an early event is expected (the bot being assigned, a red head).
+ */
+async function recheckForBinding(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<BindingLookup> {
+  const sleep = ctx.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  let lookup: BindingLookup = { ok: true, binding: null };
+  for (const delay of BINDING_RECHECK_DELAYS_MS) {
+    await sleep(delay);
+    lookup = await lookupBinding(ctx, owner, repo, number);
+    if (!lookup.ok || lookup.binding) return lookup;
+  }
+  return lookup;
 }
 
 /**
@@ -804,16 +852,20 @@ async function readEventFailure(
       const name = latest.name ?? event.name;
       return name ? { name, ...(latest.html_url ? { url: latest.html_url } : {}) } : undefined;
     }
-    // A status: the combined status lists the latest one per context.
-    const { data } = await ctx.octokit.rest.repos.getCombinedStatusForRef({
-      owner,
-      repo,
-      ref: headSha,
-      // The default page is 30 contexts; a busy head has more.
-      per_page: 100,
-    });
-    if (data.sha !== headSha) return undefined;
-    const latest = data.statuses.find((status) => status.context === event.name);
+    // A status: the combined status lists the latest one per context, a page
+    // of 100 at a time, so follow every page to find the context.
+    type CommitStatus = { context: string; state: string; target_url: string | null };
+    const statuses = await ctx.octokit.paginate(
+      ctx.octokit.rest.repos.getCombinedStatusForRef,
+      { owner, repo, ref: headSha, per_page: 100 },
+      // The client hands back either the statuses themselves or the combined
+      // object they sit in, depending on how it normalizes the page.
+      (response): CommitStatus[] => {
+        const data = response.data as unknown as CommitStatus[] | { statuses: CommitStatus[] };
+        return Array.isArray(data) ? data : data.statuses;
+      },
+    );
+    const latest = statuses.find((status) => status.context === event.name);
     if (!latest || (latest.state !== "failure" && latest.state !== "error")) return undefined;
     return { name: latest.context, ...(latest.target_url ? { url: latest.target_url } : {}) };
   } catch (error) {
@@ -859,7 +911,11 @@ async function processCi(
   // early skip may already have consumed it). Only an explicit 404 means
   // unbound: if api-rs can't say, do nothing at all, and take no claim.
   if (evaluation.failed) {
-    const lookup = await lookupBinding(ctx, owner, repo, number);
+    let lookup = await lookupBinding(ctx, owner, repo, number);
+    // A red head on a just-created PR can beat the binding's insert.
+    if (lookup.ok && !lookup.binding && isJustCreated(pr)) {
+      lookup = await recheckForBinding(ctx, owner, repo, number);
+    }
     if (!lookup.ok) return;
     if (lookup.binding) {
       // A binding for another PR (a recycled repo and number) says nothing

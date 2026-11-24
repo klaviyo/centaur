@@ -8,8 +8,8 @@ use std::env;
 
 use active_record_encryption::ActiveRecordEncryption;
 use centaur_console_db::{
-    ApiClient, ApiClientPrincipal, PR_OAUTH_PLACEHOLDER, REDACTED, SecretValues,
-    SlackChannelPermission, Subject, api_client_principals, build_config,
+    ApiClient, ApiClientPrincipal, PR_CREATE_GUARD_PATH, PR_OAUTH_PLACEHOLDER, REDACTED,
+    SecretValues, SlackChannelPermission, Subject, api_client_principals, build_config,
     build_config_with_github_user_id, find_api_client, find_direct_slack_channel_permission,
     find_principal, find_principal_by_foreign_id, find_user_id_by_email, models::Config,
 };
@@ -713,9 +713,12 @@ fn assert_guard_last(config: &Config) -> Value {
         json!([{
             "host": "api.github.com",
             "methods": ["POST"],
-            "paths": ["/repos/*/*/pulls"],
+            // The marker path api-rs's one create call sends to; ordinary
+            // `/repos/*/*/pulls` creation is not guarded.
+            "paths": ["//repos/*/*/pulls"],
         }])
     );
+    assert_eq!(PR_CREATE_GUARD_PATH, "//repos/*/*/pulls");
     assert!(guards[0].get("inject").is_none());
     guards[0]["source"].clone()
 }

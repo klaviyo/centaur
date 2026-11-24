@@ -919,6 +919,8 @@ describe("CI fix counter and escalation", () => {
       },
       state,
       userName: "centaur-bot",
+      // The binding re-check waits before believing a 404; no real waiting here.
+      sleep: async () => {},
     } as unknown as PrManagerContext;
   }
 
@@ -1563,7 +1565,11 @@ describe("PR session bindings", () => {
     // Another writer gets in before this many of the first /state calls, so the
     // revision they were derived from is stale by the time they arrive.
     interveneBeforeState?: number;
+    // The binding is not there yet for this many GETs: api-rs inserts it a
+    // moment after GitHub creates the PR.
+    appearsAfterGets?: number;
   }) {
+    let gets = 0;
     let interventions = input.interveneBeforeState ?? 0;
     const lookupFailures = [...(input.lookupFailures ?? [])];
     const stateFailures = [...(input.stateFailures ?? [])];
@@ -1584,6 +1590,8 @@ describe("PR session bindings", () => {
       const body = init?.body ? JSON.parse(String(init.body)) : undefined;
       calls.push({ body, method, path });
       if (method === "GET") {
+        gets += 1;
+        if (gets <= (input.appearsAfterGets ?? 0)) return new Response("not found", { status: 404 });
         const lookupFailure = lookupFailures.shift();
         if (lookupFailure) return new Response("x", { status: lookupFailure });
         if (input.lookupStatus) return new Response("x", { status: input.lookupStatus });
@@ -1665,6 +1673,9 @@ describe("PR session bindings", () => {
     // Head the PR reports on its Nth fetch (the last entry repeats).
     heads?: string[];
     nodeId?: string;
+    // When the PR was created; by default long ago, so it is past the window
+    // in which its binding could still be on its way.
+    createdAt?: string;
     // Overrides for the Nth PR read (0-based): the owns gate, then the fresh
     // read before a report, then the read after a head repair.
     perRead?: Record<number, { fails?: boolean; nodeId?: string; state?: string; updatedAt?: string }>;
@@ -1696,6 +1707,19 @@ describe("PR session bindings", () => {
       };
     const ctx = {
       octokit: {
+        // Like the client's paginate: page until a short page, mapping each.
+        paginate: async (
+          route: (params: Record<string, unknown>) => Promise<unknown>,
+          params: { per_page?: number },
+          map: (response: unknown) => unknown[],
+        ) => {
+          const items: unknown[] = [];
+          for (let page = 1; ; page += 1) {
+            const batch = map(await route({ ...params, page }));
+            items.push(...batch);
+            if (batch.length < (params.per_page ?? 30)) return items;
+          }
+        },
         graphql: async () => ({
           repository: {
             object: {
@@ -1719,14 +1743,16 @@ describe("PR session bindings", () => {
           repos: {
             getCommit: async () => ({ data: { author: { login: "centaur-bot" } } }),
             // Honours `per_page` like GitHub: 30 contexts unless more are asked for.
-            getCombinedStatusForRef: async (args: { per_page?: number }) => {
+            getCombinedStatusForRef: async (args: { page?: number; per_page?: number }) => {
               reads.push("status");
               const combined = input.github?.combinedStatus;
               if (combined === undefined || combined === "throw") {
                 throw new Error("not confirmable");
               }
               const all = combined.statuses as unknown[];
-              return { data: { ...combined, statuses: all.slice(0, args.per_page ?? 30) } };
+              const size = args.per_page ?? 30;
+              const start = ((args.page ?? 1) - 1) * size;
+              return { data: { ...combined, statuses: all.slice(start, start + size) } };
             },
           },
           checks: {
@@ -1760,6 +1786,7 @@ describe("PR session bindings", () => {
                     headSha: head,
                   }),
                   html_url: PR_URL,
+                  created_at: input.createdAt ?? "2026-01-01T00:00:00Z",
                   node_id: read.nodeId ?? input.nodeId ?? NODE_ID,
                   state: read.state ?? input.prState ?? "open",
                   updated_at:
@@ -1801,6 +1828,73 @@ describe("PR session bindings", () => {
     expect(state.keys().filter((key) => key.includes("ci-notice"))).toEqual([]);
 
   describe("failed CI", () => {
+    describe("a binding that is inserted just after the red head", () => {
+      const justCreated = () => new Date(Date.now() - 5_000).toISOString();
+
+      test("found on a re-check of a just-created PR: a notice, not a fix turn", async () => {
+        for (const appearsAfterGets of [1, 2]) {
+          const api = makeApi({ binding: { managed: true, closed: false }, appearsAfterGets });
+          const state = makeState();
+          const { ctx, sleeps } = makeCtx({ api, state, createdAt: justCreated() });
+          await handleCiEvent(ctx, "check_run", redCheckRun);
+          await drainBackgroundWork(2000);
+          expect(api.posts("/ci-failures")).toHaveLength(1);
+          expect(api.sessionCalls).toEqual([]);
+          expect(await state.get(PR_KEY)).toBeUndefined();
+          expect(sleeps).toEqual(appearsAfterGets === 1 ? [2_000] : [2_000, 5_000]);
+        }
+      });
+
+      test("still 404 for a just-created PR: the unchanged unbound flow, after the re-checks", async () => {
+        const api = makeApi({ binding: null });
+        const state = makeState();
+        const { ctx, sleeps } = makeCtx({ api, state, createdAt: justCreated() });
+        await handleCiEvent(ctx, "check_run", redCheckRun);
+        await drainBackgroundWork(2000);
+        expect(sleeps).toEqual([2_000, 5_000]);
+        expect(api.calls.filter((c) => c.method === "GET")).toHaveLength(3);
+        expect(api.posts("/ci-failures")).toHaveLength(0);
+        expect(api.sessionCalls.length).toBeGreaterThan(0);
+        expect(await state.get(PR_KEY)).toMatchObject({ consecutiveCiFixes: 1 });
+      });
+
+      test("an older PR with a 404 goes straight to the fix turn, with no sleep", async () => {
+        for (const createdAt of [
+          new Date(Date.now() - 120_000).toISOString(),
+          "2026-01-01T00:00:00Z",
+          undefined,
+        ]) {
+          const api = makeApi({ binding: null });
+          const state = makeState();
+          const { ctx, sleeps } = makeCtx({ api, state, createdAt });
+          if (createdAt === undefined) {
+            // A PR whose age can't be read is not treated as new either.
+            const pulls = ctx.octokit.rest.pulls as unknown as { get: () => Promise<{ data: object }> };
+            const get = pulls.get;
+            pulls.get = async () => ({ data: { ...(await get()).data, created_at: undefined } });
+          }
+          await handleCiEvent(ctx, "check_run", redCheckRun);
+          await drainBackgroundWork(2000);
+          expect(sleeps).toEqual([]);
+          expect(api.calls.filter((c) => c.method === "GET")).toHaveLength(1);
+          expect(api.sessionCalls.length).toBeGreaterThan(0);
+          expect(await state.get(PR_KEY)).toMatchObject({ consecutiveCiFixes: 1 });
+        }
+      });
+
+      test("a green head does not look for a binding at all", async () => {
+        const api = makeApi({ binding: null });
+        const { ctx, sleeps } = makeCtx({
+          api,
+          createdAt: justCreated(),
+          checkNode: { __typename: "CheckRun", name: "build", status: "COMPLETED", conclusion: "SUCCESS" },
+        });
+        await handleCiEvent(ctx, "check_run", redCheckRun);
+        expect(sleeps).toEqual([]);
+        expect(api.calls.filter((c) => c.method === "GET")).toHaveLength(0);
+      });
+    });
+
     test("an unbound red PR still gets the fix turn", async () => {
       const api = makeApi({ binding: null });
       const state = makeState();
@@ -2404,10 +2498,10 @@ describe("PR session bindings", () => {
         expect(passedApi.posts("/ci-failures")).toHaveLength(0);
       });
 
-      test("finds a failing status context beyond the default page of 30", async () => {
-        const statuses = Array.from({ length: 40 }, (_, index) => ({
+      test("finds a failing status context beyond the first page of 100", async () => {
+        const statuses = Array.from({ length: 230 }, (_, index) => ({
           context: `ctx-${index}`,
-          state: index === 35 ? "failure" : "success",
+          state: index === 215 ? "failure" : "success",
           target_url: `https://ci.example.test/ctx/${index}`,
         }));
         const api = bound();
@@ -2425,12 +2519,12 @@ describe("PR session bindings", () => {
             repository: { full_name: "base/repo" },
             sha: "abc123",
             state: "failure",
-            context: "ctx-35",
+            context: "ctx-215",
           }),
         );
         expect(body(api)).toMatchObject({
-          check_name: "ctx-35",
-          details_url: "https://ci.example.test/ctx/35",
+          check_name: "ctx-215",
+          details_url: "https://ci.example.test/ctx/215",
         });
       });
 
@@ -2622,6 +2716,7 @@ describe("PR session bindings", () => {
     type RunOpts = {
       assignees?: { login: string }[];
       heads?: string[];
+      appearsAfterGets?: number;
       lookupFailures?: number[];
       lookupStatus?: number;
       nodeId?: string;
@@ -2635,6 +2730,7 @@ describe("PR session bindings", () => {
     async function exec(binding: Binding | null, body: string, opts: RunOpts = {}) {
       const api = makeApi({
         binding,
+        appearsAfterGets: opts.appearsAfterGets,
         lookupFailures: opts.lookupFailures,
         lookupStatus: opts.lookupStatus,
         stateFailures: opts.stateFailures,
@@ -2643,6 +2739,7 @@ describe("PR session bindings", () => {
       await handlePullRequestEvent(ctx, body);
       await drainBackgroundWork(2000);
       return {
+        gets: api.calls.filter((c) => c.method === "GET").length,
         sleeps,
         updates: api.posts("/api/pr-bindings/base/repo/7/state").map((c) => c.body),
       };
@@ -2998,6 +3095,42 @@ describe("PR session bindings", () => {
       ]) {
         expect(await run(null, body)).toEqual([]);
       }
+    });
+
+    describe("a binding that is inserted just after the event", () => {
+      const assigned = prEvent("assigned", { assignee: { login: "centaur-bot" } });
+
+      test("an assignment of the bot re-checks, and records management once the binding appears", async () => {
+        const first = await exec(bound, assigned, { appearsAfterGets: 1 });
+        expect(first.updates).toEqual([
+          expect.objectContaining({ pr_node_id: NODE_ID, managed: true }),
+        ]);
+        expect(first.sleeps).toEqual([2_000]);
+        const second = await exec(bound, assigned, { appearsAfterGets: 2 });
+        expect(second.updates).toHaveLength(1);
+        expect(second.sleeps).toEqual([2_000, 5_000]);
+      });
+
+      test("still no binding after the re-checks: nothing is recorded, and the PR is unbound", async () => {
+        const result = await exec(null, assigned);
+        expect(result.updates).toEqual([]);
+        expect(result.gets).toBe(3);
+        expect(result.sleeps).toEqual([2_000, 5_000]);
+      });
+
+      test("other 404s stay immediate", async () => {
+        for (const body of [
+          prEvent("assigned", { assignee: { login: "a-human" } }),
+          prEvent("unassigned", { assignee: { login: "centaur-bot" } }),
+          prEvent("closed"),
+          prEvent("reopened"),
+          prEvent("synchronize"),
+        ]) {
+          const result = await exec(null, body);
+          expect(result.gets).toBe(1);
+          expect(result.sleeps).toEqual([]);
+        }
+      });
     });
 
     test("assigning the bot to an unbound red PR still takes it over with a fix turn", async () => {
