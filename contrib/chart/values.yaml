@@ -663,7 +663,11 @@ apiRs:
   # pull-requests). Turn it on only after every proxy-sync and githubbot
   # replica runs a version with the PR-create guard and the coded-miss rules,
   # and turn it off (letting in-flight creates drain) before rolling any of
-  # them back.
+  # them back. Once deployed, roll back only to versions that keep this
+  # feature's safeguards: an api-rs with this setting (an older one ignores it
+  # and leaves creation on), migration 0061 and the binding routes, and a
+  # githubbot whose red-CI path is binding-aware. Rolling back to a version
+  # from before this feature is not supported.
   trustedPrCreateEnabled: false
   # Controls whether a missing automatically derived session principal may be
   # created. "preapproved" admits only principals already present in the
