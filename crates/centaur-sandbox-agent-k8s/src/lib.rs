@@ -373,17 +373,21 @@ impl AgentSandboxBackend {
             .map_err(|err| map_kube_error("patch sandbox", err))
     }
 
-    async fn apply_configured_resources(
+    async fn apply_configured_agent_options(
         &self,
         id: &SandboxId,
         sandbox: &crd::Sandbox,
     ) -> SandboxResult<()> {
-        let Some(resources) = self.config.default_resources.as_ref() else {
+        let Some(patch) = sandbox_agent_options_patch(
+            sandbox,
+            &self.config.container_name,
+            self.config.default_resources.as_ref(),
+        )?
+        else {
             return Ok(());
         };
-        let patch = sandbox_resources_patch(sandbox, &self.config.container_name, resources)?;
         let patch = serde_json::from_value(patch).map_err(|error| {
-            SandboxError::backend(format!("build sandbox resources patch: {error}"))
+            SandboxError::backend(format!("build sandbox agent options patch: {error}"))
         })?;
         self.sandboxes()
             .patch(
@@ -392,11 +396,11 @@ impl AgentSandboxBackend {
                 &Patch::Json::<crd::Sandbox>(patch),
             )
             .await
-            .map_err(|err| map_kube_error("patch sandbox resources", err))?;
+            .map_err(|err| map_kube_error("patch sandbox agent options", err))?;
 
         // `resume` also repairs Created sandboxes, whose old Pod can already
         // exist. Recreate that Pod after updating the durable template so the
-        // running container cannot retain the previous resources.
+        // running container picks up the current agent options.
         self.recreate_existing_pod(id, sandbox_suspended(sandbox))
             .await
     }
@@ -914,7 +918,7 @@ impl SandboxBackend for AgentSandboxBackend {
         // Do not scale up with stale fleet policy. The container-name test
         // makes the replacement atomic against a reordered pod template.
         if let Some(sandbox) = &sandbox {
-            self.apply_configured_resources(id, sandbox).await?;
+            self.apply_configured_agent_options(id, sandbox).await?;
         }
         self.patch_sandbox_merge(id, sandbox_resume_patch(&capability_labels))
             .await?;
@@ -1166,6 +1170,9 @@ fn build_agent_sandbox(
         // Ready condition -- and therefore `SandboxStatus::Running` -- means the
         // process is accepting requests.
         container["readinessProbe"] = codemode_readiness_probe();
+    } else if is_session_sandbox(&spec.labels) {
+        // The agent entrypoint writes this after workspace and credential setup.
+        container["readinessProbe"] = agent_bootstrap_readiness_probe();
     }
     insert_optional(
         &mut container,
@@ -1483,39 +1490,67 @@ fn resources_json(spec: &SandboxSpec) -> Option<Value> {
     (!resources.is_empty()).then(|| json!(resources))
 }
 
-fn sandbox_resources_patch(
+fn is_session_sandbox(labels: &BTreeMap<String, String>) -> bool {
+    labels.get("centaur.ai/component").map(String::as_str) == Some("session-sandbox")
+        && !centaur_sandbox_core::is_codemode_workload(labels)
+}
+
+fn agent_bootstrap_readiness_probe() -> Value {
+    json!({
+        "exec": { "command": ["/usr/bin/test", "-f", "/home/agent/.ready"] },
+        "periodSeconds": 2,
+    })
+}
+
+fn sandbox_agent_options_patch(
     sandbox: &crd::Sandbox,
     container_name: &str,
-    resources: &ResourceRequirements,
-) -> SandboxResult<Value> {
-    let index = sandbox
+    resources: Option<&ResourceRequirements>,
+) -> SandboxResult<Option<Value>> {
+    let session = sandbox
+        .metadata
+        .labels
+        .as_ref()
+        .is_some_and(is_session_sandbox);
+    if resources.is_none() && !session {
+        return Ok(None);
+    }
+    let (index, container) = sandbox
         .spec
         .pod_template
         .spec
         .containers
         .iter()
-        .position(|container| container.name == container_name)
+        .enumerate()
+        .find(|(_, container)| container.name == container_name)
         .ok_or_else(|| {
             SandboxError::backend(format!("sandbox has no container named {container_name:?}"))
         })?;
-    let resources = if resources.is_empty() {
-        Value::Null
-    } else {
-        json!(resources)
-    };
-
-    Ok(json!([
-        {
-            "op": "test",
-            "path": format!("/spec/podTemplate/spec/containers/{index}/name"),
-            "value": container_name,
-        },
-        {
+    let add_readiness = session && container.readiness_probe.is_none();
+    if resources.is_none() && !add_readiness {
+        return Ok(None);
+    }
+    let path = format!("/spec/podTemplate/spec/containers/{index}");
+    let mut patch = vec![json!({
+        "op": "test",
+        "path": format!("{path}/name"),
+        "value": container_name,
+    })];
+    if let Some(resources) = resources {
+        patch.push(json!({
             "op": "add",
-            "path": format!("/spec/podTemplate/spec/containers/{index}/resources"),
-            "value": resources,
-        },
-    ]))
+            "path": format!("{path}/resources"),
+            "value": (!resources.is_empty()).then_some(resources),
+        }));
+    }
+    if add_readiness {
+        patch.push(json!({
+            "op": "add",
+            "path": format!("{path}/readinessProbe"),
+            "value": agent_bootstrap_readiness_probe(),
+        }));
+    }
+    Ok(Some(Value::Array(patch)))
 }
 
 fn state_volume_claim_json(state_volume: &StateVolumeConfig) -> Vec<Value> {
@@ -1899,7 +1934,9 @@ mod tests {
             .request("cpu", "2")
             .limit("memory", "8Gi");
 
-        let patch = sandbox_resources_patch(&sandbox, "agent", &resources).unwrap();
+        let patch = sandbox_agent_options_patch(&sandbox, "agent", Some(&resources))
+            .unwrap()
+            .unwrap();
 
         assert_eq!(
             patch,
@@ -1931,7 +1968,9 @@ mod tests {
         )
         .unwrap();
         let patch =
-            sandbox_resources_patch(&sandbox, "agent", &ResourceRequirements::default()).unwrap();
+            sandbox_agent_options_patch(&sandbox, "agent", Some(&ResourceRequirements::default()))
+                .unwrap()
+                .unwrap();
 
         assert!(patch[1]["value"].is_null());
     }
@@ -2565,6 +2604,41 @@ mod tests {
             pod_workload_address(&pod(pod_json("sbx", "Pending", false, None))),
             None
         );
+    }
+
+    #[test]
+    fn session_sandbox_readiness_waits_for_agent_bootstrap() {
+        let config = AgentSandboxConfig::new("test-ns", test_iron_control_settings());
+        let spec = SandboxSpec::new("agent:test")
+            .label("centaur.ai/component", "session-sandbox")
+            .args(["harness-server", "codex"]);
+        let sandbox = build_agent_sandbox(&SandboxId::new("sbx-test"), &spec, &config).unwrap();
+        let sandbox = serde_json::to_value(sandbox).unwrap();
+        assert_eq!(
+            sandbox["spec"]["podTemplate"]["spec"]["containers"][0]["readinessProbe"]["exec"]["command"],
+            json!(["/usr/bin/test", "-f", "/home/agent/.ready"])
+        );
+    }
+
+    #[test]
+    fn resume_adds_bootstrap_probe_to_a_legacy_session_template() {
+        let config = AgentSandboxConfig::new("test-ns", test_iron_control_settings());
+        let spec = SandboxSpec::new("agent:test").label("centaur.ai/component", "session-sandbox");
+        let mut sandbox = build_agent_sandbox(&SandboxId::new("sbx-test"), &spec, &config).unwrap();
+        assert!(
+            sandbox_agent_options_patch(&sandbox, "agent", None)
+                .unwrap()
+                .is_none()
+        );
+        sandbox.spec.pod_template.spec.containers[0].readiness_probe = None;
+        let patch = sandbox_agent_options_patch(&sandbox, "agent", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            patch[1]["path"],
+            "/spec/podTemplate/spec/containers/0/readinessProbe"
+        );
+        assert_eq!(patch[1]["value"], agent_bootstrap_readiness_probe());
     }
 
     #[test]
