@@ -9,9 +9,9 @@ use std::env;
 use active_record_encryption::ActiveRecordEncryption;
 use centaur_console_db::{
     ApiClient, ApiClientPrincipal, REDACTED, SecretValues, SlackChannelPermission, Subject,
-    api_client_principals, build_config, find_api_client, find_direct_slack_channel_permission,
-    find_principal, find_principal_by_foreign_id, find_user_id_by_email, github_user_id,
-    models::Config,
+    api_client_principals, build_config, build_config_with_github_user_id, find_api_client,
+    find_direct_slack_channel_permission, find_principal, find_principal_by_foreign_id,
+    find_user_id_by_email, models::Config,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -580,16 +580,126 @@ async fn reads_api_clients_and_their_principals() {
     );
 }
 
-async fn github_account(fixture: &Fixture, principal: i64) -> Option<String> {
+/// The delivered config and the GitHub account derived with it, in one call.
+async fn github_config(fixture: &Fixture, principal: i64) -> (Config, Option<String>) {
     let encryption = ActiveRecordEncryption::new(PRIMARY_KEY, SALT);
-    github_user_id(
+    let empty = json!([]);
+    let labels = json!({});
+    let subject = Subject {
+        principal_id: principal,
+        principal: None,
+        console_user_id: None,
+        console_user_email: None,
+        slack_history_channel_ids: &empty,
+        proxy_labels: &labels,
+    };
+    build_config_with_github_user_id(
         &fixture.pool,
         SecretValues::Live(&encryption),
-        principal,
+        &subject,
         None,
     )
     .await
     .unwrap()
+}
+
+async fn github_account(fixture: &Fixture, principal: i64) -> Option<String> {
+    github_config(fixture, principal).await.1
+}
+
+/// The `Authorization` secrets the config delivers for `api.github.com`.
+fn github_secrets(config: &Config) -> Vec<&Value> {
+    config
+        .secrets
+        .iter()
+        .filter(|secret| {
+            secret["inject"]["header"] == "Authorization"
+                && secret["rules"] == json!([{ "host": "api.github.com" }])
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_account_is_derived_from_the_credentials_the_config_delivers() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let actor = fixture.owner_principal("one-load").await;
+    fixture
+        .brokered_token(
+            actor,
+            "github-delivered",
+            "github",
+            Some("90210001"),
+            "api.github.com",
+            100,
+            fixture.personal(),
+        )
+        .await;
+
+    // The account is the one behind the single GitHub secret in the config.
+    let (config, account) = github_config(&fixture, actor).await;
+    assert_eq!(account.as_deref(), Some("90210001"));
+    assert_eq!(github_secrets(&config).len(), 1);
+
+    // A weaker competitor is withheld from the config, so it neither changes
+    // the account nor appears.
+    fixture
+        .brokered_token(
+            actor,
+            "github-withheld",
+            "github",
+            Some("90210002"),
+            "api.github.com",
+            0,
+            fixture.personal(),
+        )
+        .await;
+    let (config, account) = github_config(&fixture, actor).await;
+    assert_eq!(account.as_deref(), Some("90210001"));
+    assert_eq!(github_secrets(&config).len(), 1);
+
+    // An equal competitor is delivered too, so the config carries two and no
+    // account is claimed.
+    fixture
+        .brokered_token(
+            actor,
+            "github-competing",
+            "github",
+            Some("90210003"),
+            "api.github.com",
+            100,
+            fixture.personal(),
+        )
+        .await;
+    let (config, account) = github_config(&fixture, actor).await;
+    assert_eq!(account, None);
+    assert_eq!(github_secrets(&config).len(), 2);
+
+    // A token that cannot be delivered (none minted yet) is in neither.
+    let undelivered = fixture.owner_principal("one-load-undelivered").await;
+    let secret = fixture
+        .brokered_token(
+            undelivered,
+            "github-undelivered",
+            "github",
+            Some("90210004"),
+            "api.github.com",
+            100,
+            fixture.personal(),
+        )
+        .await;
+    sqlx::query(
+        "UPDATE broker_credentials SET access_token = NULL \
+         WHERE id = (SELECT broker_credential_id FROM static_secrets WHERE id = $1)",
+    )
+    .bind(secret)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    let (config, account) = github_config(&fixture, undelivered).await;
+    assert_eq!(account, None);
+    assert!(github_secrets(&config).is_empty());
 }
 
 #[tokio::test]

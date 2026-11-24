@@ -1917,6 +1917,85 @@ describe('slackbotv2', () => {
     await firstMention.finished()
   })
 
+  describe('a reply under a failed-CI notice', () => {
+    // api-rs posts the notice into the Slack thread that owns the session; it
+    // does not run a turn. A human answering it is today's normal flow: the
+    // reply is an @-mention in that thread, so it routes to the same session
+    // key under the usual mention-gated authorization. slackbotv2 needs no
+    // change for it.
+    const NOTICE_TEXT =
+      'CI failed on <https://github.com/acme/widgets/pull/7|acme/widgets#7> at `abc1234`: ' +
+      "<https://ci.example.test/runs/1|build>\n@-mention me in this thread if you'd like me to fix it."
+
+    async function postNotice(rootTs: string) {
+      // Posted by the bot identity, as api-rs does; no webhook event is delivered for it.
+      const notice = await slackBot.chat.postMessage({
+        channel: CHANNEL_ID,
+        thread_ts: rootTs,
+        text: NOTICE_TEXT
+      })
+      expect(notice.ok).toBe(true)
+      return notice
+    }
+
+    it('starts a turn on the session thread key the notice was posted to', async () => {
+      const root = await sendMessage(`<@${BOT_USER_ID}> open a pull request for the fix`)
+      expect(root.response.status).toBe(200)
+      await root.finished()
+      const key = threadKey(root.ts)
+      expect(codexApi.executes.map(request => request.threadKey)).toEqual([key])
+
+      await postNotice(root.ts)
+      const reply = await sendMessage(`<@${BOT_USER_ID}> yes, please fix it`, {
+        threadTs: root.ts
+      })
+      expect(reply.response.status).toBe(200)
+      await reply.finished()
+
+      // The reply starts a turn on the same session, not a new one.
+      expect(codexApi.executes.map(request => request.threadKey)).toEqual([key, key])
+      expect(codexApi.appends.map(request => request.threadKey)).toEqual([key, key])
+      expect(codexApi.creates.every(create => create.threadKey === key)).toBe(true)
+      const replyMessages = codexApi.appends[1]!.body.messages
+      expect(JSON.stringify(replyMessages)).toContain('yes, please fix it')
+      expect(codexApi.executes[1]!.body.idempotency_key).toBe(reply.ts)
+    })
+
+    it('steers the running turn on the session thread key', async () => {
+      codexApi.autoRespond = false
+      const root = await sendMessage(`<@${BOT_USER_ID}> start working on the pull request`)
+      expect(root.response.status).toBe(200)
+      await waitFor(() => codexApi.streamCount === 1)
+      const key = threadKey(root.ts)
+
+      await postNotice(root.ts)
+      const reply = await sendMessage(`<@${BOT_USER_ID}> fix it please`, { threadTs: root.ts })
+      expect(reply.response.status).toBe(200)
+      await reply.finished()
+
+      // Handed to the running execution: a second append on the same key, and
+      // no second execution.
+      expect(codexApi.appends.map(request => request.threadKey)).toEqual([key, key])
+      expect(JSON.stringify(codexApi.appends[1]!.body.messages)).toContain('fix it please')
+      expect(codexApi.executes.map(request => request.threadKey)).toEqual([key])
+
+      codexApi.emitOutputLines(key, sampleCodexOutputLines('Done.'))
+      await root.finished()
+    })
+
+    it('does not start a turn for an unmentioned reply, which stays mention-gated', async () => {
+      const root = await sendMessage(`<@${BOT_USER_ID}> open a pull request for the fix`)
+      await root.finished()
+      expect(codexApi.executes).toHaveLength(1)
+
+      await postNotice(root.ts)
+      const chatter = await sendMessage('thanks, will look later', { threadTs: root.ts })
+      expect(chatter.response.status).toBe(200)
+      await chatter.finished()
+      expect(codexApi.executes).toHaveLength(1)
+    })
+  })
+
   it('auto-disables steering reactions when reactions:write is missing', async () => {
     const logs: CapturedLog[] = []
     bot = createTestBot({

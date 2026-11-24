@@ -5,8 +5,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use centaur_console_db::{
-    SecretValues, SlackChannels as ConsoleSlackChannels, github_user_id, models::Config, oid,
-    slack_channels,
+    SlackChannels as ConsoleSlackChannels, models::Config, oid, slack_channels,
 };
 
 use crate::{
@@ -83,6 +82,7 @@ pub(crate) async fn append_api_jwt(
     state: &AppState,
     proxy: &ProxyRecord,
     config: &mut Config,
+    github_user_id: Option<String>,
     now: i64,
 ) -> Result<(), ApiError> {
     let (Some(secret), Some(principal_id)) = (&state.jwt_secret, proxy.principal_id) else {
@@ -92,13 +92,6 @@ pub(crate) async fn append_api_jwt(
         return Ok(());
     }
     let channels = slack_channels(&state.pool, principal_id).await?;
-    let github_user_id = github_user_id(
-        &state.pool,
-        SecretValues::Live(&state.encryption),
-        principal_id,
-        proxy.requester_principal_id,
-    )
-    .await?;
     let principal_oid = oid("prn", principal_id);
     let iat = window_start(&principal_oid, now, 900);
     let claims = api_jwt_claims(proxy, principal_oid, iat, channels, github_user_id);

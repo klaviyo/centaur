@@ -23,14 +23,16 @@ pub(crate) async fn build_config(
         slack_history_channel_ids: &proxy.slack_history_channel_ids,
         proxy_labels: &proxy.labels,
     };
-    let mut config = centaur_console_db::build_config(
+    // The GitHub account the API token attests comes from the same resolved
+    // credentials as the delivered config, in one load.
+    let (mut config, github_user_id) = centaur_console_db::build_config_with_github_user_id(
         &state.pool,
         SecretValues::Live(&state.encryption),
         &subject,
         proxy.requester_principal_id,
     )
     .await?;
-    append_api_jwt(state, proxy, &mut config, now).await?;
+    append_api_jwt(state, proxy, &mut config, github_user_id, now).await?;
     append_sandbox_jwt(state, proxy, &mut config, now)?;
     Ok(config)
 }

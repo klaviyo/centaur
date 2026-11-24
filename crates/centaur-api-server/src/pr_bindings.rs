@@ -25,8 +25,8 @@ use centaur_sandbox_core::SandboxError;
 use centaur_session_core::{ChatDestination, ThreadKey};
 use centaur_session_runtime::SessionRuntimeError;
 use centaur_session_sqlx::{
-    NewPrBinding, PgSessionStore, PrBinding, PrBindingStateUpdate, SessionStoreError,
-    normalize_pr_repository,
+    NewPrBinding, PgSessionStore, PrBinding, PrBindingStateUpdate, PrCiNoticeClaim,
+    SessionStoreError, normalize_pr_repository,
 };
 use centaur_workflows::{WorkflowRuntimeError, send_slack_request};
 use serde::Deserialize;
@@ -465,8 +465,9 @@ async fn binding_for_pr(
 }
 
 /// `POST /api/pr-bindings/{owner}/{repo}/{number}/state`: records `managed`,
-/// `closed` and `head_sha` on an existing binding for the named PR, unless a
-/// later observation already did (`applied: false`, nothing changed). It
+/// `closed` and `head_sha` on an existing binding for the named PR. Each field
+/// is ordered by its own observation time: a field a later observation already
+/// set is left alone, and `applied` reports whether any field changed. It
 /// cannot create or rebind a binding. Returns the binding and `applied`.
 pub(crate) async fn update_pr_binding_state(
     State(state): State<AppState>,
@@ -481,6 +482,7 @@ pub(crate) async fn update_pr_binding_state(
         .update_pr_binding_state(
             &repository,
             number,
+            &request.pr_node_id,
             &PrBindingStateUpdate {
                 managed: request.managed,
                 closed: request.closed,
@@ -577,8 +579,7 @@ pub(crate) async fn report_pr_ci_failure(
 /// the binding (ordered by `observed_updated_at`); the head never is. The post
 /// happens here, in the same request, so the checks cannot go stale in a
 /// queue. It is claimed once per `(PR node id, head)` first; a failed post
-/// releases the claim and fails the request, so githubbot releases its own
-/// claim and a later event can try again.
+/// releases the claim and fails the request, so a later event can try again.
 async fn process_ci_failure<P, Fut>(
     store: &PgSessionStore,
     repository: &str,
@@ -590,15 +591,18 @@ where
     P: FnOnce(Value) -> Fut,
     Fut: Future<Output = Result<Value, WorkflowRuntimeError>>,
 {
-    request.validate()?;
-    let binding = binding_for_pr(store, repository, number, &request.pr_node_id).await?;
+    process_ci_failure_with(store, repository, number, request, || async {}, post).await
+}
 
-    // The head is maintained only by the state route, from githubbot's fresh
-    // fetch; a failure report never moves it. It is current only when the
-    // binding, the failing check and the fresh fetch all name the same head.
+/// Why a failed check on `binding` deserves no notice, if it doesn't: the
+/// PR is closed or unassigned in the fresh read, the binding is not managed
+/// or is closed, or the failing head is not the binding's head and the PR's
+/// current head. The head is maintained only by the state route, from
+/// githubbot's fresh fetch; a failure report never moves it.
+fn skip_reason(binding: &PrBinding, request: &CiFailureRequest) -> Option<&'static str> {
     let current =
         binding.head_sha == request.head_sha && request.head_sha == request.current_head_sha;
-    let reason = if !request.open {
+    if !request.open {
         Some("not_open")
     } else if !request.assigned {
         Some("not_assigned")
@@ -610,9 +614,30 @@ where
         Some("stale_head")
     } else {
         None
-    };
+    }
+}
 
-    if let Some(reason) = reason {
+/// [`process_ci_failure`], with `before_claim` run between the binding read
+/// and the claim. That is the window in which the binding can change under
+/// the request; production passes a no-op, and tests commit a change there.
+async fn process_ci_failure_with<B, BFut, P, Fut>(
+    store: &PgSessionStore,
+    repository: &str,
+    number: i64,
+    request: &CiFailureRequest,
+    before_claim: B,
+    post: P,
+) -> Result<Value, ApiError>
+where
+    B: FnOnce() -> BFut,
+    BFut: Future<Output = ()>,
+    P: FnOnce(Value) -> Fut,
+    Fut: Future<Output = Result<Value, WorkflowRuntimeError>>,
+{
+    request.validate()?;
+    let binding = binding_for_pr(store, repository, number, &request.pr_node_id).await?;
+
+    if let Some(reason) = skip_reason(&binding, request) {
         // Closure and unassignment are facts about the PR, recorded so later
         // events for the same head stay dropped.
         let mut update = PrBindingStateUpdate::default();
@@ -627,6 +652,7 @@ where
                 .update_pr_binding_state(
                     &binding.repository,
                     binding.number,
+                    &binding.pr_node_id,
                     &update,
                     Some(request.observed_updated_at),
                 )
@@ -648,12 +674,27 @@ where
         return Ok(json!({"notice": "skipped", "reason": reason}));
     };
 
-    let claimed = store
-        .claim_pr_ci_notice(&binding.pr_node_id, &request.head_sha, &binding.thread_key)
+    before_claim().await;
+    // One conditional insert: it claims only while the binding is still this
+    // PR at this head, managed and open, whatever happened since the read.
+    match store
+        .claim_pr_ci_notice(
+            &binding.repository,
+            binding.number,
+            &binding.pr_node_id,
+            &request.head_sha,
+        )
         .await
-        .map_err(SessionRuntimeError::from)?;
-    if !claimed {
-        return Ok(json!({"notice": "duplicate"}));
+        .map_err(SessionRuntimeError::from)?
+    {
+        PrCiNoticeClaim::Claimed => {}
+        PrCiNoticeClaim::Duplicate => return Ok(json!({"notice": "duplicate"})),
+        PrCiNoticeClaim::NotEligible => {
+            // Changed after the read: say why from the binding as it is now.
+            let current = binding_for_pr(store, repository, number, &request.pr_node_id).await?;
+            let reason = skip_reason(&current, request).unwrap_or("binding_changed");
+            return Ok(json!({"notice": "skipped", "reason": reason}));
+        }
     }
     if let Err(error) = post(message).await {
         tracing::warn!(
@@ -711,7 +752,7 @@ fn notice_message(binding: &PrBinding, request: &CiFailureRequest) -> Option<Val
         "channel": channel_id,
         "thread_ts": thread_ts,
         "text": format!(
-            "CI failed on {pull_request} at `{sha7}`: {check}\nReply in this thread if you'd like me to fix it."
+            "CI failed on {pull_request} at `{sha7}`: {check}\n@-mention me in this thread if you'd like me to fix it."
         ),
         "unfurl_links": false,
         "unfurl_media": false,
@@ -1764,6 +1805,7 @@ mod tests {
             .update_pr_binding_state(
                 &repository,
                 7,
+                &h.node_id(),
                 &PrBindingStateUpdate {
                     managed: Some(managed),
                     ..Default::default()
@@ -1794,7 +1836,7 @@ mod tests {
 
     async fn set_state(h: &Harness, repository: &str, update: PrBindingStateUpdate) {
         h.store
-            .update_pr_binding_state(repository, 7, &update, None)
+            .update_pr_binding_state(repository, 7, &h.node_id(), &update, None)
             .await
             .unwrap();
     }
@@ -1834,9 +1876,87 @@ mod tests {
         assert_eq!(
             posts[0]["text"],
             format!(
-                "CI failed on <https://github.com/{repository}/pull/7|{repository}#7> at `abcdef1`: <https://github.com/acme/widgets/actions/runs/1|unit tests>\nReply in this thread if you'd like me to fix it."
+                "CI failed on <https://github.com/{repository}/pull/7|{repository}#7> at `abcdef1`: <https://github.com/acme/widgets/actions/runs/1|unit tests>\n@-mention me in this thread if you'd like me to fix it."
             )
         );
+    }
+
+    #[tokio::test]
+    async fn a_change_committed_between_the_read_and_the_claim_posts_nothing() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let (repository, _) = bound_pr(&h, true).await;
+        let slack = Slack::default();
+        let request = h.ci("abcdef1", "abcdef1", true, true);
+
+        // Each of these commits after the route read an eligible binding and
+        // before it claims. The claim is one conditional insert, so it finds
+        // the row changed and nothing is posted.
+        for (label, change, restore, reason) in [
+            (
+                "closed",
+                PrBindingStateUpdate {
+                    closed: Some(true),
+                    ..Default::default()
+                },
+                PrBindingStateUpdate {
+                    closed: Some(false),
+                    ..Default::default()
+                },
+                "closed",
+            ),
+            (
+                "unassigned",
+                PrBindingStateUpdate {
+                    managed: Some(false),
+                    ..Default::default()
+                },
+                PrBindingStateUpdate {
+                    managed: Some(true),
+                    ..Default::default()
+                },
+                "not_managed",
+            ),
+            (
+                "new head",
+                PrBindingStateUpdate {
+                    head_sha: Some("fedcba9".to_owned()),
+                    ..Default::default()
+                },
+                PrBindingStateUpdate {
+                    head_sha: Some("abcdef1".to_owned()),
+                    ..Default::default()
+                },
+                "stale_head",
+            ),
+        ] {
+            let outcome = process_ci_failure_with(
+                &h.store,
+                &repository,
+                7,
+                &request,
+                || async { set_state(&h, &repository, change).await },
+                |message| slack.post(message),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                outcome,
+                json!({"notice": "skipped", "reason": reason}),
+                "{label}"
+            );
+            assert!(slack.posts().is_empty(), "{label}: {:?}", slack.posts());
+            set_state(&h, &repository, restore).await;
+        }
+
+        // None of those left a claim behind: with the binding restored, the
+        // same report posts.
+        assert_eq!(
+            report(&h, &repository, &request, &slack).await.unwrap(),
+            json!({"notice": "posted"})
+        );
+        assert_eq!(slack.posts().len(), 1);
     }
 
     #[tokio::test]
@@ -2013,7 +2133,12 @@ mod tests {
             .update_pr_binding_state(
                 &repository,
                 7,
-                &PrBindingStateUpdate::default(),
+                &h.node_id(),
+                &PrBindingStateUpdate {
+                    closed: Some(false),
+                    managed: Some(true),
+                    ..Default::default()
+                },
                 Some(observed_at(30)),
             )
             .await
@@ -2167,7 +2292,7 @@ mod tests {
             (body["applied"].clone(), body["closed"].clone()),
             (json!(false), json!(false))
         );
-        assert_eq!(body["github_updated_at"], "2026-11-20T10:00:30Z");
+        assert_eq!(body["closed_observed_at"], "2026-11-20T10:00:30Z");
         let binding = h.store.pr_binding(&repository, 7).await.unwrap().unwrap();
         assert!(!binding.closed);
     }
@@ -2212,15 +2337,19 @@ mod tests {
             })
             .await
             .unwrap();
-        set_state(
-            &h,
-            &repository,
-            PrBindingStateUpdate {
-                managed: Some(true),
-                ..Default::default()
-            },
-        )
-        .await;
+        h.store
+            .update_pr_binding_state(
+                &repository,
+                7,
+                &new_node,
+                &PrBindingStateUpdate {
+                    managed: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
 
         // A report still naming the old PR cannot drive the new binding.
         let error = report(&h, &repository, &request, &slack).await.unwrap_err();

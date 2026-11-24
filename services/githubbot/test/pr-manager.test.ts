@@ -33,6 +33,9 @@ function makeState() {
     async delete(key: string) {
       values.delete(key);
     },
+    keys() {
+      return [...values.keys()];
+    },
   };
 }
 
@@ -1552,6 +1555,9 @@ describe("PR session bindings", () => {
     const stateFailures = [...(input.stateFailures ?? [])];
     // The binding as api-rs holds it: a state write moves its head.
     const current = input.binding ? { ...input.binding } : null;
+    // api-rs's dedupe authority: one notice per (pr_node_id, head_sha).
+    const noticed = new Set<string>();
+    const notices: string[] = [];
     const calls: Call[] = [];
     const sessionCalls: string[] = [];
     const fetch = async (url: string | URL | Request, init?: RequestInit) => {
@@ -1569,7 +1575,14 @@ describe("PR session bindings", () => {
         if (!input.binding) return new Response("not found", { status: 404 });
         return Response.json(bindingJson(current ?? input.binding));
       }
-      if (path.endsWith("/ci-failures")) return Response.json({ notice: "posted" });
+      if (path.endsWith("/ci-failures")) {
+        const report = body as { pr_node_id: string; head_sha: string };
+        const key = `${report.pr_node_id}:${report.head_sha}`;
+        const notice = noticed.has(key) ? "duplicate" : "posted";
+        noticed.add(key);
+        notices.push(notice);
+        return Response.json({ notice });
+      }
       const failure = stateFailures.shift();
       if (failure === "network") throw new TypeError("fetch failed");
       if (failure) return new Response("unavailable", { status: failure });
@@ -1583,7 +1596,7 @@ describe("PR session bindings", () => {
     };
     const posts = (suffix: string) =>
       calls.filter((c) => c.method === "POST" && c.path.endsWith(suffix));
-    return { calls, fetch, posts, sessionCalls };
+    return { calls, fetch, notices, posts, sessionCalls };
   }
 
   function makeCtx(input: {
@@ -1676,7 +1689,9 @@ describe("PR session bindings", () => {
   }
 
   const PR_KEY = "centaur-githubbot:pr:base/repo#7";
-  const NOTICE_CLAIM = "centaur-githubbot:ci-notice:base/repo#7:abc123";
+  /** githubbot keeps no notice claim of its own: api-rs is the dedupe authority. */
+  const noNoticeClaim = (state: ReturnType<typeof makeState>) =>
+    expect(state.keys().filter((key) => key.includes("ci-notice"))).toEqual([]);
 
   describe("failed CI", () => {
     test("an unbound red PR still gets the fix turn", async () => {
@@ -1749,12 +1764,27 @@ describe("PR session bindings", () => {
       expect("details_url" in body).toBe(false);
     });
 
-    test("a repeat delivery for the same head does not report twice", async () => {
+    test("a repeat delivery for the same head sends at most one notice, because api-rs answers duplicate", async () => {
       const api = makeApi({ binding: { managed: true, closed: false } });
-      const { ctx } = makeCtx({ api });
+      const state = makeState();
+      const { ctx } = makeCtx({ api, state });
       await handleCiEvent(ctx, "check_run", redCheckRun);
       await handleCiEvent(ctx, "check_run", redCheckRun);
-      expect(api.posts("/ci-failures")).toHaveLength(1);
+      // githubbot reports every eligible delivery; api-rs decides.
+      expect(api.posts("/ci-failures")).toHaveLength(2);
+      expect(api.notices).toEqual(["posted", "duplicate"]);
+      noNoticeClaim(state);
+    });
+
+    test("a repo, number and head reused with a different PR node id is not suppressed by githubbot", async () => {
+      const state = makeState();
+      const first = makeApi({ binding: { managed: true, closed: false, pr_node_id: "PR_old" } });
+      await handleCiEvent(makeCtx({ api: first, state, nodeId: "PR_old" }).ctx, "check_run", redCheckRun);
+      const reused = makeApi({ binding: { managed: true, closed: false, pr_node_id: "PR_new" } });
+      await handleCiEvent(makeCtx({ api: reused, state, nodeId: "PR_new" }).ctx, "check_run", redCheckRun);
+      expect(first.notices).toEqual(["posted"]);
+      expect(reused.notices).toEqual(["posted"]);
+      expect(reused.posts("/ci-failures")[0]?.body).toMatchObject({ pr_node_id: "PR_new" });
     });
 
     test("a stale head is not reported, whether stale at the event or by report time", async () => {
@@ -1798,7 +1828,7 @@ describe("PR session bindings", () => {
       const { ctx } = makeCtx({ api, state, assignees: [{ login: "a-human" }] });
       await handleCiEvent(ctx, "check_run", redCheckRun);
       expect(api.posts("/ci-failures")).toHaveLength(0);
-      expect(await state.get(NOTICE_CLAIM)).toBeUndefined();
+      noNoticeClaim(state);
       expect(api.sessionCalls).toEqual([]);
     });
 
@@ -1817,7 +1847,7 @@ describe("PR session bindings", () => {
       };
       await handleCiEvent(ctx, "check_run", redCheckRun);
       expect(api.posts("/ci-failures")).toHaveLength(0);
-      expect(await state.get(NOTICE_CLAIM)).toBeUndefined();
+      noNoticeClaim(state);
       expect(api.sessionCalls).toEqual([]);
     });
 
@@ -1827,17 +1857,20 @@ describe("PR session bindings", () => {
       expect(api.posts("/ci-failures")).toHaveLength(0);
     });
 
-    test("records the fresh head first when CI beats the synchronize event, then reports once", async () => {
+    test("records the fresh head first when CI beats the synchronize event, then sends one notice", async () => {
       const api = makeApi({ binding: { managed: true, closed: false, head_sha: "old111" } });
       const { ctx } = makeCtx({ api });
-      await handleCiEvent(ctx, "check_run", redCheckRun);
-      // No later event arrives; a repeat delivery must not report again either.
       await handleCiEvent(ctx, "check_run", redCheckRun);
       const writes = api.calls.filter((c) => c.method === "POST").map((c) => [c.path.split("/").pop(), c.body]);
       expect(writes).toEqual([
         ["state", { pr_node_id: NODE_ID, observed_updated_at: UPDATED_AT, head_sha: "abc123" }],
         ["ci-failures", expect.objectContaining({ head_sha: "abc123", current_head_sha: "abc123" })],
       ]);
+      // No synchronize event follows. A repeat delivery needs no second head
+      // write, and api-rs answers duplicate: still one notice.
+      await handleCiEvent(ctx, "check_run", redCheckRun);
+      expect(api.posts("/state")).toHaveLength(1);
+      expect(api.notices).toEqual(["posted", "duplicate"]);
     });
 
     test("writes no head when the binding already has the current one", async () => {
@@ -1854,7 +1887,7 @@ describe("PR session bindings", () => {
       const state = makeState();
       await handleCiEvent(makeCtx({ api, state }).ctx, "check_run", redCheckRun);
       expect(api.posts("/ci-failures")).toHaveLength(0);
-      expect(await state.get(NOTICE_CLAIM)).toBeUndefined();
+      noNoticeClaim(state);
     });
 
     test("a binding for another PR (reused number) is neither reported nor given a turn", async () => {
@@ -1865,7 +1898,7 @@ describe("PR session bindings", () => {
       await drainBackgroundWork(2000);
       expect(api.posts("/ci-failures")).toHaveLength(0);
       expect(api.sessionCalls).toEqual([]);
-      expect(await state.get(NOTICE_CLAIM)).toBeUndefined();
+      noNoticeClaim(state);
       expect(await state.get(PR_KEY)).toBeUndefined();
     });
 
@@ -1877,12 +1910,12 @@ describe("PR session bindings", () => {
       expect(api.posts("/ci-failures")).toHaveLength(1);
     });
 
-    test("an ineligible attempt keeps no claim, so the report goes out once management starts", async () => {
+    test("an ineligible attempt reports nothing and consumes nothing, so the report goes out once management starts", async () => {
       const state = makeState();
       const early = makeApi({ binding: { managed: false, closed: false } });
       await handleCiEvent(makeCtx({ api: early, state }).ctx, "check_run", redCheckRun);
       expect(early.posts("/ci-failures")).toHaveLength(0);
-      expect(await state.get(NOTICE_CLAIM)).toBeUndefined();
+      noNoticeClaim(state);
       expect(await state.get("centaur-githubbot:ci-settled:base/repo#7:abc123")).toBeUndefined();
 
       const later = makeApi({ binding: { managed: true, closed: false } });
@@ -1890,28 +1923,34 @@ describe("PR session bindings", () => {
       expect(later.posts("/ci-failures")).toHaveLength(1);
     });
 
-    test("keeps the claim only when the notice posted or was a duplicate", async () => {
-      const outcomes: [Response | "throw", boolean][] = [
-        [Response.json({ notice: "posted" }), true],
-        [Response.json({ notice: "duplicate" }), true],
-        [Response.json({ notice: "skipped", reason: "stale_head" }), false],
-        [new Response(JSON.stringify({ error: { code: "slack_post_failed" } }), { status: 502 }), false],
-        [Response.json({ notice: "weird" }), false],
-        ["throw", false],
+    test("posted and duplicate are done; skipped and errors are only logged, and none leaves a claim", async () => {
+      const outcomes: (Response | "throw")[] = [
+        Response.json({ notice: "posted" }),
+        Response.json({ notice: "duplicate" }),
+        Response.json({ notice: "skipped", reason: "stale_head" }),
+        new Response(JSON.stringify({ error: { code: "slack_post_failed" } }), { status: 502 }),
+        Response.json({ notice: "weird" }),
+        "throw",
       ];
-      for (const [outcome, kept] of outcomes) {
+      for (const outcome of outcomes) {
         const state = makeState();
         const api = makeApi({ binding: { managed: true, closed: false } });
         const reporting = {
           ...api,
           fetch: async (url: string | URL | Request, init?: RequestInit) => {
             if (!String(url).endsWith("/ci-failures")) return api.fetch(url, init);
+            api.calls.push({ body: undefined, method: "POST", path: "/ci-failures" });
             if (outcome === "throw") throw new TypeError("fetch failed");
             return outcome.clone();
           },
         };
-        await handleCiEvent(makeCtx({ api: reporting, state }).ctx, "check_run", redCheckRun);
-        expect(await state.get(NOTICE_CLAIM) !== undefined).toBe(kept);
+        const { ctx } = makeCtx({ api: reporting, state });
+        // Never throws, and a redelivery reports again rather than being blocked locally.
+        await handleCiEvent(ctx, "check_run", redCheckRun);
+        await handleCiEvent(ctx, "check_run", redCheckRun);
+        expect(api.posts("/ci-failures")).toHaveLength(2);
+        noNoticeClaim(state);
+        expect(api.sessionCalls).toEqual([]);
       }
     });
 
@@ -1947,7 +1986,7 @@ describe("PR session bindings", () => {
         expect(await state.get(PR_KEY)).toEqual({ consecutiveCiFixes: 3 });
         // No claim is left behind to suppress a later delivery.
         expect(await state.get("centaur-githubbot:ci-settled:base/repo#7:abc123")).toBeUndefined();
-        expect(await state.get(NOTICE_CLAIM)).toBeUndefined();
+        noNoticeClaim(state);
       }
     });
 
@@ -1963,7 +2002,7 @@ describe("PR session bindings", () => {
       expect(recovered.posts("/ci-failures")).toHaveLength(1);
     });
 
-    test("a failed report releases the head's claim so a later delivery retries", async () => {
+    test("a failed report does not block a later delivery", async () => {
       const api = makeApi({ binding: { managed: true, closed: false } });
       const state = makeState();
       const realFetch = api.fetch;

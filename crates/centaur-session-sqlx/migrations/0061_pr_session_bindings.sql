@@ -17,10 +17,13 @@ create table pr_session_bindings (
     head_sha text not null,                 -- latest head githubbot has seen; starts at the created head
     managed boolean not null default false, -- set only by an explicit assignment of the bot
     closed boolean not null default false,
-    -- The `updated_at` of the fetched PR behind the latest lifecycle write
-    -- (managed, closed, head_sha). Writes observed earlier are ignored, so
-    -- reordered webhook handlers converge on the newest observation.
-    github_updated_at timestamptz,
+    -- The `updated_at` of the fetched PR behind each mutable field's latest
+    -- write. Each field is ordered on its own, so reordered webhook handlers
+    -- converge, and a newer write to one field never discards an older but
+    -- still-current write to another.
+    managed_observed_at timestamptz,
+    closed_observed_at timestamptz,
+    head_observed_at timestamptz,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
     primary key (repository, number),

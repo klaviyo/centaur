@@ -60,8 +60,35 @@ pub async fn build_config(
     subject: &Subject<'_>,
     requester_id: Option<i64>,
 ) -> Result<Config> {
+    Ok(
+        build_config_with_github_user_id(pool, values, subject, requester_id)
+            .await?
+            .0,
+    )
+}
+
+/// [`build_config`], together with the GitHub account id
+/// (`broker_credentials.provider_subject`) of the human whose OAuth token that
+/// same configuration injects as `Authorization` on `api.github.com`, or
+/// `None`.
+///
+/// The account is `Some` only under the rules of `github_user_id_of` below.
+///
+/// Both come from one resolved credential list, so the account named is
+/// exactly the one behind the token the proxy is given. Deriving it from a
+/// second load could name a token the delivered configuration no longer
+/// contains (a grant, token or ownership change between the two reads), and
+/// callers compare it with the author GitHub reports for a PR created with
+/// that token.
+pub async fn build_config_with_github_user_id(
+    pool: &PgPool,
+    values: SecretValues<'_>,
+    subject: &Subject<'_>,
+    requester_id: Option<i64>,
+) -> Result<(Config, Option<String>)> {
     let credentials =
         effective_credentials(pool, values, subject.principal_id, requester_id).await?;
+    let github_user_id = github_user_id_of(&credentials);
 
     let mut config = Config::default();
     for credential in credentials
@@ -105,7 +132,7 @@ pub async fn build_config(
             .push(json!({ "name": "oauth_token", "config": { "tokens": oauth } }));
     }
     append_postgres(subject, &credentials, values, &mut config)?;
-    Ok(config)
+    Ok((config, github_user_id))
 }
 
 /// The credentials a proxy built for `principal_id` (and `requester_id`)
@@ -140,8 +167,8 @@ async fn effective_credentials(
 const GITHUB_API_HOST: &str = "api.github.com";
 
 /// The GitHub account id (`broker_credentials.provider_subject`) of the human
-/// whose OAuth token the proxy built for `principal_id` and `requester_id`
-/// would inject as `Authorization` on `api.github.com`, or `None`.
+/// whose OAuth token the proxy would inject as `Authorization` on
+/// `api.github.com`, or `None`.
 ///
 /// This is the identity a pull request created through that proxy is
 /// authored as, so callers may compare it with the author GitHub reports.
@@ -159,16 +186,6 @@ const GITHUB_API_HOST: &str = "api.github.com";
 ///
 /// Any other shape (no credential, a non-OAuth token, a competing credential,
 /// a missing or non-numeric subject) is `None`, never a guess.
-pub async fn github_user_id(
-    pool: &PgPool,
-    values: SecretValues<'_>,
-    principal_id: i64,
-    requester_id: Option<i64>,
-) -> Result<Option<String>> {
-    let credentials = effective_credentials(pool, values, principal_id, requester_id).await?;
-    Ok(github_user_id_of(&credentials))
-}
-
 fn github_user_id_of(credentials: &[Credential]) -> Option<String> {
     let mut serving = credentials
         .iter()

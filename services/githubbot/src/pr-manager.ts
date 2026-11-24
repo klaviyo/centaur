@@ -673,11 +673,9 @@ async function processCi(
 }
 
 /**
- * Report a red head on a bound PR, once per head. Eligibility comes first and
- * no claim is taken or kept unless the PR is eligible: the binding is for this
- * exact PR, managed and not closed, and a fresh read shows the PR open,
- * assigned to the bot and still at the failing head. The claim is dedicated to
- * the notice and released whenever the report is not delivered.
+ * Report a red head on a bound PR. Eligibility comes first: the binding is for
+ * this exact PR and managed and not closed, and a fresh read still shows the
+ * failing head. Nothing is claimed locally; api-rs dedupes the notice.
  */
 async function reportBoundCiFailure(
   ctx: PrManagerContext,
@@ -721,9 +719,9 @@ async function reportBoundCiFailure(
     if (!recorded) return skip("head_not_recorded");
   }
 
-  // open and assigned come from the fresh read; api-rs decides and records.
-  const claimKey = `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:ci-notice:${owner}/${repo}#${number}:${headSha}`;
-  if (!(await claim(ctx, claimKey))) return skip("already_reported");
+  // open and assigned come from the fresh read; api-rs decides and records. It
+  // is also the only dedupe authority, keyed by (pr_node_id, head_sha): a
+  // repeat delivery is answered `duplicate`, so githubbot keeps no claim here.
   try {
     const result = await reportPrCiFailure(ctx.options, bindingRef(owner, repo, number), {
       pr_node_id: fresh.nodeId,
@@ -736,15 +734,13 @@ async function reportBoundCiFailure(
       ...(evaluation.firstFailingUrl ? { details_url: evaluation.firstFailingUrl } : {}),
       html_url: fresh.htmlUrl ?? `https://github.com/${owner}/${repo}/pull/${number}`,
     });
-    // Keep the claim only for a notice that is, or already was, posted.
-    if (result.notice === "skipped") await release(ctx, claimKey);
+    // `posted` and `duplicate` are both done; a skip is api-rs's decision.
     traceLog(ctx.options, "githubbot_bound_ci_reported", trace, {
       notice: result.notice,
       pr: prLabel,
       ...(result.reason ? { reason: result.reason } : {}),
     });
   } catch (error) {
-    await release(ctx, claimKey);
     logger(ctx).warn("githubbot_bound_ci_report_failed", {
       error: errorMessage(error),
       pr: prLabel,

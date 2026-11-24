@@ -28,7 +28,10 @@ mod migrations;
 mod pr_bindings;
 
 pub use migrations::{TextSearchBackend, migrate, migration_list};
-pub use pr_bindings::{NewPrBinding, PrBinding, PrBindingStateUpdate, normalize_pr_repository};
+pub use pr_bindings::{
+    NewPrBinding, PrBinding, PrBindingStateOutcome, PrBindingStateUpdate, PrCiNoticeClaim,
+    normalize_pr_repository,
+};
 
 pub const SESSION_EVENTS_CHANNEL: &str = "centaur_session_events";
 const DEFAULT_MAX_CONNECTIONS: u32 = 500;

@@ -905,6 +905,16 @@ fn api_jwt_claims(body: &Value) -> Value {
     .claims
 }
 
+/// How many secrets a sync response delivers for `api.github.com`.
+fn github_secret_count(body: &Value) -> usize {
+    body["secrets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|secret| secret["rules"] == json!([{ "host": "api.github.com" }]))
+        .count()
+}
+
 #[tokio::test]
 async fn api_jwt_names_the_sandbox_and_the_github_account_behind_its_token() {
     let Some(f) = Fixture::with_jwt(true).await else {
@@ -951,8 +961,11 @@ async fn api_jwt_names_the_sandbox_and_the_github_account_behind_its_token() {
         .await
         .unwrap();
     f.bump(principal).await;
-    let claims = api_jwt_claims(&f.sync(&token).await);
-    assert_eq!(claims["github_user_id"], "90210001");
+    let body = f.sync(&token).await;
+    assert_eq!(api_jwt_claims(&body)["github_user_id"], "90210001");
+    // The claim names the account behind the one GitHub token this very
+    // response delivers.
+    assert_eq!(github_secret_count(&body), 1);
 
     // A shared app serves one connection to many people: no claim.
     f.update("UPDATE oauth_apps SET shared = true WHERE id = $1", app)
@@ -1027,8 +1040,10 @@ async fn api_jwt_names_the_sandbox_and_the_github_account_behind_its_token() {
     )
     .await;
     f.bump(principal).await;
-    let claims = api_jwt_claims(&f.sync(&token).await);
-    assert!(claims.get("github_user_id").is_none());
+    let body = f.sync(&token).await;
+    assert!(api_jwt_claims(&body).get("github_user_id").is_none());
+    // Both competing tokens are delivered, which is why none is claimed.
+    assert_eq!(github_secret_count(&body), 2);
 }
 
 #[tokio::test]
