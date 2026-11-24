@@ -1464,6 +1464,16 @@ impl AgentSandboxBackend {
                 operation: "create_github_pull_request",
             });
         };
+        // The certificate is read by fetching its whole Secret. If that Secret
+        // also holds the CA key (the chart allows one Secret for both), the
+        // read would bring the key into api-rs, so this deployment can't
+        // create this way: the caller falls back to the ordinary flow.
+        if iron_proxy.ca_cert_secret_name == iron_proxy.ca_key_secret_name {
+            return Err(SandboxError::Unsupported {
+                backend: crate::BACKEND_NAME,
+                operation: "create_github_pull_request",
+            });
+        }
         let ca = self
             .github_pull_request_preflight(id, iron_proxy, GITHUB_PULL_REQUEST_PREFLIGHT_TIMEOUT)
             .await?;
@@ -4628,6 +4638,49 @@ AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
         // The named bound is finite and shorter than the GitHub request's.
         assert!(GITHUB_PULL_REQUEST_PREFLIGHT_TIMEOUT <= Duration::from_secs(10));
         assert!(GITHUB_PULL_REQUEST_PREFLIGHT_TIMEOUT < GITHUB_PULL_REQUEST_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn a_ca_secret_that_also_holds_the_key_is_never_read() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A stand-in API server that only counts the connections it gets.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counted = connections.clone();
+        let held = tokio::spawn(async move {
+            let mut streams = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                streams.push(stream);
+            }
+        });
+        // The chart allows the certificate and the key in one Secret.
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca", "ca");
+        let backend = backend_at(&url, Some(iron_proxy));
+
+        let error = backend
+            .create_github_pull_request_through_proxy(
+                &SandboxId::new("asbx-test"),
+                "acme",
+                "widgets",
+                &PrOauthPlaceholder::unattested(),
+                &json!({"head": "feature", "base": "main", "title": "t"}),
+            )
+            .await
+            .unwrap_err();
+
+        // Refused as unsupported (api-rs answers `pull_requests_unsupported`,
+        // and the SDK falls back), before any Kubernetes call at all.
+        assert!(
+            matches!(error, SandboxError::Unsupported { .. }),
+            "{error:?}"
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(connections.load(Ordering::SeqCst), 0);
+        held.abort();
     }
 
     /// One request a stub API server received.

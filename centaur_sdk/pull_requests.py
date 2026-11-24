@@ -32,6 +32,16 @@ _FALLBACK_HINT = (
     "This session cannot open a session-bound pull request; "
     "open the pull request as you normally would (for example with `gh pr create`)."
 )
+
+
+def _is_bare_not_found(status: int, detail: str) -> bool:
+    """A 404 with no error code: an api-rs from before this route, say.
+
+    The session can't open a bound PR there, so the ordinary flow applies.
+    """
+    return status == 404 and '"code"' not in detail
+
+
 # Not fallbacks: the session is catching up, so the same call will work shortly.
 _RETRY_HINTS = {
     "requester_not_applied": (
@@ -72,7 +82,9 @@ def main(argv: list[str] | None = None) -> int:
         retry_hint = next((hint for code, hint in _RETRY_HINTS.items() if code in detail), None)
         if retry_hint:
             sys.stderr.write(f"{retry_hint}\n")
-        elif any(code in detail for code in _FALLBACK_CODES):
+        elif _is_bare_not_found(error.code, detail) or any(
+            code in detail for code in _FALLBACK_CODES
+        ):
             sys.stderr.write(f"{_FALLBACK_HINT}\n")
         return 1
     except (OSError, RuntimeError, ValueError) as error:

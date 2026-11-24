@@ -770,3 +770,43 @@ def test_create_pull_request_cli_reports_http_errors(
     if code in retry:
         assert retry[code] in captured.err
     assert captured.out == ""
+
+
+@pytest.mark.parametrize(
+    ("body", "fallback"),
+    [
+        # An api-rs from before the route: the router's bare 404.
+        (b"", True),
+        (b"Not Found", True),
+        (b'{"ok":false,"error":"not found"}', True),
+        # A coded 404 is reported as itself, not as a fallback.
+        (b'{"ok":false,"error":"x","code":"pr_binding_not_found"}', False),
+    ],
+)
+def test_create_pull_request_cli_falls_back_on_a_bare_404(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    body: bytes,
+    fallback: bool,
+):
+    import io
+    import urllib.error
+
+    from centaur_sdk import pull_requests
+
+    def refuse(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, io.BytesIO(body))
+
+    monkeypatch.setattr("urllib.request.urlopen", refuse)
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "slack:T1:C123:123.456")
+    monkeypatch.setattr(
+        registry, "_backend", MappingBackend({"CENTAUR_API_URL": "http://api:8000"})
+    )
+
+    exit_code = pull_requests.main(
+        ["create", "acme/widgets", "--head", "feature", "--base", "main", "--title", "T"]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "HTTP 404" in captured.err
+    assert ("open the pull request as you normally would" in captured.err) is fallback

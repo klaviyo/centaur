@@ -775,9 +775,14 @@ pub(crate) struct ServerArgs {
     ///
     /// Once deployed, roll back only to versions that keep this feature's
     /// safeguards: an api-rs that has this setting (an older one ignores it and
-    /// leaves creation on), migration 0061 and the binding routes, and a
-    /// githubbot whose red-CI path is binding-aware. Rolling back to a version
-    /// from before this feature is not supported.
+    /// leaves creation on), migration 0061 and the binding routes with their
+    /// coded miss, and a githubbot whose red-CI path is binding-aware. Roll
+    /// proxy-sync back only while every api-rs replica has this setting, off.
+    /// Rolling back to a version from before this feature is not supported.
+    ///
+    /// It also needs the proxy CA certificate in a Secret of its own: with the
+    /// certificate and key in one Secret, creation answers unsupported rather
+    /// than read the key.
     #[arg(long, env = "TRUSTED_PR_CREATE_ENABLED", default_value_t = false)]
     pub(crate) trusted_pr_create_enabled: bool,
     /// Keyword search backend that migrations install: `paradedb` (requires
