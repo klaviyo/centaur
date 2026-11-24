@@ -16,7 +16,7 @@ use crate::{PgSessionStore, SessionStoreError, parse_persisted};
 
 const BINDING_COLUMNS: &str = "repository, number, thread_key, pr_id, pr_node_id, \
      author_github_id, author_login, sandbox_id, head_ref, base_ref, head_sha, \
-     managed, closed, managed_observed_at, closed_observed_at, head_observed_at, \
+     managed, closed, managed_observed_at, closed_observed_at, head_observed_at, revision, \
      created_at, updated_at";
 
 /// A binding as api-rs verified it from GitHub's create response.
@@ -66,6 +66,9 @@ pub struct PrBinding {
     pub closed_observed_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub head_observed_at: Option<OffsetDateTime>,
+    /// Incremented by every applied state write; see
+    /// [`PrBindingStateUpdate::expected_revision`].
+    pub revision: i64,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -83,6 +86,14 @@ pub struct PrBindingStateUpdate {
     pub closed: Option<bool>,
     #[serde(default)]
     pub head_sha: Option<String>,
+    /// The binding revision the caller read before forming this write. Only
+    /// consulted when a provided field's observation equals the stored one but
+    /// its value differs: GitHub's `updated_at` has one-second resolution, so
+    /// two states can share it and neither is newer. The write then applies
+    /// if this equals the binding's current revision (nothing has been applied
+    /// since the caller looked) and is a conflict otherwise.
+    #[serde(default)]
+    pub expected_revision: Option<i64>,
 }
 
 /// The result of [`PgSessionStore::update_pr_binding_state`].
@@ -241,8 +252,10 @@ impl PgSessionStore {
     /// disturbs another field's newer value. A provided field whose
     /// observation equals the stored one but whose value differs cannot be
     /// ordered; the write is refused whole with
-    /// [`SessionStoreError::PrBindingStateConflict`] and nothing changes.
-    /// `applied` is true when any provided field was applied. Webhook handlers run concurrently and
+    /// [`SessionStoreError::PrBindingStateConflict`] and nothing changes,
+    /// unless `update.expected_revision` is the binding's current revision.
+    /// Every applied write increments the revision. `applied` is true when any
+    /// provided field was applied. Webhook handlers run concurrently and
     /// arrive out of order, so this is what makes close, reopen, assignment
     /// and head writes converge on the newest fetch. `None` writes
     /// unconditionally and leaves the stored observations alone; only
@@ -280,6 +293,9 @@ impl PgSessionStore {
             number,
         })?;
         if current.pr_node_id != pr_node_id {
+            // Release the row lock now rather than leaving it to a deferred
+            // rollback when the dropped transaction's connection is reused.
+            tx.rollback().await?;
             return Err(SessionStoreError::PrBindingConflict {
                 repository,
                 number,
@@ -288,16 +304,20 @@ impl PgSessionStore {
         }
         // A write that disagrees with a field's value at the very same
         // observation time cannot be ordered against it: neither is newer.
-        // Refuse it, changing nothing, so the caller re-reads GitHub and
-        // retries with a fresher observation.
+        // It applies only as a compare-and-set against the revision the caller
+        // read (nothing has been applied since it looked); otherwise it is
+        // refused, changing nothing, so the caller re-reads both sides.
+        let revision_matches = update.expected_revision == Some(current.revision);
         let contradicts = |field: &'static str, differs: bool, stored: Option<OffsetDateTime>| {
-            (differs && observed_updated_at.is_some() && observed_updated_at == stored).then(|| {
-                SessionStoreError::PrBindingStateConflict {
+            (differs
+                && !revision_matches
+                && observed_updated_at.is_some()
+                && observed_updated_at == stored)
+                .then(|| SessionStoreError::PrBindingStateConflict {
                     repository: repository.clone(),
                     number,
                     field,
-                }
-            })
+                })
         };
         if let Some(error) = update
             .managed
@@ -327,6 +347,7 @@ impl PgSessionStore {
                 })
             })
         {
+            tx.rollback().await?;
             return Err(error);
         }
         // A field applies when it is provided and no later observation of it
@@ -342,6 +363,7 @@ impl PgSessionStore {
         let apply_closed = applies(update.closed.is_some(), current.closed_observed_at);
         let apply_head = applies(update.head_sha.is_some(), current.head_observed_at);
         if !(apply_managed || apply_closed || apply_head) {
+            tx.rollback().await?;
             return Ok(PrBindingStateOutcome {
                 binding: current.try_into()?,
                 applied: false,
@@ -360,6 +382,7 @@ impl PgSessionStore {
             set managed = $3, managed_observed_at = $4,
                 closed = $5, closed_observed_at = $6,
                 head_sha = $7, head_observed_at = $8,
+                revision = revision + 1,
                 updated_at = now()
             where repository = $1 and number = $2 and pr_node_id = $9
             returning {BINDING_COLUMNS}
@@ -510,6 +533,7 @@ struct PrBindingRow {
     managed_observed_at: Option<OffsetDateTime>,
     closed_observed_at: Option<OffsetDateTime>,
     head_observed_at: Option<OffsetDateTime>,
+    revision: i64,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
 }
@@ -535,6 +559,7 @@ impl TryFrom<PrBindingRow> for PrBinding {
             managed_observed_at: row.managed_observed_at,
             closed_observed_at: row.closed_observed_at,
             head_observed_at: row.head_observed_at,
+            revision: row.revision,
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
@@ -1045,6 +1070,87 @@ mod tests {
                 .await
                 .applied
         );
+    }
+
+    #[tokio::test]
+    async fn an_equal_timestamp_tie_is_resolved_by_compare_and_set_on_the_revision() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key = session(&store).await;
+        let new = new_binding(&thread_key);
+        let inserted = store.insert_pr_binding(&new).await.unwrap();
+        assert_eq!(inserted.revision, 0);
+        let set_closed = |closed: bool, expected_revision: Option<i64>| PrBindingStateUpdate {
+            closed: Some(closed),
+            expected_revision,
+            ..Default::default()
+        };
+
+        // GitHub reports the same `updated_at` throughout: two states in one
+        // second. The first write applies and bumps the revision.
+        let outcome = write(&store, &new, set_closed(true, None), at(10)).await;
+        assert!(outcome.applied);
+        assert_eq!(outcome.binding.revision, 1);
+
+        // The contradicting write is a conflict, and changes nothing.
+        let conflict = store
+            .update_pr_binding_state(
+                &new.repository,
+                new.number,
+                &new.pr_node_id,
+                &set_closed(false, None),
+                at(10),
+            )
+            .await;
+        assert!(matches!(
+            conflict,
+            Err(SessionStoreError::PrBindingStateConflict {
+                field: "closed",
+                ..
+            })
+        ));
+        let unchanged = store.pr_binding(&new.repository, 7).await.unwrap().unwrap();
+        assert!(unchanged.closed);
+        assert_eq!(unchanged.revision, 1);
+
+        // A retry that read revision 1 (and re-fetched GitHub, whose timestamp
+        // has not moved) applies, and converges.
+        let outcome = write(&store, &new, set_closed(false, Some(1)), at(10)).await;
+        assert!(outcome.applied);
+        assert!(!outcome.binding.closed);
+        assert_eq!(outcome.binding.revision, 2);
+
+        // The revision it read is now stale: another writer got in, so a
+        // second contradicting write against revision 1 is a conflict again.
+        let stale = store
+            .update_pr_binding_state(
+                &new.repository,
+                new.number,
+                &new.pr_node_id,
+                &set_closed(true, Some(1)),
+                at(10),
+            )
+            .await;
+        assert!(matches!(
+            stale,
+            Err(SessionStoreError::PrBindingStateConflict { .. })
+        ));
+        let outcome = write(&store, &new, set_closed(true, Some(2)), at(10)).await;
+        assert!(outcome.applied && outcome.binding.closed);
+        assert_eq!(outcome.binding.revision, 3);
+
+        // The revision only matters for ties: older observations are still
+        // ignored (and do not bump it), newer ones apply with or without it.
+        let outcome = write(&store, &new, set_closed(false, Some(3)), at(5)).await;
+        assert!(!outcome.applied);
+        assert_eq!(outcome.binding.revision, 3);
+        let outcome = write(&store, &new, set_closed(false, None), at(11)).await;
+        assert!(outcome.applied);
+        assert_eq!(outcome.binding.revision, 4);
+        // A matching revision does not let an older observation through.
+        let outcome = write(&store, &new, set_closed(true, Some(4)), at(9)).await;
+        assert!(!outcome.applied);
     }
 
     #[tokio::test]

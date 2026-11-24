@@ -1396,8 +1396,9 @@ const GITHUB_PULL_REQUEST_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// credential replaces it in `Authorization` on `api.github.com` whether that
 /// credential is an OAuth token or a personal access token. The create call
 /// does not use it, because the account check only means something for an
-/// OAuth token (see [`GITHUB_PR_OAUTH_PLACEHOLDER_AUTHORIZATION`]).
-#[allow(dead_code)]
+/// OAuth token (see `GITHUB_PR_OAUTH_PLACEHOLDER_AUTHORIZATION`); tests assert
+/// the call never carries it.
+#[cfg(test)]
 const GITHUB_TOKEN_PLACEHOLDER_AUTHORIZATION: &str = "Bearer GITHUB_TOKEN";
 /// `Authorization` value of the create call: a placeholder, not a credential.
 /// The sandbox's proxy replaces `CENTAUR_PR_OAUTH` only with the attested

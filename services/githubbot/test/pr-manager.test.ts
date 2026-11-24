@@ -1526,7 +1526,13 @@ describe("PR session bindings", () => {
   const PR_URL = "https://github.com/base/repo/pull/7";
   const FAILURE_URL = "https://ci.example.test/runs/1";
 
-  type Binding = { managed: boolean; closed: boolean; head_sha?: string; pr_node_id?: string };
+  type Binding = {
+    managed: boolean;
+    closed: boolean;
+    head_sha?: string;
+    pr_node_id?: string;
+    revision?: number;
+  };
   type Call = { body: unknown; method: string; path: string };
 
   const NODE_ID = "PR_node_1";
@@ -1538,6 +1544,7 @@ describe("PR session bindings", () => {
       number: 7,
       thread_key: "slack:T0:C0:1700000000.000100",
       pr_node_id: NODE_ID,
+      revision: 1,
       head_sha: headSha,
       ...binding,
     };
@@ -1553,7 +1560,11 @@ describe("PR session bindings", () => {
     stateFailures?: (number | "network" | "conflict")[];
     // One entry per binding GET, consumed in order; later GETs succeed.
     lookupFailures?: number[];
+    // Another writer gets in before this many of the first /state calls, so the
+    // revision they were derived from is stale by the time they arrive.
+    interveneBeforeState?: number;
   }) {
+    let interventions = input.interveneBeforeState ?? 0;
     const lookupFailures = [...(input.lookupFailures ?? [])];
     const stateFailures = [...(input.stateFailures ?? [])];
     // The binding as api-rs holds it: a state write moves its head.
@@ -1597,8 +1608,32 @@ describe("PR session bindings", () => {
         );
       }
       if (failure) return new Response("unavailable", { status: failure });
-      if (current && typeof (body as { head_sha?: string })?.head_sha === "string") {
-        current.head_sha = (body as { head_sha: string }).head_sha;
+      if (current && interventions > 0) {
+        interventions -= 1;
+        current.revision = (current.revision ?? 1) + 1;
+      }
+      const write = body as {
+        closed?: boolean;
+        expected_revision?: number;
+        head_sha?: string;
+        managed?: boolean;
+      };
+      // Compare-and-set: a write derived from an older revision conflicts.
+      if (
+        current &&
+        write.expected_revision !== undefined &&
+        write.expected_revision !== (current.revision ?? 1)
+      ) {
+        return Response.json(
+          { error: { code: "binding_state_conflict", message: "stale revision" } },
+          { status: 409 },
+        );
+      }
+      if (current) {
+        if (typeof write.head_sha === "string") current.head_sha = write.head_sha;
+        if (typeof write.managed === "boolean") current.managed = write.managed;
+        if (typeof write.closed === "boolean") current.closed = write.closed;
+        current.revision = (current.revision ?? 1) + 1;
       }
       return Response.json({
         ...bindingJson(current ?? { managed: false, closed: false }),
@@ -1607,7 +1642,7 @@ describe("PR session bindings", () => {
     };
     const posts = (suffix: string) =>
       calls.filter((c) => c.method === "POST" && c.path.endsWith(suffix));
-    return { calls, fetch, notices, posts, sessionCalls };
+    return { calls, current: () => current, fetch, notices, posts, sessionCalls };
   }
 
   function makeCtx(input: {
@@ -1683,7 +1718,16 @@ describe("PR session bindings", () => {
         rest: {
           repos: {
             getCommit: async () => ({ data: { author: { login: "centaur-bot" } } }),
-            getCombinedStatusForRef: fresh("status", input.github?.combinedStatus),
+            // Honours `per_page` like GitHub: 30 contexts unless more are asked for.
+            getCombinedStatusForRef: async (args: { per_page?: number }) => {
+              reads.push("status");
+              const combined = input.github?.combinedStatus;
+              if (combined === undefined || combined === "throw") {
+                throw new Error("not confirmable");
+              }
+              const all = combined.statuses as unknown[];
+              return { data: { ...combined, statuses: all.slice(0, args.per_page ?? 30) } };
+            },
           },
           checks: {
             listForRef: async () => {
@@ -1926,7 +1970,10 @@ describe("PR session bindings", () => {
       await handleCiEvent(ctx, "check_run", redCheckRun);
       const writes = api.calls.filter((c) => c.method === "POST").map((c) => [c.path.split("/").pop(), c.body]);
       expect(writes).toEqual([
-        ["state", { pr_node_id: NODE_ID, observed_updated_at: UPDATED_AT, head_sha: "abc123" }],
+        [
+          "state",
+          { pr_node_id: NODE_ID, observed_updated_at: UPDATED_AT, expected_revision: 1, head_sha: "abc123" },
+        ],
         ["ci-failures", expect.objectContaining({ head_sha: "abc123", current_head_sha: "abc123" })],
       ]);
       // No synchronize event follows. A repeat delivery needs no second head
@@ -2357,6 +2404,93 @@ describe("PR session bindings", () => {
         expect(passedApi.posts("/ci-failures")).toHaveLength(0);
       });
 
+      test("finds a failing status context beyond the default page of 30", async () => {
+        const statuses = Array.from({ length: 40 }, (_, index) => ({
+          context: `ctx-${index}`,
+          state: index === 35 ? "failure" : "success",
+          target_url: `https://ci.example.test/ctx/${index}`,
+        }));
+        const api = bound();
+        const ctx = makeCtx({
+          api,
+          aggregateOnly: true,
+          github: { combinedStatus: { sha: "abc123", statuses } },
+        }).ctx;
+        (ctx.octokit.rest.repos as unknown as Record<string, unknown>).listPullRequestsAssociatedWithCommit =
+          async () => ({ data: [{ number: 7 }] });
+        await handleCiEvent(
+          ctx,
+          "status",
+          JSON.stringify({
+            repository: { full_name: "base/repo" },
+            sha: "abc123",
+            state: "failure",
+            context: "ctx-35",
+          }),
+        );
+        expect(body(api)).toMatchObject({
+          check_name: "ctx-35",
+          details_url: "https://ci.example.test/ctx/35",
+        });
+      });
+
+      test("a centaur-skip check is never named, even when confirmed failing", async () => {
+        const skipRun = { ...stillFailing, name: "agent-pr-rules-centaur-skip" };
+        const api = bound();
+        await handleCiEvent(
+          makeCtx({ api, aggregateOnly: true, github: { checkRuns: [skipRun] } }).ctx,
+          "check_run",
+          eventFor({ name: skipRun.name, conclusion: "failure" }),
+        );
+        // With no other eligible named failure, nothing is reported.
+        expect(api.posts("/ci-failures")).toHaveLength(0);
+
+        // The same for a workflow, whatever the event claims.
+        const workflowApi = bound();
+        await handleCiEvent(
+          makeCtx({
+            api: workflowApi,
+            aggregateOnly: true,
+            github: {
+              workflowRuns: [
+                {
+                  id: 5,
+                  run_number: 1,
+                  head_sha: "abc123",
+                  status: "completed",
+                  conclusion: "failure",
+                  name: "Centaur-Skip gate",
+                  html_url: "https://github.com/base/repo/actions/runs/5",
+                },
+              ],
+            },
+          }).ctx,
+          "workflow_run",
+          JSON.stringify({
+            repository: { full_name: "base/repo" },
+            workflow_run: {
+              id: 5,
+              workflow_id: 17,
+              name: "ci",
+              conclusion: "failure",
+              head_sha: "abc123",
+              pull_requests: [{ number: 7 }],
+            },
+          }),
+        );
+        expect(workflowApi.posts("/ci-failures")).toHaveLength(0);
+      });
+
+      test("a skipped check does not hide a real failure the evaluation did read", async () => {
+        const api = bound();
+        const { ctx } = makeCtx({
+          api,
+          github: { checkRuns: [{ ...stillFailing, name: "x-centaur-skip" }] },
+        });
+        await handleCiEvent(ctx, "check_run", eventFor({ name: "x-centaur-skip", conclusion: "failure" }));
+        expect(body(api)).toMatchObject({ check_name: "build" });
+      });
+
       test("a partially readable evaluation keeps the failing check it did read", async () => {
         const api = bound();
         const { ctx, reads } = makeCtx({
@@ -2518,7 +2652,8 @@ describe("PR session bindings", () => {
       return (await exec(binding, body, opts)).updates;
     }
 
-    const seen = { observed_updated_at: UPDATED_AT };
+    // Every write names the revision of the binding read before the PR fetch.
+    const seen = { observed_updated_at: UPDATED_AT, expected_revision: 1 };
 
     const bound = { managed: false, closed: false };
 
@@ -2729,6 +2864,45 @@ describe("PR session bindings", () => {
         expect(result.sleeps).toEqual([10_000]);
       });
 
+      test("a close stored first, then a reopen GitHub reports at the same updated_at, converges to open", async () => {
+        const api = makeApi({ binding: managed });
+        const { ctx: closing } = makeCtx({ api, settled: false, prState: "closed" });
+        const { ctx: reopening } = makeCtx({ api, settled: false, prState: "open" });
+        await handlePullRequestEvent(closing, prEvent("closed"));
+        expect(api.current()).toMatchObject({ closed: true, revision: 2 });
+        // Same updated_at, contradicting value, but nothing intervened: the
+        // write names the revision it read, so it applies.
+        await handlePullRequestEvent(reopening, prEvent("reopened"));
+        expect(api.posts("/state").map((c) => c.body)).toEqual([
+          { pr_node_id: NODE_ID, observed_updated_at: UPDATED_AT, expected_revision: 1, closed: true },
+          { pr_node_id: NODE_ID, observed_updated_at: UPDATED_AT, expected_revision: 2, closed: false },
+        ]);
+        expect(api.current()).toMatchObject({ closed: false, revision: 3 });
+      });
+
+      test("when another write intervenes, both the binding and the PR are read again before the retry", async () => {
+        const api = makeApi({ binding: managed, interveneBeforeState: 1 });
+        const { ctx, sleeps } = makeCtx({ api, settled: false, prState: "closed" });
+        await handlePullRequestEvent(ctx, prEvent("closed"));
+        // Revision 1 was stale on arrival; the retry carries the re-read one.
+        expect(api.posts("/state").map((c) => (c.body as { expected_revision: number }).expected_revision)).toEqual([1, 2]);
+        expect(sleeps).toEqual([10_000]);
+        expect(api.calls.filter((c) => c.method === "GET")).toHaveLength(2);
+        expect(api.current()).toMatchObject({ closed: true });
+      });
+
+      test("a conflicting head repair re-reads the binding too", async () => {
+        const api = makeApi({
+          binding: { managed: true, closed: false, head_sha: "old111" },
+          interveneBeforeState: 1,
+        });
+        await handleCiEvent(makeCtx({ api }).ctx, "check_run", redCheckRun);
+        expect(
+          api.posts("/state").map((c) => (c.body as { expected_revision: number }).expected_revision),
+        ).toEqual([1, 2]);
+        expect(api.posts("/ci-failures")).toHaveLength(1);
+      });
+
       test("a conflict is retried for any write, within the same bounded budget", async () => {
         const sync = await exec(bound, prEvent("synchronize"), {
           heads: ["head-1", "head-2"],
@@ -2765,7 +2939,9 @@ describe("PR session bindings", () => {
         for (const [, body, opts] of invalidations) {
           const result = await exec(managed, body, { ...opts, lookupStatus: 503 });
           expect(result.updates).toHaveLength(1);
-          expect(result.updates[0]).toMatchObject({ pr_node_id: NODE_ID, ...seen });
+          expect(result.updates[0]).toMatchObject({ pr_node_id: NODE_ID, observed_updated_at: UPDATED_AT });
+          // No binding was read, so there is no revision to compare against.
+          expect("expected_revision" in (result.updates[0] as object)).toBe(false);
         }
         // Never on a payload that disagrees with the fresh read.
         expect(
@@ -2867,6 +3043,7 @@ describe("getPrBinding", () => {
     thread_key: "slack:T0:C0:1700000000.000100",
     pr_node_id: "PR_node_1",
     head_sha: "abc123",
+    revision: 4,
     managed: true,
     closed: false,
   };
@@ -2911,6 +3088,10 @@ describe("getPrBinding", () => {
       { thread_key: "" },
       { pr_node_id: undefined },
       { pr_node_id: "" },
+      { revision: undefined },
+      { revision: -1 },
+      { revision: 1.5 },
+      { revision: "4" },
       { managed: undefined },
       { managed: "yes" },
       { closed: undefined },

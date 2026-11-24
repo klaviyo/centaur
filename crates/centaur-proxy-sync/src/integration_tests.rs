@@ -277,6 +277,40 @@ impl Fixture {
         secret
     }
 
+    /// Console's canonical `github_token` wrapper: the `GITHUB_TOKEN`
+    /// placeholder replaced in `Authorization` on `host`, served by `served_by`'s
+    /// brokered token.
+    async fn github_wrapper_secret(
+        &self,
+        label: &str,
+        linked: i64,
+        served_by: i64,
+        host: &str,
+    ) -> i64 {
+        let secret = self
+            .static_secret_row(
+                label,
+                None,
+                Some(json!({
+                    "proxy_value": "GITHUB_TOKEN",
+                    "match_headers": ["Authorization"],
+                    "require": false,
+                })),
+                Some(linked),
+            )
+            .await;
+        self.source(
+            "static_secret_id",
+            secret,
+            "token_broker",
+            json!({ "credential_id": served_by }),
+            Some(served_by),
+        )
+        .await;
+        self.rule("static_secret_id", secret, host).await;
+        secret
+    }
+
     /// A replace secret swapping `proxy_value` in `match_header` on `host`.
     async fn replace_secret(
         &self,
@@ -440,11 +474,23 @@ impl Fixture {
         (status, serde_json::from_slice(&bytes).unwrap())
     }
 
-    async fn sync(&self, token: &str) -> Value {
+    /// A sync response as the proxy receives it, including the PR-create guard
+    /// every configuration ends with.
+    async fn sync_raw(&self, token: &str) -> Value {
         let (status, body) = self
             .post("/api/v1/proxy/sync", Some(token), json!({}))
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    /// A sync response without the PR-create guard, for tests about the
+    /// credentials themselves. The guard has its own tests (`sync_raw`).
+    async fn sync(&self, token: &str) -> Value {
+        let mut body = self.sync_raw(token).await;
+        if let Some(secrets) = body["secrets"].as_array_mut() {
+            secrets.retain(|secret| secret["replace"]["proxy_value"] != "CENTAUR_PR_OAUTH");
+        }
         body
     }
 }
@@ -473,12 +519,14 @@ fn rand_suffix() -> u128 {
         | u128::from(COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
-/// Hosts of the served static secrets, in served order.
+/// Hosts of the served static secrets, in served order, leaving out the
+/// PR-create guard every configuration ends with (see `assert_guard`).
 fn secret_hosts(body: &Value) -> Vec<String> {
     body["secrets"]
         .as_array()
         .unwrap()
         .iter()
+        .filter(|secret| secret["replace"]["proxy_value"] != "CENTAUR_PR_OAUTH")
         .map(|secret| secret["rules"][0]["host"].as_str().unwrap_or("").to_owned())
         .collect()
 }
@@ -962,6 +1010,38 @@ fn pr_oauth_secrets(body: &Value) -> Vec<Value> {
         .collect()
 }
 
+/// Asserts that `body` ends with exactly one PR-create guard (`require: true`,
+/// for the one create operation) and that its source is `source`, or the
+/// unattested sentinel when `None`.
+fn assert_guard(body: &Value, source: Option<&Value>) {
+    let guards = pr_oauth_secrets(body);
+    assert_eq!(guards.len(), 1, "{guards:?}");
+    // The last secret for the GitHub API host (the API token's own secret
+    // targets another host and may follow).
+    let github: Vec<&Value> = body["secrets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|secret| secret["rules"][0]["host"] == "api.github.com")
+        .collect();
+    assert_eq!(github.last().copied(), guards.first());
+    assert_eq!(
+        guards[0]["replace"],
+        json!({"proxy_value": "CENTAUR_PR_OAUTH", "match_headers": ["Authorization"], "require": true})
+    );
+    assert_eq!(
+        guards[0]["rules"],
+        json!([{"host": "api.github.com", "methods": ["POST"], "paths": ["/repos/*/*/pulls"]}])
+    );
+    match source {
+        Some(source) => assert_eq!(&guards[0]["source"], source),
+        None => assert_eq!(
+            guards[0]["source"],
+            json!({"type": "control_plane", "value": "centaur-unattested-oauth"})
+        ),
+    }
+}
+
 /// How many secrets a sync response delivers for `api.github.com`.
 fn github_secret_count(body: &Value) -> usize {
     body["secrets"]
@@ -980,10 +1060,13 @@ async fn api_jwt_names_the_sandbox_and_the_github_account_behind_its_token() {
     let principal = f.principal("principal").await;
     let token = f.proxy(Some(principal), None, json!({})).await;
 
-    // No GitHub credential: the sandbox is named, the account is not.
-    let claims = api_jwt_claims(&f.sync(&token).await);
+    // No GitHub credential: the sandbox is named, the account is not, and the
+    // PR-create guard is there all the same, with the sentinel source.
+    let body = f.sync_raw(&token).await;
+    let claims = api_jwt_claims(&body);
     assert_eq!(claims["sandbox_id"], f.name("proxy"));
     assert!(claims.get("github_user_id").is_none());
+    assert_guard(&body, None);
 
     let app = f.oauth_app("github-app", false).await;
     let broker = f.broker_credential("github-user", Some(app), true).await;
@@ -993,7 +1076,7 @@ async fn api_jwt_names_the_sandbox_and_the_github_account_behind_its_token() {
     )
     .await;
     let wrapper = f
-        .wrapper_secret("github-token", broker, broker, "api.github.com")
+        .github_wrapper_secret("github-token", broker, broker, "api.github.com")
         .await;
     f.grant(
         Grantee::Principal(principal),
@@ -1005,11 +1088,11 @@ async fn api_jwt_names_the_sandbox_and_the_github_account_behind_its_token() {
     f.bump(principal).await;
     // The token was connected by the Console admin, but the principal is not
     // that person (it is a plain `user` principal), so it is not the actor's.
-    let body = f.sync(&token).await;
+    let body = f.sync_raw(&token).await;
     let claims = api_jwt_claims(&body);
     assert_eq!(claims["sandbox_id"], f.name("proxy"));
     assert!(claims.get("github_user_id").is_none());
-    assert!(pr_oauth_secrets(&body).is_empty());
+    assert_guard(&body, None);
 
     // Once the acting principal is the connecting Console user, the token is
     // theirs and its numeric GitHub id is the claim.
@@ -1020,39 +1103,28 @@ async fn api_jwt_names_the_sandbox_and_the_github_account_behind_its_token() {
         .await
         .unwrap();
     f.bump(principal).await;
-    let body = f.sync(&token).await;
+    let body = f.sync_raw(&token).await;
     assert_eq!(api_jwt_claims(&body)["github_user_id"], "90210001");
     // The claim names the account behind the one GitHub token this very
     // response delivers.
     assert_eq!(github_secret_count(&body), 1);
-    // The create-only OAuth secret rides along with the claim: the attested
-    // credential's own delivered token source, under its placeholder, for the
-    // one create operation.
-    let extra = pr_oauth_secrets(&body);
-    assert_eq!(extra.len(), 1, "{extra:?}");
+    // The PR-create guard carries the attested credential's own delivered
+    // token source, under its placeholder, for the one create operation.
     let delivered = body["secrets"]
         .as_array()
         .unwrap()
         .iter()
         .find(|secret| secret["rules"] == json!([{ "host": "api.github.com" }]))
         .unwrap();
-    assert_eq!(extra[0]["source"], delivered["source"]);
-    assert_eq!(
-        extra[0]["replace"],
-        json!({"proxy_value": "CENTAUR_PR_OAUTH", "match_headers": ["Authorization"], "require": false})
-    );
-    assert_eq!(
-        extra[0]["rules"],
-        json!([{"host": "api.github.com", "methods": ["POST"], "paths": ["/repos/*/*/pulls"]}])
-    );
+    assert_guard(&body, Some(&delivered["source"]));
 
     // A shared app serves one connection to many people: no claim.
     f.update("UPDATE oauth_apps SET shared = true WHERE id = $1", app)
         .await;
     f.bump(principal).await;
-    let body = f.sync(&token).await;
+    let body = f.sync_raw(&token).await;
     assert!(api_jwt_claims(&body).get("github_user_id").is_none());
-    assert!(pr_oauth_secrets(&body).is_empty());
+    assert_guard(&body, None);
     f.update("UPDATE oauth_apps SET shared = false WHERE id = $1", app)
         .await;
 
@@ -1072,7 +1144,7 @@ async fn api_jwt_names_the_sandbox_and_the_github_account_behind_its_token() {
         .await
         .unwrap();
     f.bump(principal).await;
-    let body = f.sync(&token).await;
+    let body = f.sync_raw(&token).await;
     assert!(
         body["secrets"]
             .as_array()
@@ -1082,7 +1154,7 @@ async fn api_jwt_names_the_sandbox_and_the_github_account_behind_its_token() {
         "the owner-only token is still delivered"
     );
     assert!(api_jwt_claims(&body).get("github_user_id").is_none());
-    assert!(pr_oauth_secrets(&body).is_empty());
+    assert_guard(&body, None);
     f.update(
         "UPDATE oauth_apps SET owner_only = false WHERE id = $1",
         app,
@@ -1095,7 +1167,7 @@ async fn api_jwt_names_the_sandbox_and_the_github_account_behind_its_token() {
     .await;
     f.bump(principal).await;
     assert_eq!(
-        api_jwt_claims(&f.sync(&token).await)["github_user_id"],
+        api_jwt_claims(&f.sync_raw(&token).await)["github_user_id"],
         "90210001"
     );
 
@@ -1108,7 +1180,7 @@ async fn api_jwt_names_the_sandbox_and_the_github_account_behind_its_token() {
     )
     .await;
     let competing = f
-        .wrapper_secret("github-competing", other, other, "api.github.com")
+        .github_wrapper_secret("github-competing", other, other, "api.github.com")
         .await;
     f.grant(
         Grantee::Principal(principal),
@@ -1118,11 +1190,11 @@ async fn api_jwt_names_the_sandbox_and_the_github_account_behind_its_token() {
     )
     .await;
     f.bump(principal).await;
-    let body = f.sync(&token).await;
+    let body = f.sync_raw(&token).await;
     assert!(api_jwt_claims(&body).get("github_user_id").is_none());
     // Both competing tokens are delivered, which is why none is claimed.
     assert_eq!(github_secret_count(&body), 2);
-    assert!(pr_oauth_secrets(&body).is_empty());
+    assert_guard(&body, None);
 }
 
 #[tokio::test]

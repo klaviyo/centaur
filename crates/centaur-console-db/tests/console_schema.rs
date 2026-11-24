@@ -41,6 +41,18 @@ async fn database() -> Option<PgPool> {
     )
 }
 
+/// How a brokered test credential reaches the proxy.
+#[derive(Clone, Copy)]
+enum Wrapper {
+    /// Console's canonical `github_token`: a `GITHUB_TOKEN` placeholder
+    /// replacement in `Authorization`, on the whole host.
+    Canonical,
+    /// A custom secret that injects `Authorization` directly.
+    Injected,
+    /// The canonical replacement, but its rule allows only `GET`.
+    ReadOnly,
+}
+
 /// The OAuth app and connection behind a brokered test credential.
 #[derive(Clone, Copy)]
 struct App {
@@ -48,6 +60,7 @@ struct App {
     shared: bool,
     /// The Console user who connected the credential.
     connected_by: i64,
+    wrapper: Wrapper,
 }
 
 struct Fixture {
@@ -154,6 +167,7 @@ impl Fixture {
             owner_only: false,
             shared: false,
             connected_by: self.admin,
+            wrapper: Wrapper::Canonical,
         }
     }
 
@@ -224,11 +238,22 @@ impl Fixture {
         .await
         .unwrap();
         let secret: i64 = sqlx::query_scalar(
-            "INSERT INTO static_secrets (foreign_id, inject_config, broker_credential_id, created_by_id, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, now(), now()) RETURNING id",
+            "INSERT INTO static_secrets (foreign_id, inject_config, replace_config, broker_credential_id, created_by_id, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, now(), now()) RETURNING id",
         )
         .bind(self.name(label))
-        .bind(json!({ "header": "Authorization" }))
+        .bind(match app_shape.wrapper {
+            Wrapper::Injected => Some(json!({ "header": "Authorization" })),
+            Wrapper::Canonical | Wrapper::ReadOnly => None,
+        })
+        .bind(match app_shape.wrapper {
+            Wrapper::Injected => None,
+            Wrapper::Canonical | Wrapper::ReadOnly => Some(json!({
+                "proxy_value": "GITHUB_TOKEN",
+                "match_headers": ["Authorization"],
+                "require": false,
+            })),
+        })
         .bind(broker)
         .bind(self.admin)
         .fetch_one(&self.pool)
@@ -243,6 +268,15 @@ impl Fixture {
         )
         .await;
         self.rule("static_secret_id", secret, host).await;
+        if matches!(app_shape.wrapper, Wrapper::ReadOnly) {
+            sqlx::query(
+                "UPDATE request_rules SET http_methods = '[\"GET\"]' WHERE static_secret_id = $1",
+            )
+            .bind(secret)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
         sqlx::query(
             "INSERT INTO grants (principal_id, static_secret_id, priority, created_by_id, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, now(), now())",
@@ -613,7 +647,7 @@ fn github_secrets(config: &Config) -> Vec<&Value> {
         .secrets
         .iter()
         .filter(|secret| {
-            secret["inject"]["header"] == "Authorization"
+            secret["replace"]["proxy_value"] == "GITHUB_TOKEN"
                 && secret["rules"] == json!([{ "host": "api.github.com" }])
         })
         .collect()
@@ -628,15 +662,47 @@ fn pr_oauth_secrets(config: &Config) -> Vec<&Value> {
         .collect()
 }
 
+/// The sentinel the guard carries when no account is attested.
+fn sentinel() -> Value {
+    json!({"type": "control_plane", "value": "centaur-unattested-oauth"})
+}
+
+/// Checks that `config` ends with exactly one PR-create guard, `require: true`,
+/// for the one create operation, and returns its source.
+fn assert_guard_last(config: &Config) -> Value {
+    let guards = pr_oauth_secrets(config);
+    assert_eq!(guards.len(), 1, "{guards:?}");
+    assert_eq!(
+        config.secrets.last().map(|secret| &secret["replace"]),
+        Some(&json!({
+            "proxy_value": "CENTAUR_PR_OAUTH",
+            "match_headers": ["Authorization"],
+            "require": true,
+        })),
+        "the guard must be the last secret"
+    );
+    assert_eq!(
+        guards[0]["rules"],
+        json!([{
+            "host": "api.github.com",
+            "methods": ["POST"],
+            "paths": ["/repos/*/*/pulls"],
+        }])
+    );
+    assert!(guards[0].get("inject").is_none());
+    guards[0]["source"].clone()
+}
+
 #[tokio::test]
-async fn the_oauth_only_secret_exists_exactly_when_an_account_is_attested() {
+async fn the_pr_create_guard_is_in_every_build_and_names_the_attested_credential() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
+    // Nothing granted: the guard is still there, with the sentinel.
     let actor = fixture.owner_principal("pr-oauth").await;
     let (config, account) = github_config(&fixture, actor).await;
     assert_eq!(account, None);
-    assert!(pr_oauth_secrets(&config).is_empty());
+    assert_eq!(assert_guard_last(&config), sentinel());
 
     fixture
         .brokered_token(
@@ -652,40 +718,13 @@ async fn the_oauth_only_secret_exists_exactly_when_an_account_is_attested() {
     let (config, account) = github_config(&fixture, actor).await;
     assert_eq!(account.as_deref(), Some("90210001"));
 
-    // One extra secret: the attested credential's own token source, under the
-    // placeholder, for the one create operation only.
-    let extra = pr_oauth_secrets(&config);
-    assert_eq!(extra.len(), 1, "{extra:?}");
+    // Attested: the guard carries the credential's own delivered source.
     let delivered = github_secrets(&config);
     assert_eq!(delivered.len(), 1);
-    assert_eq!(extra[0]["source"], delivered[0]["source"]);
-    assert_eq!(extra[0]["source"]["type"], "control_plane");
-    assert_eq!(
-        extra[0]["replace"],
-        json!({
-            "proxy_value": "CENTAUR_PR_OAUTH",
-            "match_headers": ["Authorization"],
-            "require": false,
-        })
-    );
-    assert_eq!(
-        extra[0]["rules"],
-        json!([{
-            "host": "api.github.com",
-            "methods": ["POST"],
-            "paths": ["/repos/*/*/pulls"],
-        }])
-    );
-    assert!(extra[0].get("inject").is_none());
-    // It is appended after every credential's own secret, so it never took
-    // part in suppression, and the delivered one is unchanged.
-    assert_eq!(
-        config
-            .secrets
-            .last()
-            .map(|secret| &secret["replace"]["proxy_value"]),
-        Some(&json!("CENTAUR_PR_OAUTH"))
-    );
+    let source = assert_guard_last(&config);
+    assert_eq!(source, delivered[0]["source"]);
+    assert_eq!(source["type"], "control_plane");
+    assert_ne!(source, sentinel());
 
     // The plain config (Console's effective-config preview, for one) never
     // carries it.
@@ -710,7 +749,8 @@ async fn the_oauth_only_secret_exists_exactly_when_an_account_is_attested() {
     .unwrap();
     assert!(pr_oauth_secrets(&plain).is_empty());
 
-    // An equal competitor leaves the account unattested, so no secret.
+    // An equal competitor leaves the account unattested: the guard stays, now
+    // with the sentinel instead of either token.
     fixture
         .brokered_token(
             actor,
@@ -724,7 +764,113 @@ async fn the_oauth_only_secret_exists_exactly_when_an_account_is_attested() {
         .await;
     let (config, account) = github_config(&fixture, actor).await;
     assert_eq!(account, None);
-    assert!(pr_oauth_secrets(&config).is_empty());
+    assert_eq!(assert_guard_last(&config), sentinel());
+}
+
+#[tokio::test]
+async fn a_direct_injector_or_a_narrow_rule_gives_no_claim_and_a_sentinel_guard() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    // A custom secret injecting Authorization directly on api.github.com.
+    let injected = fixture.owner_principal("injected").await;
+    fixture
+        .brokered_token(
+            injected,
+            "github-injected",
+            "github",
+            Some("90210001"),
+            "api.github.com",
+            100,
+            App {
+                wrapper: Wrapper::Injected,
+                ..fixture.personal()
+            },
+        )
+        .await;
+    let (config, account) = github_config(&fixture, injected).await;
+    assert_eq!(account, None);
+    assert_eq!(assert_guard_last(&config), sentinel());
+
+    // The canonical replacement, but only for GET.
+    let read_only = fixture.owner_principal("read-only").await;
+    fixture
+        .brokered_token(
+            read_only,
+            "github-read-only",
+            "github",
+            Some("90210001"),
+            "api.github.com",
+            100,
+            App {
+                wrapper: Wrapper::ReadOnly,
+                ..fixture.personal()
+            },
+        )
+        .await;
+    let (config, account) = github_config(&fixture, read_only).await;
+    assert_eq!(account, None);
+    assert_eq!(assert_guard_last(&config), sentinel());
+}
+
+#[tokio::test]
+async fn a_transform_targeting_the_api_host_withdraws_the_claim() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let actor = fixture.owner_principal("transform").await;
+    fixture
+        .brokered_token(
+            actor,
+            "github-transform",
+            "github",
+            Some("90210001"),
+            "api.github.com",
+            100,
+            fixture.personal(),
+        )
+        .await;
+    assert_eq!(
+        github_account(&fixture, actor).await.as_deref(),
+        Some("90210001")
+    );
+
+    // A GCP auth transform on another host leaves the claim alone ...
+    let gcp: i64 = sqlx::query_scalar(
+        "INSERT INTO gcp_auth_secrets (foreign_id, scopes, created_by_id, created_at, updated_at) \
+         VALUES ($1, '[]', $2, now(), now()) RETURNING id",
+    )
+    .bind(fixture.name("gcp-elsewhere"))
+    .bind(fixture.admin)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    fixture
+        .source(
+            "gcp_auth_secret_id",
+            gcp,
+            "control_plane",
+            Some(ENCRYPTED),
+            None,
+        )
+        .await;
+    fixture
+        .rule("gcp_auth_secret_id", gcp, "storage.example.com")
+        .await;
+    fixture.grant(actor, "gcp_auth_secret_id", gcp).await;
+    assert_eq!(
+        github_account(&fixture, actor).await.as_deref(),
+        Some("90210001")
+    );
+
+    // ... and one that targets api.github.com withdraws it, leaving the guard
+    // with the sentinel.
+    fixture
+        .rule("gcp_auth_secret_id", gcp, "api.github.com")
+        .await;
+    let (config, account) = github_config(&fixture, actor).await;
+    assert_eq!(account, None);
+    assert_eq!(assert_guard_last(&config), sentinel());
 }
 
 #[tokio::test]

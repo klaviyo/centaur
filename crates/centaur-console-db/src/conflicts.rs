@@ -45,6 +45,26 @@ pub(crate) fn writes_header_on_host(credential: &Credential, header: &str, host:
     })
 }
 
+/// Whether any of `credential`'s rules could apply to requests to `host`: a
+/// host rule overlapping it, or a rule naming neither host nor CIDR, which
+/// constrains nothing. Used where being wrong must err toward "yes".
+pub(crate) fn targets_host(credential: &Credential, host: &str) -> bool {
+    credential.rules.iter().any(|rule| {
+        match rule
+            .host
+            .as_deref()
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+        {
+            Some(pattern) => hosts_overlap(&pattern.trim_end_matches('.').to_lowercase(), host),
+            None => rule
+                .cidr
+                .as_deref()
+                .is_none_or(|cidr| cidr.trim().is_empty()),
+        }
+    })
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum Scope {
     Host(String),

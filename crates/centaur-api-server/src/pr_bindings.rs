@@ -498,6 +498,12 @@ pub(crate) struct StateUpdateRequest {
     closed: Option<bool>,
     #[serde(default)]
     head_sha: Option<String>,
+    /// The binding `revision` the caller read (see the binding GET): lets a
+    /// write that contradicts a field at the very same observation time apply
+    /// as a compare-and-set. Without it, or with a stale one, such a write is a
+    /// 409 `binding_state_conflict`.
+    #[serde(default)]
+    expected_revision: Option<i64>,
 }
 
 /// The binding for `repository#number`, which must be for the PR `pr_node_id`
@@ -547,6 +553,7 @@ pub(crate) async fn update_pr_binding_state(
                 managed: request.managed,
                 closed: request.closed,
                 head_sha: request.head_sha,
+                expected_revision: request.expected_revision,
             },
             Some(request.observed_updated_at),
         )
@@ -1656,6 +1663,55 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_tie_converges_over_http_when_the_revision_read_still_matches() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let (repository, _) = bound_pr(&h, true).await;
+        let base = format!("/api/pr-bindings/{repository}/7");
+        let write = |closed: bool, expected: Option<i64>| {
+            let mut body = json!({
+                "pr_node_id": h.node_id(),
+                // GitHub's timestamp does not move across any of these.
+                "observed_updated_at": "2026-11-20T10:00:10Z",
+                "closed": closed,
+            });
+            if let Some(expected) = expected {
+                body["expected_revision"] = json!(expected);
+            }
+            let (uri, h) = (format!("{base}/state"), &h);
+            async move { h.send(Method::POST, &uri, GITHUBBOT_KEY, Some(body)).await }
+        };
+        let revision = || async {
+            let (status, body) = h.send(Method::GET, &base, GITHUBBOT_KEY, None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body["revision"].as_i64().unwrap()
+        };
+
+        let before = revision().await;
+        let (status, body) = write(true, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["revision"], before + 1);
+
+        // A contradicting write without the revision is refused; reading the
+        // binding and retrying with its revision converges.
+        let (status, body) = write(false, None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "binding_state_conflict");
+        let read = revision().await;
+        assert_eq!(read, before + 1);
+        let (status, body) = write(false, Some(read)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["closed"], false);
+        assert_eq!(body["revision"], read + 1);
+
+        // The same retry again is now stale.
+        let (status, body) = write(true, Some(read)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "binding_state_conflict");
     }
 
     #[tokio::test]

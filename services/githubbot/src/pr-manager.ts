@@ -7,6 +7,7 @@ import { runTurnStream, turnOutputChars } from "./turn";
 import {
   FAILED_CONCLUSIONS,
   fetchCiEvaluation,
+  isCentaurSkipCheck,
   maybeEmitReviewSubmitted,
   prepareCiCompleted,
   type CiEvaluation,
@@ -437,7 +438,17 @@ async function recordBindingState(
   const [owner = "", repo = ""] = ref.repository.split("/", 2);
   // Derive the write from a fresh read. Run again if api-rs reports a conflict,
   // so a retry recomputes from GitHub's current state, not a stale one.
-  const build = async (): Promise<PrBindingStateUpdate | undefined> => {
+  let current = binding;
+  const build = async (reread = false): Promise<PrBindingStateUpdate | undefined> => {
+    // A conflict means another writer got in: read the binding again, for its
+    // new revision, *before* reading the PR it will be compared against.
+    if (reread) {
+      const again = await lookupBinding(ctx, owner, repo, ref.number);
+      if (again.ok) {
+        if (!again.binding) return undefined;
+        current = again.binding;
+      }
+    }
     const fresh = await fetchPr(ctx, owner, repo, ref.number);
     if (!fresh?.updatedAt) {
       logger(ctx).warn("githubbot_pr_binding_no_fresh_state", { action, pr: prLabel });
@@ -445,7 +456,7 @@ async function recordBindingState(
     }
     // The binding only speaks for the PR it was created for.
     const payloadNodeId = stringValue(prNode.node_id);
-    const expectedNodeId = binding?.pr_node_id ?? payloadNodeId;
+    const expectedNodeId = current?.pr_node_id ?? payloadNodeId;
     if (
       !expectedNodeId ||
       (payloadNodeId && payloadNodeId !== expectedNodeId) ||
@@ -464,13 +475,20 @@ async function recordBindingState(
       update = owns(ctx, fresh) ? undefined : { managed: false };
     }
     if (!update) return undefined;
-    return { ...update, pr_node_id: expectedNodeId, observed_updated_at: fresh.updatedAt };
+    return {
+      ...update,
+      pr_node_id: expectedNodeId,
+      observed_updated_at: fresh.updatedAt,
+      ...(current ? { expected_revision: current.revision } : {}),
+    };
   };
   const update = await build();
   if (!update) return;
   // Enabling management is as unrepeatable as disabling it (one delivery, no
   // redelivery), so both get the bounded retry.
-  await writeBindingState(ctx, ref, update, invalidating || action === "assigned", action, build);
+  await writeBindingState(ctx, ref, update, invalidating || action === "assigned", action, () =>
+    build(true),
+  );
 }
 
 /** api-rs refused a write whose timestamp ties the stored one but contradicts it. */
@@ -486,7 +504,8 @@ function isStateConflict(error: unknown): boolean {
  * Write binding state; with `retry`, up to three attempts with bounded backoff
  * for retryable and network errors. A `binding_state_conflict` is retried within
  * the same budget whatever `retry` says, after `rebuild` re-derives the write
- * from a fresh read (it may find nothing left to write). Resolves true when
+ * from a fresh read of both the binding and the PR (it may find nothing left to
+ * write). Resolves true when
  * api-rs accepted the call (an unapplied, superseded write counts), false after
  * giving up.
  */
@@ -687,7 +706,7 @@ function ciEventFailure(
     url = stringValue(node.details_url) ?? stringValue(node.html_url);
     if (eventType === "workflow_run") id = numberValue(node.workflow_id);
   }
-  if (!name || (eventType !== "status" && eventType !== "check_run" && eventType !== "workflow_run")) {
+  if (!name || isCentaurSkipCheck(name) || (eventType !== "status" && eventType !== "check_run" && eventType !== "workflow_run")) {
     return undefined;
   }
   return {
@@ -710,6 +729,18 @@ type FailingCheck = { name: string; url?: string };
  * has since passed, or can't be read, is not used.
  */
 async function confirmEventFailure(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  headSha: string,
+  event: CiEventFailure,
+): Promise<FailingCheck | undefined> {
+  const confirmed = await readEventFailure(ctx, owner, repo, headSha, event);
+  // A `centaur-skip` check is never counted red, so it is never named either.
+  return confirmed && !isCentaurSkipCheck(confirmed.name) ? confirmed : undefined;
+}
+
+async function readEventFailure(
   ctx: PrManagerContext,
   owner: string,
   repo: string,
@@ -774,7 +805,13 @@ async function confirmEventFailure(
       return name ? { name, ...(latest.html_url ? { url: latest.html_url } : {}) } : undefined;
     }
     // A status: the combined status lists the latest one per context.
-    const { data } = await ctx.octokit.rest.repos.getCombinedStatusForRef({ owner, repo, ref: headSha });
+    const { data } = await ctx.octokit.rest.repos.getCombinedStatusForRef({
+      owner,
+      repo,
+      ref: headSha,
+      // The default page is 30 contexts; a busy head has more.
+      per_page: 100,
+    });
     if (data.sha !== headSha) return undefined;
     const latest = data.statuses.find((status) => status.context === event.name);
     if (!latest || (latest.state !== "failure" && latest.state !== "error")) return undefined;
@@ -955,16 +992,28 @@ async function reportBoundCiFailure(
       {
         pr_node_id: fresh.nodeId,
         observed_updated_at: fresh.updatedAt,
+        // The revision of the binding read before the fetch above.
+        expected_revision: binding.revision,
         head_sha: fresh.headSha,
       },
       false,
       "ci_head_sync",
       async () => {
+        // Binding first (its new revision), then the PR it is compared with.
+        const rebound = await lookupBinding(ctx, owner, repo, number);
+        if (!rebound.ok || !rebound.binding || rebound.binding.pr_node_id !== binding.pr_node_id) {
+          return undefined;
+        }
         const again = await fetchPr(ctx, owner, repo, number);
         if (!again?.updatedAt || again.nodeId !== binding.pr_node_id || again.headSha !== headSha) {
           return undefined;
         }
-        return { pr_node_id: again.nodeId, observed_updated_at: again.updatedAt, head_sha: again.headSha };
+        return {
+          pr_node_id: again.nodeId,
+          observed_updated_at: again.updatedAt,
+          expected_revision: rebound.binding.revision,
+          head_sha: again.headSha,
+        };
       },
     );
     if (!recorded) return skip("head_not_recorded");

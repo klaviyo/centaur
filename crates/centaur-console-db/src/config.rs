@@ -6,11 +6,11 @@ use sqlx::PgPool;
 
 use crate::{
     Error, Result,
-    conflicts::{suppress, writes_header_on_host},
+    conflicts::{suppress, targets_host, writes_header_on_host},
     credentials::load_credentials,
     models::{
         Config, Credential, CredentialData, CredentialKind, PostgresSetting, RequestRule,
-        SecretSource,
+        SecretSource, StaticData,
     },
     oid::oid,
 };
@@ -77,16 +77,23 @@ pub async fn build_config(
 /// callers compare it with the author GitHub reports for a PR created with
 /// that token.
 ///
-/// When an account is attested, the configuration also carries one extra
-/// secret, appended after every credential's own so it never takes part in
-/// conflict suppression: the attested credential's own token source under the
-/// placeholder [`PR_OAUTH_PLACEHOLDER`], valid only for `POST api.github.com
-/// /repos/*/*/pulls`. api-rs's pull-request create call sends that placeholder
-/// instead of the generic `GITHUB_TOKEN` one, so it can only authenticate with
-/// the attested OAuth credential in the configuration in force at that moment:
-/// if the credential has since become a personal access token, or is gone, the
-/// placeholder is not substituted and GitHub rejects the call. With no
-/// attested account there is no such secret.
+/// Every configuration built here ends with one guard secret, appended after
+/// all credentials' own so it never takes part in conflict suppression and is
+/// the last writer of `Authorization` for `POST api.github.com
+/// /repos/*/*/pulls`. It replaces the placeholder [`PR_OAUTH_PLACEHOLDER`] and
+/// is `require: true`, which makes the proxy refuse the request outright when
+/// an earlier secret has already written that header. api-rs's pull-request
+/// create call sends that placeholder instead of the generic `GITHUB_TOKEN`
+/// one, so it authenticates only with the attested OAuth credential in the
+/// configuration in force at that moment: if the credential has since become a
+/// personal access token, or something injects `Authorization` directly, the
+/// call fails closed instead of going out under another token.
+///
+/// The guard is in every configuration, not only attested ones, because a
+/// guard that exists only while OAuth is attested could vanish in the very
+/// change that adds a direct injector. Its source is the attested credential's
+/// own delivered source; with no attested account it is a sentinel that is not
+/// a credential, which GitHub rejects.
 pub async fn build_config_with_github_user_id(
     pool: &PgPool,
     values: SecretValues<'_>,
@@ -101,12 +108,18 @@ pub async fn build_config_with_github_user_id(
 /// token and only on that one operation.
 pub const PR_OAUTH_PLACEHOLDER: &str = "CENTAUR_PR_OAUTH";
 
+/// The guard's source when no account is attested: a fixed non-credential
+/// string, so the guard is present and fails closed without any token to leak.
+static UNATTESTED_OAUTH_SOURCE: std::sync::LazyLock<Value> = std::sync::LazyLock::new(
+    || json!({"type": "control_plane", "value": "centaur-unattested-oauth"}),
+);
+
 async fn build(
     pool: &PgPool,
     values: SecretValues<'_>,
     subject: &Subject<'_>,
     requester_id: Option<i64>,
-    pr_oauth_secret: bool,
+    pr_oauth_guard: bool,
 ) -> Result<(Config, Option<String>)> {
     let credentials =
         effective_credentials(pool, values, subject.principal_id, requester_id).await?;
@@ -155,16 +168,20 @@ async fn build(
             .push(json!({ "name": "oauth_token", "config": { "tokens": oauth } }));
     }
     append_postgres(subject, &credentials, values, &mut config)?;
-    if pr_oauth_secret
-        && let Some((credential, _)) = attested
-        && let Some(source) = source_value(&credential.sources[0], values)?
-    {
+    if pr_oauth_guard {
+        // The attested credential's own delivered source, or, when none is
+        // attested, a sentinel that is not a credential.
+        let source = match attested {
+            Some((credential, _)) => source_value(&credential.sources[0], values)?,
+            None => None,
+        }
+        .unwrap_or_else(|| UNATTESTED_OAUTH_SOURCE.clone());
         config.secrets.push(json!({
             "source": source,
             "replace": {
                 "proxy_value": PR_OAUTH_PLACEHOLDER,
                 "match_headers": ["Authorization"],
-                "require": false,
+                "require": true,
             },
             "rules": [{
                 "host": GITHUB_API_HOST,
@@ -234,12 +251,35 @@ fn github_user_id_of(credentials: &[Credential]) -> Option<String> {
 
 /// The credential whose token the proxy would inject for the GitHub API, and
 /// its GitHub account, when [`github_user_id_of`]'s rules attest one.
+///
+/// Beyond the owner, subject and sharing rules, the credential must be the
+/// canonical `github_token` shape (a placeholder replacement of
+/// `GITHUB_TOKEN` in `Authorization`, no direct injection) whose own rules
+/// already cover `POST api.github.com /repos/*/*/pulls`, so attesting it never
+/// widens what its token may do. And nothing else that rewrites headers may
+/// target `api.github.com`: no `oauth_token`, `hmac`, `aws_auth`, `gcp_auth` or
+/// `gcp_id_token` transform.
 fn attested_github_credential(credentials: &[Credential]) -> Option<(&Credential, &str)> {
+    let rewrites_headers = |credential: &Credential| {
+        !matches!(
+            credential.kind,
+            CredentialKind::Static | CredentialKind::PgDsn
+        ) && targets_host(credential, GITHUB_API_HOST)
+    };
+    if credentials.iter().any(rewrites_headers) {
+        return None;
+    }
     let mut serving = credentials
         .iter()
         .filter(|credential| writes_header_on_host(credential, "authorization", GITHUB_API_HOST));
     let credential = serving.next()?;
-    if serving.next().is_some() || credential.kind != CredentialKind::Static {
+    if serving.next().is_some() {
+        return None;
+    }
+    let CredentialData::Static(data) = &credential.data else {
+        return None;
+    };
+    if !is_canonical_github_replace(data) || !rules_cover_pr_create(&credential.rules) {
         return None;
     }
     // A static credential delivers its first source, as `build_config` does.
@@ -258,6 +298,54 @@ fn attested_github_credential(credentials: &[Credential]) -> Option<(&Credential
         .map(str::trim)
         .filter(|subject| !subject.is_empty() && subject.bytes().all(|b| b.is_ascii_digit()))?;
     Some((credential, account))
+}
+
+/// Console's canonical `github_token` replacement (`CredentialProfiles::
+/// GithubToken::REPLACE_CONFIG`, also stored without `require`), and no direct
+/// injection.
+fn is_canonical_github_replace(data: &StaticData) -> bool {
+    if data.inject_config.as_ref().is_some_and(present) {
+        return false;
+    }
+    let Some(replace) = data.replace_config.as_ref() else {
+        return false;
+    };
+    *replace
+        == json!({
+            "proxy_value": "GITHUB_TOKEN",
+            "match_headers": ["Authorization"],
+            "require": false,
+        })
+        || *replace
+            == json!({
+                "proxy_value": "GITHUB_TOKEN",
+                "match_headers": ["Authorization"],
+            })
+}
+
+/// Whether one of `rules` covers `POST https://api.github.com/repos/*/*/pulls`:
+/// a rule for the API host that allows `POST` (or any method) and that path (or
+/// any path). Path patterns are recognized only in the few forms known to
+/// cover it; an unfamiliar pattern is not assumed to.
+fn rules_cover_pr_create(rules: &[RequestRule]) -> bool {
+    rules.iter().any(|rule| {
+        rule.host.as_deref().is_some_and(|host| {
+            host.trim()
+                .trim_end_matches('.')
+                .eq_ignore_ascii_case(GITHUB_API_HOST)
+        }) && (rule.http_methods.is_empty()
+            || rule
+                .http_methods
+                .iter()
+                .any(|method| method.trim().eq_ignore_ascii_case("POST")))
+            && (rule.paths.is_empty()
+                || rule.paths.iter().any(|path| {
+                    matches!(
+                        path.trim(),
+                        "/repos/*/*/pulls" | "/repos/*/*/*" | "/repos/**" | "/**" | "**"
+                    )
+                }))
+    })
 }
 
 pub(crate) fn source_value(
@@ -616,14 +704,19 @@ mod tests {
         }
     }
 
+    fn canonical_replace() -> serde_json::Value {
+        json!({"proxy_value": "GITHUB_TOKEN", "match_headers": ["Authorization"], "require": false})
+    }
+
     fn github_token(id: i64, priority: i32, host: &str) -> Credential {
         Credential {
             kind: CredentialKind::Static,
             id,
             priority,
+            // Console's canonical `github_token` shape.
             data: CredentialData::Static(StaticData {
-                inject_config: Some(json!({"header": "Authorization"})),
-                replace_config: None,
+                inject_config: None,
+                replace_config: Some(canonical_replace()),
             }),
             sources: vec![source("token_broker", Some("github"), Some("90210001"))],
             rules: vec![rule(host)],
@@ -636,21 +729,256 @@ mod tests {
             github_user_id_of(&[github_token(1, 100, "api.github.com")]),
             Some("90210001".to_owned())
         );
-        // A wildcard rule serves the host too.
-        assert_eq!(
-            github_user_id_of(&[github_token(1, 100, "*.github.com")]),
-            Some("90210001".to_owned())
-        );
-        // So does a placeholder-replacing credential, which is how the
-        // sandbox's `Authorization: Bearer GITHUB_TOKEN` is rewritten.
-        let mut replacing = github_token(1, 100, "api.github.com");
-        replacing.data = CredentialData::Static(StaticData {
+        // The canonical replacement is also stored without `require`.
+        let mut without_require = github_token(1, 100, "api.github.com");
+        without_require.data = CredentialData::Static(StaticData {
             inject_config: None,
             replace_config: Some(
                 json!({"proxy_value": "GITHUB_TOKEN", "match_headers": ["Authorization"]}),
             ),
         });
-        assert_eq!(github_user_id_of(&[replacing]), Some("90210001".to_owned()));
+        assert_eq!(
+            github_user_id_of(&[without_require]),
+            Some("90210001".to_owned())
+        );
+        // A wildcard host rule is not "a rule for api.github.com": not
+        // attested, which errs toward no claim.
+        assert_eq!(
+            github_user_id_of(&[github_token(1, 100, "*.github.com")]),
+            None
+        );
+    }
+
+    fn static_with(id: i64, data: StaticData, rules: Vec<RequestRule>) -> Credential {
+        Credential {
+            data: CredentialData::Static(data),
+            rules,
+            ..github_token(id, 100, "api.github.com")
+        }
+    }
+
+    fn api_rule(methods: &[&str], paths: &[&str]) -> RequestRule {
+        RequestRule {
+            host: Some("api.github.com".to_owned()),
+            cidr: None,
+            http_methods: methods.iter().map(|m| (*m).to_owned()).collect(),
+            paths: paths.iter().map(|p| (*p).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_direct_injector_or_a_non_canonical_replacement_is_never_attested() {
+        let canonical = || StaticData {
+            inject_config: None,
+            replace_config: Some(canonical_replace()),
+        };
+        for (label, data) in [
+            // Console lets a custom secret inject Authorization directly.
+            (
+                "injector",
+                StaticData {
+                    inject_config: Some(json!({"header": "Authorization"})),
+                    replace_config: None,
+                },
+            ),
+            (
+                "injector and replacement",
+                StaticData {
+                    inject_config: Some(json!({"header": "Authorization"})),
+                    ..canonical()
+                },
+            ),
+            (
+                "another placeholder",
+                StaticData {
+                    inject_config: None,
+                    replace_config: Some(json!({
+                        "proxy_value": "OTHER", "match_headers": ["Authorization"], "require": false
+                    })),
+                },
+            ),
+            (
+                "another header",
+                StaticData {
+                    inject_config: None,
+                    replace_config: Some(json!({
+                        "proxy_value": "GITHUB_TOKEN", "match_headers": ["X-Token"], "require": false
+                    })),
+                },
+            ),
+            (
+                "required",
+                StaticData {
+                    inject_config: None,
+                    replace_config: Some(json!({
+                        "proxy_value": "GITHUB_TOKEN", "match_headers": ["Authorization"], "require": true
+                    })),
+                },
+            ),
+            (
+                "extra header",
+                StaticData {
+                    inject_config: None,
+                    replace_config: Some(json!({
+                        "proxy_value": "GITHUB_TOKEN",
+                        "match_headers": ["Authorization", "X-Token"],
+                        "require": false
+                    })),
+                },
+            ),
+        ] {
+            let credential = static_with(1, data, vec![api_rule(&[], &[])]);
+            assert_eq!(github_user_id_of(&[credential]), None, "{label}");
+        }
+        assert!(
+            github_user_id_of(&[static_with(1, canonical(), vec![api_rule(&[], &[])])]).is_some()
+        );
+    }
+
+    #[test]
+    fn a_credential_whose_rules_do_not_cover_pr_create_is_never_attested() {
+        let canonical = || StaticData {
+            inject_config: None,
+            replace_config: Some(canonical_replace()),
+        };
+        for (label, rules) in [
+            ("read only", vec![api_rule(&["GET"], &[])]),
+            ("issues only", vec![api_rule(&[], &["/repos/*/*/issues"])]),
+            ("other paths", vec![api_rule(&["POST"], &["/graphql"])]),
+            ("no rules", vec![]),
+            ("other host", vec![rule("github.com")]),
+        ] {
+            let credential = static_with(1, canonical(), rules);
+            assert_eq!(github_user_id_of(&[credential]), None, "{label}");
+        }
+        for (label, rules) in [
+            ("any method and path", vec![api_rule(&[], &[])]),
+            ("POST only", vec![api_rule(&["post"], &[])]),
+            (
+                "the exact path",
+                vec![api_rule(&["POST"], &["/repos/*/*/pulls"])],
+            ),
+            ("a covering path", vec![api_rule(&[], &["/repos/**"])]),
+            (
+                "one covering rule among others",
+                vec![
+                    rule("github.com"),
+                    api_rule(&["GET"], &[]),
+                    api_rule(&["POST"], &[]),
+                ],
+            ),
+        ] {
+            let credential = static_with(1, canonical(), rules);
+            assert_eq!(
+                github_user_id_of(&[credential]),
+                Some("90210001".to_owned()),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_header_rewriting_transform_on_the_api_host_withdraws_the_attestation() {
+        let attested = github_token(1, 100, "api.github.com");
+        assert!(github_user_id_of(std::slice::from_ref(&attested)).is_some());
+        let transform = |kind: CredentialKind, data: CredentialData, host: &str| Credential {
+            kind,
+            id: 50,
+            priority: 100,
+            data,
+            sources: vec![],
+            rules: vec![rule(host)],
+        };
+        let hmac = |host: &str| {
+            transform(
+                CredentialKind::Hmac,
+                CredentialData::Hmac(crate::models::HmacData {
+                    timestamp_format: "unix".to_owned(),
+                    signature_algorithm: "sha256".to_owned(),
+                    signature_key_encoding: "raw".to_owned(),
+                    signature_output_encoding: "hex".to_owned(),
+                    signature_message: "{{ .Body }}".to_owned(),
+                    // A header that does not collide with `Authorization`.
+                    headers: vec![crate::models::HmacHeader {
+                        name: "X-Signature".to_owned(),
+                        value: "{{ .Signature }}".to_owned(),
+                    }],
+                    allow_chunked_body: false,
+                }),
+                host,
+            )
+        };
+        let aws = |host: &str| {
+            transform(
+                CredentialKind::AwsAuth,
+                CredentialData::AwsAuth(crate::models::AwsAuthData {
+                    allowed_regions: vec![],
+                    allowed_services: vec![],
+                }),
+                host,
+            )
+        };
+        let gcp = |host: &str| {
+            transform(
+                CredentialKind::GcpAuth,
+                CredentialData::GcpAuth(crate::models::GcpAuthData {
+                    credentials_provider: None,
+                    subject: None,
+                    scopes: vec![],
+                }),
+                host,
+            )
+        };
+        let gcp_id = |host: &str| {
+            transform(
+                CredentialKind::GcpIdToken,
+                CredentialData::GcpIdToken(crate::models::GcpIdTokenData {
+                    audience: "https://run.example".to_owned(),
+                    header: Some("X-Serverless-Authorization".to_owned()),
+                }),
+                host,
+            )
+        };
+        let oauth = |host: &str| {
+            transform(
+                CredentialKind::OauthToken,
+                CredentialData::OauthToken(crate::models::OauthTokenData {
+                    grant: "refresh_token".to_owned(),
+                    token_endpoint: "https://idp.example/token".to_owned(),
+                    audience: None,
+                    scopes: vec![],
+                    header: Some("X-Other".to_owned()),
+                    value_prefix: None,
+                }),
+                host,
+            )
+        };
+        for (label, other) in [
+            ("hmac", hmac("api.github.com")),
+            ("aws_auth", aws("api.github.com")),
+            ("gcp_auth", gcp("api.github.com")),
+            ("gcp_id_token", gcp_id("api.github.com")),
+            ("oauth_token", oauth("api.github.com")),
+            ("wildcard host", hmac("*.github.com")),
+        ] {
+            assert_eq!(
+                github_user_id_of(&[github_token(1, 100, "api.github.com"), other]),
+                None,
+                "{label}"
+            );
+        }
+        // The same transforms on other hosts leave it alone.
+        assert!(
+            github_user_id_of(&[
+                github_token(1, 100, "api.github.com"),
+                hmac("api.example.com"),
+                aws("s3.example.com"),
+                gcp("storage.example.com"),
+                gcp_id("run.example.com"),
+                oauth("mcp.example.com"),
+            ])
+            .is_some()
+        );
     }
 
     #[test]

@@ -770,6 +770,9 @@ function parsePrBinding(payload: unknown): PrBinding {
     !nonEmpty(payload.head_sha) ||
     !nonEmpty(payload.thread_key) ||
     !nonEmpty(payload.pr_node_id) ||
+    typeof payload.revision !== "number" ||
+    !Number.isInteger(payload.revision) ||
+    payload.revision < 0 ||
     typeof payload.managed !== "boolean" ||
     typeof payload.closed !== "boolean"
   ) {

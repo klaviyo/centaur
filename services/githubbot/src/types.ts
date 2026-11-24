@@ -220,6 +220,8 @@ export type PrBinding = {
   thread_key: string;
   /** GitHub node id of the exact PR this binding was created for. */
   pr_node_id: string;
+  /** Compare-and-set token: a state write may name the revision it was derived from. */
+  revision: number;
   head_sha: string;
   managed: boolean;
   closed: boolean;
@@ -233,6 +235,12 @@ export type PrBindingStateUpdate = {
    * applies a write only if it is not older than the last one it applied.
    */
   observed_updated_at: string;
+  /**
+   * The binding `revision` read before the fresh GitHub fetch this write was
+   * derived from. Resolves an equal-`updated_at` tie: a contradicting write
+   * applies only if nothing else was written since.
+   */
+  expected_revision?: number;
   managed?: boolean;
   closed?: boolean;
   head_sha?: string;

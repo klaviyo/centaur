@@ -24,6 +24,10 @@ create table pr_session_bindings (
     managed_observed_at timestamptz,
     closed_observed_at timestamptz,
     head_observed_at timestamptz,
+    -- Incremented by every applied state write. A write that contradicts a
+    -- field at the very same observation time (GitHub's `updated_at` has
+    -- one-second resolution) applies only against the revision it read.
+    revision bigint not null default 0,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
     primary key (repository, number),
