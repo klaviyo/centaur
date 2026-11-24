@@ -345,11 +345,13 @@ export async function handlePullRequestEvent(
     stringValue(prNode.node_id),
     botAssigned,
   );
+  // An answer for another PR's binding is no basis for anything: no write, no
+  // CI evaluation (which would claim, reset the counter or turn), no merge.
+  if (!lookup.ok && lookup.mismatch) return;
   // A failed lookup is not "unbound": the invalidating writes (close, unassign,
   // reopen) are still attempted on the signed payload's node id, which api-rs
   // checks against the binding.
-  // (An answer for another PR's binding is no basis for a write at all.)
-  if (!lookup.ok ? !lookup.mismatch : lookup.binding) {
+  if (!lookup.ok || lookup.binding) {
     await recordBindingState(
       ctx,
       bindingRef(repo.owner, repo.repo, number),
@@ -497,6 +499,8 @@ async function recordBindingState(
         ref.number,
         current?.pr_node_id ?? stringValue(prNode.node_id),
       );
+      // Another PR's binding answers nothing about this one: abandon the write.
+      if (!again.ok && again.mismatch) return undefined;
       if (again.ok) {
         if (!again.binding) return undefined;
         current = again.binding;

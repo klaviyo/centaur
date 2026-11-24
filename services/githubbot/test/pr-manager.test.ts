@@ -3140,6 +3140,83 @@ describe("PR session bindings", () => {
           expect(api.sessionCalls).toEqual([]);
         }
       });
+
+      const lifecycleEvent = (action: string, assignee?: string) =>
+        JSON.stringify({
+          action,
+          repository: { full_name: "base/repo" },
+          pull_request: { number: 7, node_id: NODE_ID, head: { sha: "abc123" } },
+          ...(assignee ? { assignee: { login: assignee } } : {}),
+        });
+
+      test("a lifecycle event stops at the mismatch: no PR read, CI evaluation, claim, counter change or merge", async () => {
+        const green = {
+          __typename: "CheckRun",
+          name: "build",
+          status: "COMPLETED",
+          conclusion: "SUCCESS",
+          detailsUrl: FAILURE_URL,
+          permalink: "https://github.com/base/repo/runs/1",
+          checkSuite: { app: { slug: "ci", databaseId: CHECK_APP_ID } },
+        };
+        for (const [action, assignee] of [
+          // Green CI: processCi would take the ci-settled claim, reset the
+          // counter and try the merge.
+          ["assigned", "centaur-bot"],
+          // A clean PR: tryMerge would read the PR and could take the merge claim.
+          ["synchronize", undefined],
+          ["reopened", undefined],
+        ] as const) {
+          const api = makeApi({ binding: null, lookupResponse: otherPr });
+          const state = makeState();
+          await state.set(PR_KEY, { consecutiveCiFixes: 2 });
+          const { ctx, reads } = makeCtx({ api, state, checkNode: green });
+          await handlePullRequestEvent(ctx, lifecycleEvent(action, assignee));
+          await drainBackgroundWork(2000);
+          expect(reads, action).toEqual([]);
+          expect(api.posts("/state"), action).toHaveLength(0);
+          expect(api.sessionCalls, action).toEqual([]);
+          expect(await state.get(PR_KEY), action).toEqual({ consecutiveCiFixes: 2 });
+          expect(state.keys(), action).toEqual([PR_KEY]);
+        }
+      });
+
+      test("an assignment's mismatch is final even if a later lookup would miss", async () => {
+        // The first lookup answers for another PR, a later one with a coded
+        // miss. Only the first decides: no takeover of a red PR, no turn.
+        let lookups = 0;
+        const api = makeApi({
+          binding: null,
+          lookupResponse: () => (lookups++ === 0 ? otherPr() : bindingMiss()),
+        });
+        const state = makeState();
+        await state.set(PR_KEY, { consecutiveCiFixes: 3 });
+        const { ctx, comments } = makeCtx({ api, state });
+        await handlePullRequestEvent(ctx, lifecycleEvent("assigned", "centaur-bot"));
+        await drainBackgroundWork(2000);
+        expect(lookups).toBe(1);
+        expect(api.sessionCalls).toEqual([]);
+        expect(comments).toEqual([]);
+        expect(await state.get(PR_KEY)).toEqual({ consecutiveCiFixes: 3 });
+        expect(state.keys()).toEqual([PR_KEY]);
+      });
+
+      test("a conflict whose re-read answers for another PR abandons the write", async () => {
+        // The first lookup finds this PR's binding; the write conflicts; the
+        // re-read answers for another PR. Nothing further is written.
+        let lookups = 0;
+        const api = makeApi({
+          binding: null,
+          lookupResponse: () =>
+            lookups++ === 0 ? Response.json(bindingJson({ managed: true, closed: false })) : otherPr(),
+          stateFailures: ["conflict"],
+        });
+        const { ctx } = makeCtx({ api, settled: false, prState: "closed" });
+        await handlePullRequestEvent(ctx, lifecycleEvent("closed"));
+        await drainBackgroundWork(2000);
+        expect(lookups).toBe(2);
+        expect(api.posts("/state")).toHaveLength(1);
+      });
     });
 
     describe("a partially readable rollup", () => {
