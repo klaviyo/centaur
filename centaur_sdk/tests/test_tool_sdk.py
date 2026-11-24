@@ -717,6 +717,7 @@ def test_create_pull_request_cli_prints_result(
         (403, "sandbox_mismatch", True),
         (503, "sandbox_proxy_unavailable", True),
         (409, "requester_not_applied", False),
+        (409, "no_active_execution", False),
         (502, "upstream_error", False),
     ],
 )
@@ -757,5 +758,11 @@ def test_create_pull_request_cli_reports_http_errors(
     assert code in captured.err
     assert ("open the pull request as you normally would" in captured.err) is fallback
     # The identity switch is retried, never worked around.
-    assert ("retry in a few seconds" in captured.err) is (code == "requester_not_applied")
+    retry = {
+        "requester_not_applied": "still switching to the current speaker",
+        "no_active_execution": "turn is still starting",
+    }
+    assert ("retry in a few seconds" in captured.err) is (code in retry)
+    if code in retry:
+        assert retry[code] in captured.err
     assert captured.out == ""

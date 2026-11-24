@@ -921,7 +921,8 @@ async fn admit_api_client_execution(
 /// the runtime can safely honor Console requesters on any thread namespace.
 /// Likewise `linear_user_id` (and its display name) names the Linear user a
 /// turn runs as; only linearbot reads it from a signature-verified webhook, so
-/// it is stripped from every other caller.
+/// it is stripped from every other caller. The execution's requester record
+/// (`centaur.requester`) is stripped from all of them.
 fn sanitize_execute_metadata(
     caller_class: CallerClass,
     caller_identity: &str,
@@ -933,6 +934,8 @@ fn sanitize_execute_metadata(
     if caller_class != CallerClass::Console {
         fields.remove("requester_principal_foreign_id");
     }
+    // api-rs's own record of an execution's requester, which no caller sets.
+    fields.remove(centaur_session_sqlx::EXECUTION_REQUESTER_KEY);
     if !(caller_class == CallerClass::Ingress && caller_identity == LINEARBOT_IDENTITY) {
         fields.remove("linear_user_id");
         fields.remove("linear_user_name");
@@ -1173,6 +1176,28 @@ mod session_authorization_tests {
             assert_eq!(
                 sanitize_execute_metadata(caller_class, identity, Some(metadata.clone())),
                 Some(json!({ "source": "console" }))
+            );
+        }
+    }
+
+    #[test]
+    fn no_caller_may_plant_the_execution_requester_record() {
+        let metadata = json!({
+            "source": "slackbot",
+            "centaur.requester": {"principal_id": "prn_alice"}
+        });
+        for (caller_class, identity) in [
+            (CallerClass::Admin, "api-rs-admin"),
+            (CallerClass::Console, "centaur-console"),
+            (CallerClass::Ingress, "slackbot"),
+            (CallerClass::Ingress, LINEARBOT_IDENTITY),
+            (CallerClass::Principal, "prn_sandbox"),
+            (CallerClass::ApiClient, "acl_test"),
+        ] {
+            assert_eq!(
+                sanitize_execute_metadata(caller_class, identity, Some(metadata.clone())),
+                Some(json!({ "source": "slackbot" })),
+                "{caller_class:?} {identity}"
             );
         }
     }

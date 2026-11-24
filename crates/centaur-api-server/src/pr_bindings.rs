@@ -194,15 +194,45 @@ impl GithubPullRequest {
 /// Slack session that is not a DM and has a running execution whose requester
 /// api-rs bound is the one its proxy attests, with a GitHub account attested
 /// by its proxy.
+///
+/// The thread's proxy-binding lock, the one every rebind and unbind of that
+/// thread's proxy takes, is held from before the first of those checks until
+/// the response is handled. A turn change cannot rebind the proxy to the next
+/// speaker between the checks and the GitHub call, so the token GitHub sees is
+/// the one the checks vouched for.
 pub(crate) async fn create_session_pull_request(
     State(state): State<AppState>,
     Extension(caller): Extension<AuthenticatedCaller>,
     Path(raw_thread_key): Path<String>,
     Json(request): Json<CreatePullRequestRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    create_session_pull_request_with(&state, &caller, raw_thread_key, request, || async {})
+        .await
+        .map(Json)
+}
+
+/// [`create_session_pull_request`], with `before_github` run while the
+/// binding lock is held, just before the GitHub call. Production passes a
+/// no-op; tests use it to pause creation mid-flight.
+async fn create_session_pull_request_with<B, BFut>(
+    state: &AppState,
+    caller: &AuthenticatedCaller,
+    raw_thread_key: String,
+    request: CreatePullRequestRequest,
+    before_github: B,
+) -> Result<Value, ApiError>
+where
+    B: FnOnce() -> BFut,
+    BFut: Future<Output = ()>,
+{
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
     let request = request.validate()?;
     let runtime = state.runtime()?;
+    let _proxy_binding = runtime
+        .store()
+        .lock_proxy_binding(&thread_key)
+        .await
+        .map_err(SessionRuntimeError::from)?;
     let session = runtime.session(&thread_key).await?;
     if caller.principal_subject().is_none()
         || !principal_subject_owns_session(
@@ -295,6 +325,7 @@ pub(crate) async fn create_session_pull_request(
         ));
     };
 
+    before_github().await;
     let response = runtime
         .create_github_pull_request(sandbox_id, &request.owner, &request.repo, request.payload)
         .await
@@ -322,7 +353,7 @@ pub(crate) async fn create_session_pull_request(
         .await
         .map(|_| ()),
     };
-    Ok(Json(match outcome {
+    Ok(match outcome {
         Ok(()) => json!({"pull_request": pull_request.summary(), "bound": true}),
         Err(reason) => {
             // The PR exists on GitHub and stays on today's unbound flow.
@@ -336,7 +367,7 @@ pub(crate) async fn create_session_pull_request(
             );
             json!({"pull_request": pull_request.summary(), "bound": false, "reason": reason})
         }
-    }))
+    })
 }
 
 /// Inserts the binding for a PR GitHub has proven authored by the caller.
@@ -988,6 +1019,8 @@ mod tests {
         store: PgSessionStore,
         backend: Arc<GithubBackend>,
         router: axum::Router,
+        state: AppState,
+        auth: ApiAuthConfig,
         principal: String,
         suffix: String,
         database_url: String,
@@ -1038,17 +1071,17 @@ mod tests {
                 SandboxRuntime::backend(backend.clone(), SandboxSpec::new("test")),
                 Registrar,
             );
-            let router = build_router_with_app_state(AppState::ready_with_pool(
-                runtime,
-                None,
-                Some(store.pool().clone()),
-                ApiAuthConfig::testing_with_ingresses("test-secret"),
-            ));
+            let auth = ApiAuthConfig::testing_with_ingresses("test-secret");
+            let state =
+                AppState::ready_with_pool(runtime, None, Some(store.pool().clone()), auth.clone());
+            let router = build_router_with_app_state(state.clone());
             let suffix = Uuid::new_v4().simple().to_string();
             Some(Self {
                 store,
                 backend,
                 router,
+                state,
+                auth,
                 principal: format!("prn_{suffix}"),
                 suffix,
                 database_url: url,
@@ -1454,6 +1487,91 @@ mod tests {
         );
 
         assert!(h.backend.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rebind_waits_for_an_in_flight_creation_and_a_refusal_releases_the_lock() {
+        use std::time::Duration;
+
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let sandbox = h.sandbox_id("lock");
+        let thread_key = h.session("C0TEST", &sandbox).await;
+        h.backend.respond(
+            201,
+            h.github_pull_request(7, AUTHOR_ID, "User", &h.repository()),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", h.token(&sandbox)).parse().unwrap(),
+        );
+        let caller = h.auth.authenticate(&headers).unwrap();
+        let request: CreatePullRequestRequest = serde_json::from_value(h.create_body()).unwrap();
+
+        // Creation pauses just before the GitHub call, holding the lock.
+        let (paused_tx, paused_rx) = tokio::sync::oneshot::channel::<()>();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+        let creation = tokio::spawn({
+            let state = h.state.clone();
+            let raw = thread_key.as_str().to_owned();
+            async move {
+                create_session_pull_request_with(&state, &caller, raw, request, || async move {
+                    let _ = paused_tx.send(());
+                    let _ = resume_rx.await;
+                })
+                .await
+            }
+        });
+        paused_rx.await.expect("creation reached the GitHub call");
+        assert!(h.backend.calls().is_empty(), "paused before the call");
+
+        // A rebind or unbind of this thread's proxy takes the same lock, so it
+        // waits while the creation is in flight.
+        let waiting = tokio::time::timeout(
+            Duration::from_millis(400),
+            h.store.lock_proxy_binding(&thread_key),
+        )
+        .await;
+        assert!(waiting.is_err(), "the rebind did not wait for the creation");
+
+        // Another thread's rebind is unaffected.
+        let other = ThreadKey::parse(format!("slack:T0TEST:C0OTHER:{}.1", h.suffix)).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), h.store.lock_proxy_binding(&other))
+            .await
+            .expect("another thread's lock is free")
+            .unwrap();
+
+        // Creation finishes (and binds), then the rebind gets the lock.
+        resume_tx.send(()).unwrap();
+        let body = creation.await.unwrap().unwrap();
+        assert_eq!(body["bound"], true);
+        assert_eq!(h.backend.calls().len(), 1);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            h.store.lock_proxy_binding(&thread_key),
+        )
+        .await
+        .expect("the lock is released once creation finishes")
+        .unwrap();
+
+        // A refused request holds the lock only while it is checked.
+        let (status, _) = h
+            .create(
+                &thread_key,
+                &proxy_token(&h.principal, Some("sbx-wrong"), Some("1")),
+                h.create_body(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            h.store.lock_proxy_binding(&thread_key),
+        )
+        .await
+        .expect("a refusal releases the lock")
+        .unwrap();
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@ import { resolveAllowedAuthorAssociations } from "./authorization";
 import { reactWorkingOnReview, settleReviewReaction } from "./reactions";
 import { runTurnStream, turnOutputChars } from "./turn";
 import {
+  FAILED_CONCLUSIONS,
   fetchCiEvaluation,
   maybeEmitReviewSubmitted,
   prepareCiCompleted,
@@ -323,7 +324,7 @@ export async function handlePullRequestEvent(
   if (number === undefined) return;
   // A PR opened through a session binding keeps its lifecycle state in api-rs,
   // recorded before (and regardless of) the unbound handling below.
-  const lookup = await lookupBinding(ctx, repo.owner, repo.repo, number);
+  const lookup = await lookupBindingWithRetry(ctx, repo.owner, repo.repo, number);
   // A failed lookup is not "unbound": the invalidating writes (close, unassign,
   // reopen) are still attempted on the signed payload's node id, which api-rs
   // checks against the binding.
@@ -383,6 +384,28 @@ async function lookupBinding(
 }
 
 /**
+ * `lookupBinding`, retried within the bounded budget used for critical state
+ * writes when api-rs fails transiently, so a lifecycle event that is delivered
+ * once (an `assigned`, say) isn't lost to a brief outage.
+ */
+async function lookupBindingWithRetry(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<BindingLookup> {
+  const delays = ctx.stateWriteRetryDelaysMs ?? DEFAULT_STATE_WRITE_RETRY_DELAYS_MS;
+  const sleep = ctx.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  for (let attempt = 0; ; attempt += 1) {
+    const lookup = await lookupBinding(ctx, owner, repo, number);
+    if (lookup.ok || attempt >= delays.length || !isRetryableSessionApiError(lookup.error)) {
+      return lookup;
+    }
+    await sleep(delays[attempt] ?? 0);
+  }
+}
+
+/**
  * Record a lifecycle event on the binding, only for the PR the binding was
  * created for (`pr_node_id`). Every write is derived from a fresh fetch, never
  * the payload, and carries that fetch's `updated_at` so api-rs can drop a write
@@ -434,11 +457,13 @@ async function recordBindingState(
     update = owns(ctx, fresh) ? undefined : { managed: false };
   }
   if (!update) return;
+  // Enabling management is as unrepeatable as disabling it (one delivery, no
+  // redelivery), so both get the bounded retry.
   await writeBindingState(
     ctx,
     ref,
     { ...update, pr_node_id: expectedNodeId, observed_updated_at: fresh.updatedAt },
-    invalidating,
+    invalidating || action === "assigned",
     action,
   );
 }
@@ -586,11 +611,52 @@ export async function handleCiEvent(
     target.prNumbers.length > 0
       ? target.prNumbers
       : await fetchPrNumbersForCommit(ctx, repo.owner, repo.repo, target.headSha);
+  const eventFailure = ciEventFailure(eventType, payload, repo, target.headSha);
   await Promise.all(
     prNumbers.map((number) =>
-      processCi(ctx, repo.owner, repo.repo, number, target.headSha, false, evaluation),
+      processCi(ctx, repo.owner, repo.repo, number, target.headSha, false, evaluation, eventFailure),
     ),
   );
+}
+
+/** A failing check as the signed completion event itself names it. */
+type CiEventFailure = {
+  owner: string;
+  repo: string;
+  headSha: string;
+  name: string;
+  url?: string;
+};
+
+/**
+ * The failing check the signed completion event names, for a report whose CI
+ * evaluation settled red without a readable name or link. Only a failing
+ * check_run, status or workflow_run qualifies: a passing one finishing last
+ * says nothing about what failed.
+ */
+function ciEventFailure(
+  eventType: string,
+  payload: JsonRecord,
+  repo: { owner: string; repo: string },
+  headSha: string,
+): CiEventFailure | undefined {
+  let name: string | undefined;
+  let url: string | undefined;
+  if (eventType === "status") {
+    const state = stringValue(payload.state);
+    if (state !== "failure" && state !== "error") return undefined;
+    name = stringValue(payload.context);
+    url = stringValue(payload.target_url);
+  } else if (eventType === "check_run" || eventType === "workflow_run") {
+    const node = eventType === "check_run" ? payload.check_run : payload.workflow_run;
+    if (!isRecord(node)) return undefined;
+    const conclusion = stringValue(node.conclusion)?.toLowerCase();
+    if (!conclusion || !FAILED_CONCLUSIONS.has(conclusion)) return undefined;
+    name = stringValue(node.name);
+    url = stringValue(node.details_url) ?? stringValue(node.html_url);
+  }
+  if (!name) return undefined;
+  return { ...repo, headSha, name, ...(url ? { url } : {}) };
 }
 
 async function processCi(
@@ -601,6 +667,7 @@ async function processCi(
   headSha: string,
   force = false,
   knownEvaluation?: CiEvaluation | null,
+  eventFailure?: CiEventFailure,
 ): Promise<void> {
   const pr = await fetchPr(ctx, owner, repo, number);
   if (!pr || !owns(ctx, pr)) return;
@@ -625,7 +692,17 @@ async function processCi(
       // about this one: it takes the unbound flow below, unchanged. A PR whose
       // node id is unknown can't be told apart, so it is left alone.
       if (lookup.binding.pr_node_id === pr.nodeId) {
-        await reportBoundCiFailure(ctx, owner, repo, number, headSha, lookup.binding, evaluation, trace);
+        await reportBoundCiFailure(
+          ctx,
+          owner,
+          repo,
+          number,
+          headSha,
+          lookup.binding,
+          evaluation,
+          trace,
+          eventFailure,
+        );
         return;
       }
       if (!pr.nodeId) {
@@ -701,6 +778,7 @@ async function reportBoundCiFailure(
   binding: PrBinding,
   evaluation: CiEvaluation,
   trace: GithubbotTrace,
+  eventFailure?: CiEventFailure,
 ): Promise<void> {
   const prLabel = `${owner}/${repo}#${number}`;
   const skip = (reason: string) =>
@@ -741,6 +819,18 @@ async function reportBoundCiFailure(
     if (fresh.headSha !== headSha) return skip("stale_head");
   }
 
+  // The evaluation's own failing check wins. Only when it names none (it fell
+  // back to aggregate counts) does the signed event's own failing check stand
+  // in, and only for this exact repository and head.
+  const failing = evaluation.failingNames[0]
+    ? { name: evaluation.failingNames[0], url: evaluation.firstFailingUrl }
+    : eventFailure &&
+        eventFailure.owner.toLowerCase() === owner.toLowerCase() &&
+        eventFailure.repo.toLowerCase() === repo.toLowerCase() &&
+        eventFailure.headSha === headSha
+      ? { name: eventFailure.name, url: eventFailure.url }
+      : { name: "CI checks", url: undefined };
+
   // open and assigned come from the fresh read; api-rs decides and records. It
   // is also the only dedupe authority, keyed by (pr_node_id, head_sha): a
   // repeat delivery is answered `duplicate`, so githubbot keeps no claim here.
@@ -752,8 +842,8 @@ async function reportBoundCiFailure(
       current_head_sha: fresh.headSha,
       open: fresh.state === "open" && !fresh.merged,
       assigned: owns(ctx, fresh),
-      check_name: evaluation.failingNames[0] ?? "CI checks",
-      ...(evaluation.firstFailingUrl ? { details_url: evaluation.firstFailingUrl } : {}),
+      check_name: failing.name,
+      ...(failing.url ? { details_url: failing.url } : {}),
       html_url: fresh.htmlUrl ?? `https://github.com/${owner}/${repo}/pull/${number}`,
     });
     // `posted` and `duplicate` are both done; a skip is api-rs's decision.

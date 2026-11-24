@@ -1551,7 +1551,10 @@ describe("PR session bindings", () => {
     // One entry per /state call, consumed in order: a failing HTTP status or a
     // network error. Calls after the list is used up succeed.
     stateFailures?: (number | "network")[];
+    // One entry per binding GET, consumed in order; later GETs succeed.
+    lookupFailures?: number[];
   }) {
+    const lookupFailures = [...(input.lookupFailures ?? [])];
     const stateFailures = [...(input.stateFailures ?? [])];
     // The binding as api-rs holds it: a state write moves its head.
     const current = input.binding ? { ...input.binding } : null;
@@ -1570,6 +1573,8 @@ describe("PR session bindings", () => {
       const body = init?.body ? JSON.parse(String(init.body)) : undefined;
       calls.push({ body, method, path });
       if (method === "GET") {
+        const lookupFailure = lookupFailures.shift();
+        if (lookupFailure) return new Response("x", { status: lookupFailure });
         if (input.lookupStatus) return new Response("x", { status: input.lookupStatus });
         if ("lookupBody" in input) return Response.json(input.lookupBody);
         if (!input.binding) return new Response("not found", { status: 404 });
@@ -1603,6 +1608,9 @@ describe("PR session bindings", () => {
     api: ReturnType<typeof makeApi>;
     assignees?: { login: string }[];
     checkNode?: Record<string, unknown>;
+    // The rollup's check detail is unreadable, so the evaluation falls back to
+    // aggregate counts: red, but with no failing name or link.
+    aggregateOnly?: boolean;
     // Head the PR reports on its Nth fetch (the last entry repeats).
     heads?: string[];
     nodeId?: string;
@@ -1635,8 +1643,14 @@ describe("PR session bindings", () => {
               statusCheckRollup: {
                 state: input.settled === false ? "PENDING" : "FAILURE",
                 contexts: {
-                  nodes: [node],
+                  nodes: input.aggregateOnly ? [null] : [node],
                   pageInfo: { hasNextPage: false, endCursor: null },
+                  ...(input.aggregateOnly
+                    ? {
+                        checkRunCountsByState: [{ count: 1, state: "FAILURE" }],
+                        statusContextCountsByState: [],
+                      }
+                    : {}),
                 },
               },
             },
@@ -2041,6 +2055,88 @@ describe("PR session bindings", () => {
       }
     });
 
+    describe("when the evaluation names no failing check", () => {
+      const eventFor = (check: Record<string, unknown>) =>
+        JSON.stringify({
+          repository: { full_name: "base/repo" },
+          check_run: { head_sha: "abc123", pull_requests: [{ number: 7 }], ...check },
+        });
+      const bound = () => makeApi({ binding: { managed: true, closed: false } });
+
+      test("the signed event's failing check stands in, with its details url", async () => {
+        const api = bound();
+        const { ctx } = makeCtx({ api, aggregateOnly: true });
+        await handleCiEvent(
+          ctx,
+          "check_run",
+          eventFor({
+            name: "lint",
+            conclusion: "failure",
+            details_url: "https://ci.example.test/lint/9",
+            html_url: "https://github.com/base/repo/runs/9",
+          }),
+        );
+        expect(api.posts("/ci-failures")).toHaveLength(1);
+        expect(api.posts("/ci-failures")[0]?.body).toMatchObject({
+          check_name: "lint",
+          details_url: "https://ci.example.test/lint/9",
+          head_sha: "abc123",
+        });
+      });
+
+      test("falls back to the event's html_url, and omits the link when it has neither", async () => {
+        const withHtml = bound();
+        await handleCiEvent(
+          makeCtx({ api: withHtml, aggregateOnly: true }).ctx,
+          "check_run",
+          eventFor({ name: "lint", conclusion: "timed_out", html_url: "https://github.com/base/repo/runs/9" }),
+        );
+        expect(withHtml.posts("/ci-failures")[0]?.body).toMatchObject({
+          check_name: "lint",
+          details_url: "https://github.com/base/repo/runs/9",
+        });
+        const bare = bound();
+        await handleCiEvent(
+          makeCtx({ api: bare, aggregateOnly: true }).ctx,
+          "check_run",
+          eventFor({ name: "lint", conclusion: "failure" }),
+        );
+        const body = bare.posts("/ci-failures")[0]?.body as Record<string, unknown>;
+        expect(body.check_name).toBe("lint");
+        expect("details_url" in body).toBe(false);
+      });
+
+      test("a passing or unnamed event is not mistaken for the failure", async () => {
+        for (const check of [
+          { name: "build", conclusion: "success", details_url: "https://ci.example.test/ok" },
+          { conclusion: "failure", details_url: "https://ci.example.test/unnamed" },
+        ]) {
+          const api = bound();
+          await handleCiEvent(
+            makeCtx({ api, aggregateOnly: true }).ctx,
+            "check_run",
+            eventFor(check),
+          );
+          const body = api.posts("/ci-failures")[0]?.body as Record<string, unknown>;
+          expect(body.check_name).toBe("CI checks");
+          expect("details_url" in body).toBe(false);
+        }
+      });
+
+      test("never overrides a failing check the evaluation did read", async () => {
+        const api = bound();
+        await handleCiEvent(
+          makeCtx({ api }).ctx,
+          "check_run",
+          eventFor({ name: "lint", conclusion: "failure", details_url: "https://ci.example.test/lint/9" }),
+        );
+        expect(api.posts("/ci-failures")[0]?.body).toMatchObject({
+          check_name: "build",
+          details_url: FAILURE_URL,
+        });
+      });
+    });
+
     test("never escalates a bound PR, even at the attempt cap", async () => {
       const api = makeApi({ binding: { managed: true, closed: false } });
       const state = makeState();
@@ -2126,6 +2222,7 @@ describe("PR session bindings", () => {
     type RunOpts = {
       assignees?: { login: string }[];
       heads?: string[];
+      lookupFailures?: number[];
       lookupStatus?: number;
       nodeId?: string;
       prFetchFails?: boolean;
@@ -2137,6 +2234,7 @@ describe("PR session bindings", () => {
     async function exec(binding: Binding | null, body: string, opts: RunOpts = {}) {
       const api = makeApi({
         binding,
+        lookupFailures: opts.lookupFailures,
         lookupStatus: opts.lookupStatus,
         stateFailures: opts.stateFailures,
       });
@@ -2314,6 +2412,38 @@ describe("PR session bindings", () => {
         const result = await exec(bound, prEvent("synchronize"), { stateFailures: [503] });
         expect(result.updates).toHaveLength(1);
         expect(result.sleeps).toEqual([]);
+      });
+
+      test("a transient 503 on the only assigned event still ends with managed set", async () => {
+        const assigned = prEvent("assigned", { assignee: { login: "centaur-bot" } });
+        // The preliminary binding GET fails once, then the write fails twice.
+        const result = await exec(bound, assigned, {
+          lookupFailures: [503],
+          stateFailures: [503, "network"],
+        });
+        expect(result.updates).toHaveLength(3);
+        expect(result.updates.at(-1)).toMatchObject({ managed: true, pr_node_id: NODE_ID });
+        expect(result.sleeps).toEqual([10_000, 10_000, 20_000]);
+      });
+
+      test("the assigned write is retried only for retryable errors", async () => {
+        const assigned = prEvent("assigned", { assignee: { login: "centaur-bot" } });
+        const refused = await exec(bound, assigned, { stateFailures: [409] });
+        expect(refused.updates).toHaveLength(1);
+        expect(refused.sleeps).toEqual([]);
+        const gaveUp = await exec(bound, assigned, { stateFailures: [503, 503, 503] });
+        expect(gaveUp.updates).toHaveLength(3);
+        expect(gaveUp.sleeps).toEqual([10_000, 20_000]);
+      });
+
+      test("the binding lookup is retried within the bounded budget, and only when retryable", async () => {
+        const assigned = prEvent("assigned", { assignee: { login: "centaur-bot" } });
+        const never = await exec(bound, assigned, { lookupStatus: 503 });
+        expect(never.updates).toEqual([]);
+        expect(never.sleeps).toEqual([10_000, 20_000]);
+        const forbidden = await exec(bound, assigned, { lookupStatus: 403 });
+        expect(forbidden.updates).toEqual([]);
+        expect(forbidden.sleeps).toEqual([]);
       });
 
       test("still writes on the payload's node id when the binding lookup fails", async () => {

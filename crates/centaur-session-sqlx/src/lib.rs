@@ -33,6 +33,10 @@ pub use pr_bindings::{
     normalize_pr_repository,
 };
 
+/// The execution-metadata key api-rs records an execution's requester under.
+/// Only [`PgSessionStore::set_execution_requester`] may set it; code that
+/// persists caller-supplied metadata must strip it.
+pub const EXECUTION_REQUESTER_KEY: &str = "centaur.requester";
 pub const SESSION_EVENTS_CHANNEL: &str = "centaur_session_events";
 const DEFAULT_MAX_CONNECTIONS: u32 = 500;
 /// Proxy-binding locks one replica may hold or wait for at once. Each takes a
@@ -565,7 +569,7 @@ impl PgSessionStore {
             r#"
             update session_executions
             set metadata = metadata || jsonb_build_object(
-                    'centaur.requester', jsonb_build_object('principal_id', $2::text)),
+                    $3::text, jsonb_build_object('principal_id', $2::text)),
                 updated_at = now()
             where execution_id = $1
             returning execution_id
@@ -573,6 +577,7 @@ impl PgSessionStore {
         )
         .bind(execution_id)
         .bind(requester_principal_id)
+        .bind(EXECUTION_REQUESTER_KEY)
         .fetch_optional(&self.pool)
         .await?;
         if updated.is_none() {
@@ -2457,7 +2462,7 @@ impl TryFrom<SessionEventRow> for SessionEvent {
 /// recorded yet, `Some(None)` when the turn was recorded as having no
 /// requester, and `Some(Some(id))` for the requester principal.
 pub fn execution_requester(execution: &SessionExecution) -> Option<Option<&str>> {
-    let recorded = execution.metadata.get("centaur.requester")?;
+    let recorded = execution.metadata.get(EXECUTION_REQUESTER_KEY)?;
     Some(recorded.get("principal_id").and_then(Value::as_str))
 }
 

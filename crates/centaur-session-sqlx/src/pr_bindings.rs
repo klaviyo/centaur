@@ -356,9 +356,11 @@ impl PgSessionStore {
     /// therefore cannot be missed: the insert finds the row changed and claims
     /// nothing. The binding row is read `FOR SHARE`, so a close, unassignment
     /// or head change still in flight (holding the row's lock) is waited for
-    /// and its result decides, instead of the claim reading the old row. The notice is keyed by `(pr_node_id, head_sha)`, so a second
-    /// claim for the same PR and head is [`PrCiNoticeClaim::Duplicate`].
-    /// Release the claim if the post fails, so a later event can retry.
+    /// and its result decides, instead of the claim reading the old row.
+    ///
+    /// The notice is keyed by `(pr_node_id, head_sha)`, so a second claim for
+    /// the same PR and head is [`PrCiNoticeClaim::Duplicate`]. Release the
+    /// claim if the post fails, so a later event can retry.
     pub async fn claim_pr_ci_notice(
         &self,
         repository: &str,

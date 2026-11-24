@@ -30,12 +30,14 @@ _FALLBACK_HINT = (
     "This session cannot open a session-bound pull request; "
     "open the pull request as you normally would (for example with `gh pr create`)."
 )
-# Not a fallback: the identity is catching up, so the same call will work shortly.
-_RETRY_CODE = "requester_not_applied"
-_RETRY_HINT = (
-    "The session's GitHub identity is still switching to the current speaker; "
-    "retry in a few seconds."
-)
+# Not fallbacks: the session is catching up, so the same call will work shortly.
+_RETRY_HINTS = {
+    "requester_not_applied": (
+        "The session's GitHub identity is still switching to the current speaker; "
+        "retry in a few seconds."
+    ),
+    "no_active_execution": "The session's turn is still starting; retry in a few seconds.",
+}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -65,8 +67,9 @@ def main(argv: list[str] | None = None) -> int:
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", "replace")[:_ERROR_BODY_LIMIT]
         sys.stderr.write(f"create failed: HTTP {error.code} {detail}\n")
-        if _RETRY_CODE in detail:
-            sys.stderr.write(f"{_RETRY_HINT}\n")
+        retry_hint = next((hint for code, hint in _RETRY_HINTS.items() if code in detail), None)
+        if retry_hint:
+            sys.stderr.write(f"{retry_hint}\n")
         elif any(code in detail for code in _FALLBACK_CODES):
             sys.stderr.write(f"{_FALLBACK_HINT}\n")
         return 1

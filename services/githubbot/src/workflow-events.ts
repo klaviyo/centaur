@@ -41,7 +41,7 @@ function reviewCorrelationId(
   return `${owner}/${repo}:pr-${number}:${headSha}:${reviewer}`.toLowerCase();
 }
 
-const FAILED_CONCLUSIONS = new Set([
+export const FAILED_CONCLUSIONS = new Set([
   "action_required",
   "cancelled",
   "failure",
