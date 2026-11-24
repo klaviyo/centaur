@@ -201,6 +201,7 @@ type PullRequestSummary = {
   draft: boolean;
   headRef: string;
   headRepoFullName: string | null;
+  baseRepoFullName: string | null;
   headSha: string;
   htmlUrl: string | null;
   labels: string[];
@@ -222,6 +223,7 @@ function assigneeLogins(
 
 function summarizePr(pr: {
   draft?: boolean | null;
+  base?: { repo?: { full_name?: string | null } | null } | null;
   head: { ref: string; repo?: { full_name?: string | null } | null; sha: string };
   html_url?: string | null;
   labels: { name?: string }[];
@@ -239,6 +241,7 @@ function summarizePr(pr: {
     draft: pr.draft === true,
     headRef: pr.head.ref,
     headRepoFullName: pr.head.repo?.full_name ?? null,
+    baseRepoFullName: pr.base?.repo?.full_name ?? null,
     headSha: pr.head.sha,
     htmlUrl: pr.html_url ?? null,
     labels: pr.labels.map((l) => l.name ?? "").filter(Boolean),
@@ -1063,6 +1066,10 @@ async function reportBoundCiFailure(
       observed_updated_at: fresh.updatedAt,
       head_sha: headSha,
       current_head_sha: fresh.headSha,
+      // Where the PR lives now, from the same fresh read; the route path keeps
+      // the coordinates it was bound under.
+      current_repository: (fresh.baseRepoFullName ?? `${owner}/${repo}`).toLowerCase(),
+      current_number: fresh.number,
       open: fresh.state === "open" && !fresh.merged,
       assigned: owns(ctx, fresh),
       check_name: truncateCheckName(failing.name),

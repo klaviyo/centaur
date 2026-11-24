@@ -123,10 +123,54 @@ pub struct PrCreateLock {
 
 impl PrCreateLock {
     /// Releases the lock now, rather than leaving it to the dropped
-    /// transaction's deferred rollback.
+    /// transaction's deferred rollback, discarding anything inserted through
+    /// it.
     pub async fn release(self) -> Result<(), SessionStoreError> {
         self.tx.rollback().await?;
         Ok(())
+    }
+
+    /// Inserts `new` as a binding inside the transaction that holds the lock,
+    /// as a savepoint, so a refused insert (a conflict, say) leaves the lock
+    /// and the transaction usable. The binding becomes visible to anyone else
+    /// only at [`Self::commit`], which is also when the lock is released:
+    /// a lookup waiting on the lock can never miss a binding committed by the
+    /// creation it waited for. If the transaction has failed (a lost
+    /// connection, for instance) this fails and nothing is bound.
+    pub async fn insert_binding(
+        &mut self,
+        new: &NewPrBinding,
+    ) -> Result<PrBinding, SessionStoreError> {
+        use sqlx::Acquire as _;
+        let mut savepoint = (&mut self.tx).begin().await?;
+        match pr_bindings::insert_pr_binding_on(&mut savepoint, new).await {
+            Ok(binding) => {
+                savepoint.commit().await?;
+                Ok(binding)
+            }
+            Err(error) => {
+                // Best effort: if even this fails the transaction is gone and
+                // the caller's commit fails too.
+                let _ = savepoint.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Commits what was inserted through [`Self::insert_binding`] and releases
+    /// the lock, in one step.
+    pub async fn commit(self) -> Result<(), SessionStoreError> {
+        self.tx.commit().await?;
+        Ok(())
+    }
+
+    /// The Postgres backend serving this lock's transaction, so a test can
+    /// kill it.
+    #[doc(hidden)]
+    pub async fn backend_pid(&mut self) -> Result<i32, SessionStoreError> {
+        Ok(sqlx::query_scalar("select pg_backend_pid()")
+            .fetch_one(&mut *self.tx)
+            .await?)
     }
 }
 

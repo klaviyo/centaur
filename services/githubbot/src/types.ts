@@ -254,6 +254,9 @@ export type PrCiFailureReport = {
   observed_updated_at: string;
   head_sha: string;
   current_head_sha: string;
+  /** Lowercased `owner/repo` the PR lives under now, which a rename may have changed. */
+  current_repository: string;
+  current_number: number;
   open: boolean;
   assigned: boolean;
   check_name: string;

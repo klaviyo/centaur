@@ -161,62 +161,17 @@ impl PgSessionStore {
     /// session, another node id, or a node id already bound to a different
     /// PR, is [`SessionStoreError::PrBindingConflict`]: a binding is never
     /// rebound to another session.
+    ///
+    /// This pooled insert is for callers that do not hold the repository's
+    /// PR-create lock (tests and tools). A trusted creation inserts through
+    /// [`PrCreateLock::insert_binding`] instead, inside the transaction that
+    /// holds the lock.
     pub async fn insert_pr_binding(
         &self,
         new: &NewPrBinding,
     ) -> Result<PrBinding, SessionStoreError> {
-        let repository = normalize_pr_repository(&new.repository)?;
-        validate_number(new.number)?;
-        let conflict = |reason: &str| SessionStoreError::PrBindingConflict {
-            repository: repository.clone(),
-            number: new.number,
-            reason: reason.to_owned(),
-        };
-        let inserted = sqlx::query_as::<_, PrBindingRow>(&format!(
-            r#"
-            insert into pr_session_bindings (
-                repository, number, thread_key, pr_id, pr_node_id, author_github_id,
-                author_login, sandbox_id, head_ref, base_ref, head_sha
-            )
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            on conflict (repository, number) do nothing
-            returning {BINDING_COLUMNS}
-            "#
-        ))
-        .bind(&repository)
-        .bind(new.number)
-        .bind(new.thread_key.as_str())
-        .bind(new.pr_id)
-        .bind(&new.pr_node_id)
-        .bind(new.author_github_id)
-        .bind(&new.author_login)
-        .bind(&new.sandbox_id)
-        .bind(&new.head_ref)
-        .bind(&new.base_ref)
-        .bind(&new.head_sha)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|error| match database_error_code(&error).as_deref() {
-            Some("23503") => SessionStoreError::NotFound {
-                thread_key: new.thread_key.as_str().to_owned(),
-            },
-            Some("23505") => conflict("the pull request node id is already bound"),
-            Some("23514") => SessionStoreError::InvalidPrBinding(
-                "binding violates the table constraints".to_owned(),
-            ),
-            _ => error.into(),
-        })?;
-        if let Some(row) = inserted {
-            return row.try_into();
-        }
-        let existing = self
-            .pr_binding(&repository, new.number)
-            .await?
-            .ok_or_else(|| conflict("the binding changed while it was being inserted"))?;
-        if existing.pr_node_id == new.pr_node_id && existing.thread_key == new.thread_key {
-            return Ok(existing);
-        }
-        Err(conflict("the pull request is already bound"))
+        let mut conn = self.pool.acquire().await?;
+        insert_pr_binding_on(&mut conn, new).await
     }
 
     /// The binding for `repository#number`, if any.
@@ -523,6 +478,73 @@ impl PgSessionStore {
             Err(_) => Ok(None),
         }
     }
+}
+
+/// The insert behind [`PgSessionStore::insert_pr_binding`] and
+/// [`PrCreateLock::insert_binding`], on whichever connection or transaction
+/// the caller holds.
+pub(crate) async fn insert_pr_binding_on(
+    conn: &mut sqlx::PgConnection,
+    new: &NewPrBinding,
+) -> Result<PrBinding, SessionStoreError> {
+    let repository = normalize_pr_repository(&new.repository)?;
+    validate_number(new.number)?;
+    let conflict = |reason: &str| SessionStoreError::PrBindingConflict {
+        repository: repository.clone(),
+        number: new.number,
+        reason: reason.to_owned(),
+    };
+    let inserted = sqlx::query_as::<_, PrBindingRow>(&format!(
+        r#"
+        insert into pr_session_bindings (
+            repository, number, thread_key, pr_id, pr_node_id, author_github_id,
+            author_login, sandbox_id, head_ref, base_ref, head_sha
+        )
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        on conflict (repository, number) do nothing
+        returning {BINDING_COLUMNS}
+        "#
+    ))
+    .bind(&repository)
+    .bind(new.number)
+    .bind(new.thread_key.as_str())
+    .bind(new.pr_id)
+    .bind(&new.pr_node_id)
+    .bind(new.author_github_id)
+    .bind(&new.author_login)
+    .bind(&new.sandbox_id)
+    .bind(&new.head_ref)
+    .bind(&new.base_ref)
+    .bind(&new.head_sha)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|error| match database_error_code(&error).as_deref() {
+        Some("23503") => SessionStoreError::NotFound {
+            thread_key: new.thread_key.as_str().to_owned(),
+        },
+        Some("23505") => conflict("the pull request node id is already bound"),
+        Some("23514") => {
+            SessionStoreError::InvalidPrBinding("binding violates the table constraints".to_owned())
+        }
+        _ => error.into(),
+    })?;
+    if let Some(row) = inserted {
+        return row.try_into();
+    }
+    let existing = sqlx::query_as::<_, PrBindingRow>(&format!(
+        "select {BINDING_COLUMNS} from pr_session_bindings where repository = $1 and number = $2"
+    ))
+    .bind(&repository)
+    .bind(new.number)
+    .fetch_optional(&mut *conn)
+    .await?
+    .map(PrBinding::try_from)
+    .transpose()?
+    .ok_or_else(|| conflict("the binding changed while it was being inserted"))?;
+    if existing.pr_node_id == new.pr_node_id && existing.thread_key == new.thread_key {
+        return Ok(existing);
+    }
+    Err(conflict("the pull request is already bound"))
 }
 
 fn database_error_code(error: &sqlx::Error) -> Option<String> {

@@ -1791,6 +1791,8 @@ describe("PR session bindings", () => {
                     headSha: head,
                   }),
                   html_url: PR_URL,
+                  // Mixed case on purpose: the report lowercases it.
+                  base: { repo: { full_name: "Base/Repo" } },
                   node_id: read.nodeId ?? input.nodeId ?? NODE_ID,
                   state: read.state ?? input.prState ?? "open",
                   updated_at:
@@ -1852,6 +1854,13 @@ describe("PR session bindings", () => {
         ]);
         expect(api.notices).toEqual(["posted"]);
         expect(api.sessionCalls).toEqual([]);
+        // The route keeps the stored coordinates, but the report says where the
+        // PR lives now, with the link from the same fresh read.
+        expect(api.posts("/ci-failures")[0]?.body).toMatchObject({
+          current_repository: "base/repo",
+          current_number: 7,
+          html_url: PR_URL,
+        });
       });
 
       test("lifecycle events find it from the payload's node id and write to the stored coordinates", async () => {
@@ -1939,6 +1948,8 @@ describe("PR session bindings", () => {
           observed_updated_at: UPDATED_AT,
           head_sha: "abc123",
           current_head_sha: "abc123",
+          current_repository: "base/repo",
+          current_number: 7,
           open: true,
           assigned: true,
           check_name: "build",

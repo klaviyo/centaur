@@ -25,7 +25,7 @@ use centaur_sandbox_core::SandboxError;
 use centaur_session_core::{ChatDestination, ExecutionStatus, ThreadKey};
 use centaur_session_runtime::SessionRuntimeError;
 use centaur_session_sqlx::{
-    NewPrBinding, PgSessionStore, PrBinding, PrBindingStateUpdate, PrCiNoticeClaim,
+    NewPrBinding, PgSessionStore, PrBinding, PrBindingStateUpdate, PrCiNoticeClaim, PrCreateLock,
     SessionStoreError, execution_requester, normalize_pr_repository,
 };
 use centaur_workflows::{WorkflowRuntimeError, send_slack_request};
@@ -365,10 +365,15 @@ where
         )
     })?;
 
+    // Insert inside the transaction that holds the repository lock, and commit
+    // it (which releases the lock) before answering: a lookup waiting on the
+    // lock then finds the binding. If that transaction has failed, nothing is
+    // bound and the PR stays on the unbound flow.
+    let mut pr_create = pr_create;
     let outcome = match pull_request.rejection(&request.repository, github_user_id) {
         Some(reason) => Err(reason),
         None => bind(
-            runtime.store(),
+            &mut pr_create,
             &thread_key,
             sandbox_id,
             &request.repository,
@@ -377,10 +382,18 @@ where
         .await
         .map(|_| ()),
     };
-    // The binding (if any) is committed: let lookups that missed go on.
-    if let Err(error) = pr_create.release().await {
-        tracing::warn!(%error, "failed to release the PR-create lock");
-    }
+    let outcome = match outcome {
+        Ok(()) => pr_create.commit().await.map_err(|error| {
+            tracing::warn!(%error, "failed to commit the PR binding");
+            "binding_unavailable"
+        }),
+        Err(reason) => {
+            if let Err(error) = pr_create.release().await {
+                tracing::warn!(%error, "failed to release the PR-create lock");
+            }
+            Err(reason)
+        }
+    };
     Ok(match outcome {
         Ok(()) => json!({"pull_request": pull_request.summary(), "bound": true}),
         Err(reason) => {
@@ -400,34 +413,33 @@ where
 
 /// Inserts the binding for a PR GitHub has proven authored by the caller.
 async fn bind(
-    store: &PgSessionStore,
+    lock: &mut PrCreateLock,
     thread_key: &ThreadKey,
     sandbox_id: &str,
     repository: &str,
     pull_request: &GithubPullRequest,
 ) -> Result<PrBinding, &'static str> {
-    store
-        .insert_pr_binding(&NewPrBinding {
-            repository: repository.to_owned(),
-            number: pull_request.number,
-            thread_key: thread_key.clone(),
-            pr_id: pull_request.id,
-            pr_node_id: pull_request.node_id.clone(),
-            author_github_id: pull_request.user.id,
-            author_login: pull_request.user.login.clone(),
-            sandbox_id: sandbox_id.to_owned(),
-            head_ref: pull_request.head.name.clone(),
-            base_ref: pull_request.base.name.clone(),
-            head_sha: pull_request.head.sha.clone(),
-        })
-        .await
-        .map_err(|error| match error {
-            SessionStoreError::PrBindingConflict { .. } => "binding_conflict",
-            other => {
-                tracing::warn!(error = %other, "failed to store PR binding");
-                "binding_unavailable"
-            }
-        })
+    lock.insert_binding(&NewPrBinding {
+        repository: repository.to_owned(),
+        number: pull_request.number,
+        thread_key: thread_key.clone(),
+        pr_id: pull_request.id,
+        pr_node_id: pull_request.node_id.clone(),
+        author_github_id: pull_request.user.id,
+        author_login: pull_request.user.login.clone(),
+        sandbox_id: sandbox_id.to_owned(),
+        head_ref: pull_request.head.name.clone(),
+        base_ref: pull_request.base.name.clone(),
+        head_sha: pull_request.head.sha.clone(),
+    })
+    .await
+    .map_err(|error| match error {
+        SessionStoreError::PrBindingConflict { .. } => "binding_conflict",
+        other => {
+            tracing::warn!(error = %other, "failed to store PR binding");
+            "binding_unavailable"
+        }
+    })
 }
 
 /// An upstream failure carrying only GitHub's own `message`.
@@ -512,14 +524,16 @@ pub(crate) async fn get_pr_binding(
     };
     let mut found = lookup().await.map_err(SessionRuntimeError::from)?;
     if found.is_none() {
-        store
+        // Take the lock (waiting out any creation in flight), read again
+        // while holding it, and only then let go. A creation's binding is
+        // committed before its lock is released, so what this read sees is
+        // final for every creation that had started.
+        let guard = store
             .lock_pr_create(&repository)
-            .await
-            .map_err(SessionRuntimeError::from)?
-            .release()
             .await
             .map_err(SessionRuntimeError::from)?;
         found = lookup().await.map_err(SessionRuntimeError::from)?;
+        guard.release().await.map_err(SessionRuntimeError::from)?;
     }
     found
         .map(Json)
@@ -631,6 +645,16 @@ pub(crate) struct CiFailureRequest {
     #[serde(default)]
     details_url: Option<String>,
     html_url: String,
+    /// The repository and number GitHub reports for this PR now, from
+    /// githubbot's fresh read; they differ from the binding's stored ones
+    /// after a rename or transfer. Both or neither: older githubbot sends
+    /// neither and the stored coordinates are used. They only decide where the
+    /// notice links; the node id and the stored coordinates still govern
+    /// state and dedupe.
+    #[serde(default)]
+    current_repository: Option<String>,
+    #[serde(default)]
+    current_number: Option<i64>,
 }
 
 impl CiFailureRequest {
@@ -652,7 +676,28 @@ impl CiFailureRequest {
         if !is_usable_url(&self.html_url) {
             return invalid("html_url must be an https URL");
         }
+        match (&self.current_repository, self.current_number) {
+            (None, None) => {}
+            (Some(repository), Some(number)) => {
+                if normalize_pr_repository(repository).is_err() || number <= 0 {
+                    return invalid("current_repository and current_number must name a PR");
+                }
+            }
+            _ => return invalid("current_repository and current_number go together"),
+        }
         Ok(())
+    }
+
+    /// The repository (lowercased) and number the notice names and links: the
+    /// PR's current ones when reported, else the binding's stored ones.
+    fn notice_coordinates(&self, binding: &PrBinding) -> (String, i64) {
+        match (&self.current_repository, self.current_number) {
+            (Some(repository), Some(number)) => (
+                normalize_pr_repository(repository).unwrap_or_else(|_| binding.repository.clone()),
+                number,
+            ),
+            _ => (binding.repository.clone(), binding.number),
+        }
     }
 
     /// The failing check's own page, when it has a usable one. An unusable
@@ -833,7 +878,8 @@ where
 /// The `chat.postMessage` payload for the failed-CI notice of a binding, or
 /// `None` when the notice must not be posted: the binding's thread is not a
 /// Slack thread outside a DM, or `html_url` is not the pull request's own URL
-/// (compared without regard to the case of owner and repo).
+/// at its current coordinates (compared without regard to the case of owner and
+/// repo).
 ///
 /// The channel and `thread_ts` come only from the bound thread key; the text
 /// only from the check's own fields, escaped for Slack mrkdwn.
@@ -848,18 +894,14 @@ fn notice_message(binding: &PrBinding, request: &CiFailureRequest) -> Option<Val
     if channel_id.starts_with('D') {
         return None;
     }
-    let pull_request_url = format!(
-        "https://github.com/{}/pull/{}",
-        binding.repository, binding.number
-    );
+    // The PR's current coordinates (after a rename, say), not the stored ones.
+    let (repository, number) = request.notice_coordinates(binding);
+    let pull_request_url = format!("https://github.com/{repository}/pull/{number}");
     if !request.html_url.eq_ignore_ascii_case(&pull_request_url) {
         return None;
     }
     let sha7: String = request.head_sha.chars().take(7).collect();
-    let pull_request = slack_link(
-        Some(&request.html_url),
-        &format!("{}#{}", binding.repository, binding.number),
-    );
+    let pull_request = slack_link(Some(&request.html_url), &format!("{repository}#{number}"));
     let check = slack_link(request.usable_details_url(), &request.check_name);
     Some(json!({
         "channel": channel_id,
@@ -1238,6 +1280,8 @@ mod tests {
                 check_name: "unit tests".to_owned(),
                 details_url: Some("https://github.com/acme/widgets/actions/runs/1".to_owned()),
                 html_url: format!("https://github.com/{}/pull/7", self.repository()),
+                current_repository: None,
+                current_number: None,
             }
         }
 
@@ -1732,6 +1776,251 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["thread_key"], thread_key.as_str());
         assert_eq!(body["number"], 7);
+    }
+
+    #[tokio::test]
+    async fn a_lost_lock_transaction_before_the_insert_leaves_nothing_bound() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let sandbox = h.sandbox_id("lost-lock");
+        let thread_key = h.session("C0TEST", &sandbox).await;
+        h.backend.respond(
+            201,
+            h.github_pull_request(7, AUTHOR_ID, "User", &h.repository()),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", h.token(&sandbox)).parse().unwrap(),
+        );
+        let caller = h.auth.authenticate(&headers).unwrap();
+        let request: CreatePullRequestRequest = serde_json::from_value(h.create_body()).unwrap();
+        let repository = h.repository();
+
+        // The connection holding the repository lock dies after the GitHub
+        // call is about to be made and before the binding is inserted.
+        let body = create_session_pull_request_with(
+            &h.state,
+            &caller,
+            thread_key.as_str().to_owned(),
+            request,
+            || async {
+                let killed: i64 = sqlx::query_scalar(
+                    "select count(*) from (
+                         select pg_terminate_backend(l.pid) from pg_locks l
+                         where l.locktype = 'advisory' and l.granted
+                           and ((l.classid::bigint << 32) | l.objid::bigint)
+                               = hashtextextended('centaur:pr-create:' || $1::text, 0)
+                     ) killed",
+                )
+                .bind(&repository)
+                .fetch_one(h.store.pool())
+                .await
+                .unwrap();
+                assert_eq!(killed, 1, "exactly the lock's connection is killed");
+            },
+        )
+        .await
+        .unwrap();
+
+        // The PR exists on GitHub and is reported, unbound, with a reason.
+        assert_eq!(body["pull_request"]["number"], 7);
+        assert_eq!(body["bound"], false, "{body}");
+        assert_eq!(body["reason"], "binding_unavailable");
+        assert_eq!(h.store.pr_binding(&h.repository(), 7).await.unwrap(), None);
+        assert_eq!(h.backend.calls().len(), 1);
+        // And the lock is gone with the connection.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            h.store.lock_pr_create(&h.repository()),
+        )
+        .await
+        .expect("the dead lock was never released")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_binding_is_committed_with_the_lock_and_never_before() {
+        use std::time::Duration;
+
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        // The binding is inserted inside the lock's transaction: invisible to
+        // other connections until the commit, then visible with the lock free.
+        let thread_key = h.session("C0TEST", &h.sandbox_id("commit")).await;
+        let mut lock = h.store.lock_pr_create(&h.repository()).await.unwrap();
+        lock.insert_binding(&NewPrBinding {
+            repository: h.repository(),
+            number: 7,
+            thread_key: thread_key.clone(),
+            pr_id: 1,
+            pr_node_id: h.node_id(),
+            author_github_id: AUTHOR_ID,
+            author_login: "ada".to_owned(),
+            sandbox_id: "sbx".to_owned(),
+            head_ref: "fix".to_owned(),
+            base_ref: "main".to_owned(),
+            head_sha: "abcdef1".to_owned(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(h.store.pr_binding(&h.repository(), 7).await.unwrap(), None);
+        // A conflicting second insert fails without breaking the transaction.
+        let conflict = lock
+            .insert_binding(&NewPrBinding {
+                repository: h.repository(),
+                number: 7,
+                thread_key: thread_key.clone(),
+                pr_id: 2,
+                pr_node_id: "PR_other".to_owned(),
+                author_github_id: AUTHOR_ID,
+                author_login: "ada".to_owned(),
+                sandbox_id: "sbx".to_owned(),
+                head_ref: "fix".to_owned(),
+                base_ref: "main".to_owned(),
+                head_sha: "abcdef1".to_owned(),
+            })
+            .await;
+        assert!(matches!(
+            conflict,
+            Err(SessionStoreError::PrBindingConflict { .. })
+        ));
+        lock.commit().await.unwrap();
+        let bound = h
+            .store
+            .pr_binding(&h.repository(), 7)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.pr_node_id, h.node_id());
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            h.store.lock_pr_create(&h.repository()),
+        )
+        .await
+        .expect("commit releases the lock")
+        .unwrap();
+
+        // A rolled-back lock binds nothing.
+        let mut lock = h.store.lock_pr_create("acme/rolled-back").await.unwrap();
+        lock.insert_binding(&NewPrBinding {
+            repository: "acme/rolled-back".to_owned(),
+            number: 9,
+            thread_key,
+            pr_id: 3,
+            pr_node_id: format!("PR_rb_{}", h.suffix),
+            author_github_id: AUTHOR_ID,
+            author_login: "ada".to_owned(),
+            sandbox_id: "sbx".to_owned(),
+            head_ref: "fix".to_owned(),
+            base_ref: "main".to_owned(),
+            head_sha: "abcdef1".to_owned(),
+        })
+        .await
+        .unwrap();
+        lock.release().await.unwrap();
+        assert_eq!(
+            h.store.pr_binding("acme/rolled-back", 9).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_notice_after_a_rename_links_the_current_url_and_keeps_the_stored_identity() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let (stored, binding) = bound_pr(&h, true).await;
+        let slack = Slack::default();
+        let new_name = format!("acme/new-name-{}", h.suffix);
+        let request = CiFailureRequest {
+            current_repository: Some(new_name.to_ascii_uppercase()),
+            current_number: Some(7),
+            html_url: format!("https://github.com/{new_name}/pull/7"),
+            ..h.ci("abcdef1", "abcdef1", true, true)
+        };
+
+        // The route is called at the binding's stored coordinates; the report
+        // carries the PR's current ones.
+        let outcome = report(&h, &stored, &request, &slack).await.unwrap();
+
+        assert_eq!(outcome, json!({"notice": "posted"}));
+        let posts = slack.posts();
+        assert_eq!(posts.len(), 1);
+        let text = posts[0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with(&format!(
+                "CI failed on <https://github.com/{new_name}/pull/7|{new_name}#7> at `abcdef1`"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains(&stored), "{text}");
+        // Dedupe and state still follow the node id: a repeat is a duplicate.
+        assert_eq!(
+            report(&h, &stored, &request, &slack).await.unwrap(),
+            json!({"notice": "duplicate"})
+        );
+        assert_eq!(
+            h.store
+                .pr_binding(&stored, 7)
+                .await
+                .unwrap()
+                .unwrap()
+                .repository,
+            binding.repository
+        );
+
+        // A URL for the old name no longer matches the current coordinates.
+        let stale = CiFailureRequest {
+            html_url: format!("https://github.com/{stored}/pull/7"),
+            ..request
+        };
+        assert_eq!(
+            report(&h, &stored, &stale, &slack).await.unwrap(),
+            json!({"notice": "skipped", "reason": "invalid_html_url"})
+        );
+        assert_eq!(slack.posts().len(), 1);
+        set_state(
+            &h,
+            &stored,
+            PrBindingStateUpdate {
+                head_sha: Some("fedcba9".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Without the current coordinates (older githubbot) the stored ones
+        // are used.
+        let legacy = h.ci("fedcba9", "fedcba9", true, true);
+        assert_eq!(
+            report(&h, &stored, &legacy, &slack).await.unwrap(),
+            json!({"notice": "posted"})
+        );
+        assert!(
+            slack.posts()[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("https://github.com/{stored}/pull/7"))
+        );
+
+        // Only one of the pair, or nonsense, is refused.
+        for (repository, number) in [
+            (Some("acme/x".to_owned()), None),
+            (None, Some(7)),
+            (Some("acme".to_owned()), Some(7)),
+            (Some("acme/x".to_owned()), Some(0)),
+        ] {
+            let bad = CiFailureRequest {
+                current_repository: repository,
+                current_number: number,
+                ..h.ci("fedcba9", "fedcba9", true, true)
+            };
+            let error = report(&h, &stored, &bad, &slack).await.unwrap_err();
+            assert!(matches!(error, ApiError::BadRequest(_)), "{error:?}");
+        }
     }
 
     #[tokio::test]
