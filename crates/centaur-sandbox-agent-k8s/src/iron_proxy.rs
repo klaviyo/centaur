@@ -1574,9 +1574,25 @@ impl AgentSandboxBackend {
     }
 }
 
+/// The tail of every PEM private-key header (`PRIVATE KEY`, `RSA PRIVATE KEY`,
+/// `EC PRIVATE KEY`, `ENCRYPTED PRIVATE KEY`).
+const PEM_PRIVATE_KEY_MARKER: &[u8] = b"PRIVATE KEY-----";
+
 /// The certificates in the proxy CA PEM. An entry with none is an error, not an
 /// empty trust set.
 fn parse_proxy_ca(pem: &[u8]) -> SandboxResult<Vec<reqwest::Certificate>> {
+    // The projected entry must hold the certificate alone. One that also holds
+    // a private key was provisioned wrong (the chart refuses the obvious alias
+    // at render time): refuse it rather than use it, and say so without
+    // echoing anything from the file.
+    if pem
+        .windows(PEM_PRIVATE_KEY_MARKER.len())
+        .any(|window| window == PEM_PRIVATE_KEY_MARKER)
+    {
+        return Err(SandboxError::backend(
+            "proxy CA certificate file also holds a private key; project the certificate alone",
+        ));
+    }
     let certificates = reqwest::Certificate::from_pem_bundle(pem)
         .map_err(|err| SandboxError::backend_source("parse proxy CA certificate", err))?;
     if certificates.is_empty() {
@@ -4748,12 +4764,26 @@ AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
             std::process::id()
         ));
         std::fs::write(&empty, "").unwrap();
+        // A certificate entry that also carries a key (a fake one: only the
+        // header matters) is refused, never used.
+        let with_key = std::env::temp_dir().join(format!(
+            "centaur-test-proxy-ca-{}-with-key.pem",
+            std::process::id()
+        ));
+        std::fs::write(
+            &with_key,
+            format!(
+                "{TEST_CA_PEM}\n-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n"
+            ),
+        )
+        .unwrap();
         for (label, file) in [
             (
                 "missing",
                 std::env::temp_dir().join("centaur-no-such-ca.pem"),
             ),
             ("empty", empty),
+            ("with a private key", with_key),
         ] {
             let mut iron_proxy = IronProxyConfig::new("proxy:test", "ca", "ca");
             iron_proxy.ca_cert_file = Some(file);
@@ -4777,6 +4807,8 @@ AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
                 matches!(error, SandboxError::Backend { .. }),
                 "{label}: {error:?}"
             );
+            // Nothing from the file is echoed.
+            assert!(!format!("{error:?}").contains("AAAA"), "{label}: {error:?}");
         }
     }
 

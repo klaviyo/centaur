@@ -529,6 +529,9 @@ spec:
             - name: KUBERNETES_FIREWALL_CA_KEY_SECRET_KEY
               value: {{ .Values.firewall.existingCaKeySecretKey | default "ca-key.pem" | quote }}
 {{- if .Values.apiRs.trustedPrCreateEnabled }}
+{{- if and (eq (include "centaur.trustedCaSecretName" .) (include "centaur.trustedCaKeySecretName" .)) (eq (.Values.firewall.existingCaSecretKey | default "ca-cert.pem") (.Values.firewall.existingCaKeySecretKey | default "ca-key.pem")) }}
+{{- fail "apiRs.trustedPrCreateEnabled needs the proxy CA certificate in its own Secret entry: firewall.existingCaSecretName/existingCaSecretKey name the same entry as existingCaKeySecretName/existingCaKeySecretKey, so projecting it would expose the CA key to api-rs" }}
+{{- end }}
             # The projected certificate file (see volumes); trusted PR creation
             # reads this and never fetches the CA Secret.
             - name: KUBERNETES_FIREWALL_CA_CERT_FILE

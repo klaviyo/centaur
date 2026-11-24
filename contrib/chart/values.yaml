@@ -671,7 +671,10 @@ apiRs:
   # Rolling back to a version from before this feature is not supported.
   # When on, the chart projects only the proxy CA certificate entry into the
   # api-rs container as a file, and api-rs never reads the CA Secret itself.
-  # The certificate Secret must then exist before api-rs starts.
+  # The certificate Secret must then exist before api-rs starts, and its
+  # certificate entry must hold only the certificate: the chart refuses to
+  # render when the certificate and key selectors name the same entry, and
+  # api-rs refuses a projected file that holds a private key.
   trustedPrCreateEnabled: false
   # Controls whether a missing automatically derived session principal may be
   # created. "preapproved" admits only principals already present in the
