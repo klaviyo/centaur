@@ -9,9 +9,8 @@ secretManager:
   existingSecretName: centaur-infra-env
 
 firewall:
-  # Name fields select Kubernetes Secrets (they may be the same Secret, but
-  # apiRs.trustedPrCreateEnabled needs them separate); Key fields select the
-  # PEM entries inside them.
+  # Name fields select Kubernetes Secrets (they may be the same Secret); Key
+  # fields select the PEM entries inside them.
   existingCaSecretName: centaur-firewall-ca
   existingCaSecretKey: ca-cert.pem
   existingCaKeySecretName: centaur-firewall-ca-key
@@ -670,9 +669,9 @@ apiRs:
   # coded miss, and a githubbot whose red-CI path is binding-aware. Roll
   # proxy-sync back only while every api-rs replica has this setting, off.
   # Rolling back to a version from before this feature is not supported.
-  # Trusted creation also needs firewall.existingCaSecretName to differ from
-  # existingCaKeySecretName; with one Secret for both it answers unsupported
-  # rather than read the key.
+  # When on, the chart projects only the proxy CA certificate entry into the
+  # api-rs container as a file, and api-rs never reads the CA Secret itself.
+  # The certificate Secret must then exist before api-rs starts.
   trustedPrCreateEnabled: false
   # Controls whether a missing automatically derived session principal may be
   # created. "preapproved" admits only principals already present in the

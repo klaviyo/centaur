@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use centaur_iron_proxy::{ProxyFragment, SourceKind, SourcePolicy};
@@ -9,7 +10,7 @@ use centaur_sandbox_core::{
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvFromSource,
     EnvVar as K8sEnvVar, HTTPGetAction, KeyToPath, Pod, PodSpec, Probe, ProjectedVolumeSource,
-    ResourceClaim as K8sResourceClaim, ResourceRequirements as K8sResourceRequirements, Secret,
+    ResourceClaim as K8sResourceClaim, ResourceRequirements as K8sResourceRequirements,
     SecretEnvSource, SecretProjection, SecurityContext, Service, ServicePort, ServiceSpec, Volume,
     VolumeMount, VolumeProjection,
 };
@@ -98,6 +99,14 @@ pub struct IronProxyConfig {
     pub ca_cert_secret_name: String,
     /// Entry in `ca_cert_secret_name` holding the PEM CA certificate.
     pub ca_cert_secret_key: String,
+    /// A file holding only the PEM CA certificate, projected into api-rs from
+    /// the certificate entry of `ca_cert_secret_name` alone. The trusted
+    /// pull-request create call trusts exactly this file; api-rs never reads
+    /// the CA Secret through the Kubernetes API, so the CA key can never reach
+    /// it whatever else that Secret holds. `None` leaves that call
+    /// unsupported. Proxy and sandbox pods ignore it and keep using the Secret
+    /// names.
+    pub ca_cert_file: Option<PathBuf>,
     pub ca_key_secret_name: String,
     /// Entry in `ca_key_secret_name` holding the PEM CA private key.
     pub ca_key_secret_key: String,
@@ -142,6 +151,7 @@ impl IronProxyConfig {
             source_policy: SourcePolicy::default(),
             ca_cert_secret_name: ca_cert_secret_name.into(),
             ca_cert_secret_key: CA_CERT_FILE.to_owned(),
+            ca_cert_file: None,
             ca_key_secret_name: ca_key_secret_name.into(),
             ca_key_secret_key: CA_KEY_FILE.to_owned(),
             env_from_secret_names: Vec::new(),
@@ -1447,8 +1457,10 @@ impl AgentSandboxBackend {
     ///
     /// The method, host, path and headers are fixed here; `owner` and `repo`
     /// are validated before anything else happens, so a bad value never
-    /// reaches the network or Kubernetes. Only the public CA certificate is
-    /// read from its Secret, never the CA key.
+    /// reaches the network or Kubernetes. The proxy's CA certificate is read
+    /// from `ca_cert_file`, a file holding only the certificate; the CA Secret
+    /// itself is never fetched, so the CA key cannot reach api-rs whatever that
+    /// Secret holds.
     pub(crate) async fn create_github_pull_request_through_proxy(
         &self,
         id: &SandboxId,
@@ -1464,11 +1476,9 @@ impl AgentSandboxBackend {
                 operation: "create_github_pull_request",
             });
         };
-        // The certificate is read by fetching its whole Secret. If that Secret
-        // also holds the CA key (the chart allows one Secret for both), the
-        // read would bring the key into api-rs, so this deployment can't
-        // create this way: the caller falls back to the ordinary flow.
-        if iron_proxy.ca_cert_secret_name == iron_proxy.ca_key_secret_name {
+        // Without the projected certificate file the call is unsupported,
+        // before any Kubernetes call.
+        if iron_proxy.ca_cert_file.is_none() {
             return Err(SandboxError::Unsupported {
                 backend: crate::BACKEND_NAME,
                 operation: "create_github_pull_request",
@@ -1489,7 +1499,8 @@ impl AgentSandboxBackend {
     /// The Kubernetes steps the create call needs before it can reach the
     /// proxy, bounded together by `deadline`: the NetworkPolicy check (older
     /// sandboxes lack the tunnel rule; add it so their proxy admits this call)
-    /// and the CA certificate read. A stalled Kubernetes API fails the call as
+    /// and the CA certificate file read. A stalled Kubernetes API (or file
+    /// system) fails the call as
     /// [`SandboxError::NotReady`], which api-rs reports as the sandbox proxy
     /// being unavailable, without echoing anything to the caller.
     async fn github_pull_request_preflight(
@@ -1541,25 +1552,25 @@ impl AgentSandboxBackend {
         Ok(())
     }
 
-    /// The proxy CA's public certificate, from the Secret the proxies and
-    /// sandboxes already mount. The key Secret is never read.
+    /// The proxy CA's public certificate, from `ca_cert_file`: a file the
+    /// chart projects from the certificate entry of the CA Secret alone. The
+    /// Secrets API is never called, so the CA key, even in the same Secret,
+    /// never reaches api-rs. A missing or unreadable file is a backend error.
     async fn proxy_ca_certificate(
         &self,
         iron_proxy: &IronProxyConfig,
     ) -> SandboxResult<Vec<reqwest::Certificate>> {
-        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), &self.config.namespace);
-        let secret = secrets
-            .get(&iron_proxy.ca_cert_secret_name)
-            .await
-            .map_err(|err| map_kube_error("get proxy CA certificate secret", err))?;
-        let pem = secret
-            .data
-            .as_ref()
-            .and_then(|data| data.get(&iron_proxy.ca_cert_secret_key))
-            .ok_or_else(|| {
-                SandboxError::backend("proxy CA certificate secret has no certificate entry")
+        let path = iron_proxy
+            .ca_cert_file
+            .as_deref()
+            .ok_or_else(|| SandboxError::Unsupported {
+                backend: crate::BACKEND_NAME,
+                operation: "create_github_pull_request",
             })?;
-        parse_proxy_ca(&pem.0)
+        let pem = tokio::fs::read(path)
+            .await
+            .map_err(|err| SandboxError::backend_source("read proxy CA certificate file", err))?;
+        parse_proxy_ca(&pem)
     }
 }
 
@@ -1570,7 +1581,7 @@ fn parse_proxy_ca(pem: &[u8]) -> SandboxResult<Vec<reqwest::Certificate>> {
         .map_err(|err| SandboxError::backend_source("parse proxy CA certificate", err))?;
     if certificates.is_empty() {
         return Err(SandboxError::backend(
-            "proxy CA certificate secret entry holds no certificate",
+            "proxy CA certificate file holds no certificate",
         ));
     }
     Ok(certificates)
@@ -4575,7 +4586,7 @@ AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
                 .await
                 .unwrap_err();
             // InvalidSpec, not a Kubernetes or network error: validation ran
-            // first, ahead of the CA Secret read and the proxy connection.
+            // first, ahead of the CA file read and the proxy connection.
             assert!(
                 matches!(error, SandboxError::InvalidSpec(_)),
                 "{owner:?}/{repo:?}: {error}"
@@ -4640,8 +4651,19 @@ AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
         assert!(GITHUB_PULL_REQUEST_PREFLIGHT_TIMEOUT < GITHUB_PULL_REQUEST_TIMEOUT);
     }
 
+    /// A file holding the test CA certificate, as the chart's projection of the
+    /// certificate entry would, for `label`'s test.
+    fn ca_file(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "centaur-test-proxy-ca-{}-{label}.pem",
+            std::process::id()
+        ));
+        std::fs::write(&path, TEST_CA_PEM).unwrap();
+        path
+    }
+
     #[tokio::test]
-    async fn a_ca_secret_that_also_holds_the_key_is_never_read() {
+    async fn a_create_without_a_projected_ca_file_is_unsupported_before_any_kubernetes_call() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -4657,30 +4679,105 @@ AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
                 streams.push(stream);
             }
         });
-        // The chart allows the certificate and the key in one Secret.
-        let iron_proxy = IronProxyConfig::new("proxy:test", "ca", "ca");
-        let backend = backend_at(&url, Some(iron_proxy));
+        // Whatever the Secret layout (certificate and key in one Secret
+        // included), with no projected file there is nothing to read.
+        for iron_proxy in [
+            IronProxyConfig::new("proxy:test", "ca", "ca"),
+            IronProxyConfig::new("proxy:test", "ca-cert", "ca-key"),
+        ] {
+            assert_eq!(iron_proxy.ca_cert_file, None);
+            let backend = backend_at(&url, Some(iron_proxy));
+            let error = backend
+                .create_github_pull_request_through_proxy(
+                    &SandboxId::new("asbx-test"),
+                    "acme",
+                    "widgets",
+                    &PrOauthPlaceholder::unattested(),
+                    &json!({"head": "feature", "base": "main", "title": "t"}),
+                )
+                .await
+                .unwrap_err();
 
-        let error = backend
-            .create_github_pull_request_through_proxy(
-                &SandboxId::new("asbx-test"),
-                "acme",
-                "widgets",
-                &PrOauthPlaceholder::unattested(),
-                &json!({"head": "feature", "base": "main", "title": "t"}),
-            )
-            .await
-            .unwrap_err();
-
-        // Refused as unsupported (api-rs answers `pull_requests_unsupported`,
-        // and the SDK falls back), before any Kubernetes call at all.
-        assert!(
-            matches!(error, SandboxError::Unsupported { .. }),
-            "{error:?}"
-        );
+            // Unsupported (api-rs answers `pull_requests_unsupported`, and the
+            // SDK falls back), before any Kubernetes call at all.
+            assert!(
+                matches!(error, SandboxError::Unsupported { .. }),
+                "{error:?}"
+            );
+        }
         tokio::task::yield_now().await;
         assert_eq!(connections.load(Ordering::SeqCst), 0);
         held.abort();
+    }
+
+    #[tokio::test]
+    async fn the_preflight_reads_the_ca_file_and_never_the_secrets_api() {
+        let mut iron_proxy = IronProxyConfig::new("proxy:test", "ca", "ca");
+        iron_proxy.ca_cert_file = Some(ca_file("preflight"));
+        let id = SandboxId::new("asbx-new");
+        let current =
+            build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, &[], None).remove(1);
+        let (url, received) = spawn_policy_api(iron_proxy_policy_name(&id), current).await;
+        let backend = backend_at(&url, Some(iron_proxy.clone()));
+
+        let ca = backend
+            .github_pull_request_preflight(&id, &iron_proxy, GITHUB_PULL_REQUEST_PREFLIGHT_TIMEOUT)
+            .await
+            .unwrap();
+
+        assert_eq!(ca.len(), 1);
+        // Only the NetworkPolicy was asked of the API server: the CA Secret
+        // (which may also hold the key) was never requested.
+        let requests = received.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0].method, "GET");
+        assert!(requests[0].path.contains("networkpolicies"));
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.path.contains("/secrets")),
+            "{requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_empty_ca_file_is_a_backend_error() {
+        let id = SandboxId::new("asbx-new");
+        let empty = std::env::temp_dir().join(format!(
+            "centaur-test-proxy-ca-{}-empty.pem",
+            std::process::id()
+        ));
+        std::fs::write(&empty, "").unwrap();
+        for (label, file) in [
+            (
+                "missing",
+                std::env::temp_dir().join("centaur-no-such-ca.pem"),
+            ),
+            ("empty", empty),
+        ] {
+            let mut iron_proxy = IronProxyConfig::new("proxy:test", "ca", "ca");
+            iron_proxy.ca_cert_file = Some(file);
+            let current =
+                build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, &[], None)
+                    .remove(1);
+            let (url, _) = spawn_policy_api(iron_proxy_policy_name(&id), current).await;
+            let backend = backend_at(&url, Some(iron_proxy.clone()));
+
+            let error = backend
+                .github_pull_request_preflight(
+                    &id,
+                    &iron_proxy,
+                    GITHUB_PULL_REQUEST_PREFLIGHT_TIMEOUT,
+                )
+                .await
+                .unwrap_err();
+
+            // A backend error maps to `sandbox_proxy_unavailable`.
+            assert!(
+                matches!(error, SandboxError::Backend { .. }),
+                "{label}: {error:?}"
+            );
+        }
     }
 
     /// One request a stub API server received.
@@ -4909,7 +5006,8 @@ AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
 
     #[tokio::test]
     async fn a_failed_reconcile_stops_the_create_before_the_ca_or_github_are_touched() {
-        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        let mut iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        iron_proxy.ca_cert_file = Some(ca_file("reconcile"));
         // The API server knows no policy for this sandbox.
         let (url, received) =
             spawn_policy_api("some-other-policy".to_owned(), NetworkPolicy::default()).await;

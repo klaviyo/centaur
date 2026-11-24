@@ -528,6 +528,12 @@ spec:
               value: {{ .Values.firewall.existingCaSecretKey | default "ca-cert.pem" | quote }}
             - name: KUBERNETES_FIREWALL_CA_KEY_SECRET_KEY
               value: {{ .Values.firewall.existingCaKeySecretKey | default "ca-key.pem" | quote }}
+{{- if .Values.apiRs.trustedPrCreateEnabled }}
+            # The projected certificate file (see volumes); trusted PR creation
+            # reads this and never fetches the CA Secret.
+            - name: KUBERNETES_FIREWALL_CA_CERT_FILE
+              value: /etc/centaur/proxy-ca/ca-cert.pem
+{{- end }}
             - name: KUBERNETES_SECRET_ENV_NAME
               value: {{ include "centaur.secretEnvName" . | quote }}
 {{- if .Values.secrets.bootstrapSecretName }}
@@ -749,14 +755,20 @@ copies in source order (later roots shadow earlier ones). */}}
 {{ toYaml .Values.containerSecurityContext | nindent 12 }}
           resources:
 {{ toYaml .Values.apiRs.resources | nindent 12 }}
-{{- if $useOverlayRepoCache }}
+{{- if or $useOverlayRepoCache .Values.apiRs.trustedPrCreateEnabled }}
           volumeMounts:
+{{- if $useOverlayRepoCache }}
             - name: repo-cache
               mountPath: {{ .Values.repoCache.hostPath | quote }}
               readOnly: true
 {{- end }}
-{{- if $useOverlayRepoCache }}
+{{- if .Values.apiRs.trustedPrCreateEnabled }}
+            - name: proxy-ca-cert
+              mountPath: /etc/centaur/proxy-ca
+              readOnly: true
+{{- end }}
       volumes:
+{{- if $useOverlayRepoCache }}
         - name: repo-cache
 {{- if $repoCacheUsePvc }}
           persistentVolumeClaim:
@@ -766,6 +778,19 @@ copies in source order (later roots shadow earlier ones). */}}
           hostPath:
             path: {{ .Values.repoCache.hostPath | quote }}
             type: DirectoryOrCreate
+{{- end }}
+{{- end }}
+{{- if .Values.apiRs.trustedPrCreateEnabled }}
+        # Only the proxy CA certificate entry, never the CA key even if the
+        # same Secret holds it. Mounted only when trusted creation is on, so
+        # api-rs doesn't otherwise depend on this Secret at startup.
+        - name: proxy-ca-cert
+          secret:
+            secretName: {{ include "centaur.trustedCaSecretName" . | quote }}
+            defaultMode: 0444
+            items:
+              - key: {{ .Values.firewall.existingCaSecretKey | default "ca-cert.pem" | quote }}
+                path: ca-cert.pem
 {{- end }}
 {{- end }}
 ---

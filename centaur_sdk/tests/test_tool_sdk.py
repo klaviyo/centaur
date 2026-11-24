@@ -781,6 +781,15 @@ def test_create_pull_request_cli_reports_http_errors(
         (b'{"ok":false,"error":"not found"}', True),
         # A coded 404 is reported as itself, not as a fallback.
         (b'{"ok":false,"error":"x","code":"pr_binding_not_found"}', False),
+        # `"code": null` is no code, whatever the text contains.
+        (b'{"ok":false,"error":"x","code":null}', True),
+        (b'{"error":{"code":null}}', True),
+        (b'{"code":42}', True),
+        # A coded 404 whose code sits past the displayed 500 characters.
+        (
+            b'{"error":"' + b"x" * 600 + b'","code":"pr_binding_not_found"}',
+            False,
+        ),
     ],
 )
 def test_create_pull_request_cli_falls_back_on_a_bare_404(
@@ -810,3 +819,43 @@ def test_create_pull_request_cli_falls_back_on_a_bare_404(
     assert exit_code == 1
     assert "HTTP 404" in captured.err
     assert ("open the pull request as you normally would" in captured.err) is fallback
+
+
+def test_create_pull_request_cli_classifies_on_the_whole_body(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    import io
+    import urllib.error
+
+    from centaur_sdk import pull_requests
+
+    def run(status: int, body: bytes) -> str:
+        def refuse(request, timeout):
+            raise urllib.error.HTTPError(request.full_url, status, "Error", {}, io.BytesIO(body))
+
+        monkeypatch.setattr("urllib.request.urlopen", refuse)
+        monkeypatch.setenv("CENTAUR_THREAD_KEY", "slack:T1:C123:123.456")
+        monkeypatch.setattr(
+            registry, "_backend", MappingBackend({"CENTAUR_API_URL": "http://api:8000"})
+        )
+        exit_code = pull_requests.main(
+            ["create", "acme/widgets", "--head", "feature", "--base", "main", "--title", "T"]
+        )
+        assert exit_code == 1
+        return capsys.readouterr().err
+
+    filler = b'"detail":"' + b"x" * 600 + b'",'
+    # A fallback code past the displayed 500 characters still gets the hint, and
+    # the displayed text is truncated.
+    late_fallback = run(403, b"{" + filler + b'"code":"slack_session_required"}')
+    assert "open the pull request as you normally would" in late_fallback
+    assert "slack_session_required" not in late_fallback
+    # So does a retry code.
+    late_retry = run(409, b"{" + filler + b'"code":"no_active_execution"}')
+    assert "turn is still starting" in late_retry
+    # A code that merely appears inside another field's text is not the code.
+    mentioned = run(500, b'{"error":"saw sandbox_mismatch and no_active_execution"}')
+    assert "open the pull request as you normally would" not in mentioned
+    assert "retry in a few seconds" not in mentioned
+    # Not JSON at all, on a non-404, gets no hint either.
+    assert "open the pull request as you normally would" not in run(502, b"sandbox_mismatch")

@@ -34,12 +34,31 @@ _FALLBACK_HINT = (
 )
 
 
-def _is_bare_not_found(status: int, detail: str) -> bool:
+def _error_code(body: str) -> str | None:
+    """The error code in an API error body, parsed from the whole body.
+
+    api-rs puts ``code`` at the top level; ``error.code`` is accepted too. Anything
+    else (non-JSON, no code, a non-string or empty code) is ``None``.
+    """
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    error = data.get("error")
+    for code in (data.get("code"), error.get("code") if isinstance(error, dict) else None):
+        if isinstance(code, str) and code.strip():
+            return code
+    return None
+
+
+def _is_bare_not_found(status: int, code: str | None) -> bool:
     """A 404 with no error code: an api-rs from before this route, say.
 
     The session can't open a bound PR there, so the ordinary flow applies.
     """
-    return status == 404 and '"code"' not in detail
+    return status == 404 and code is None
 
 
 # Not fallbacks: the session is catching up, so the same call will work shortly.
@@ -77,14 +96,14 @@ def main(argv: list[str] | None = None) -> int:
             draft=args.draft,
         )
     except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", "replace")[:_ERROR_BODY_LIMIT]
-        sys.stderr.write(f"create failed: HTTP {error.code} {detail}\n")
-        retry_hint = next((hint for code, hint in _RETRY_HINTS.items() if code in detail), None)
+        # Classify on the whole body; only what is shown is truncated.
+        body = error.read().decode("utf-8", "replace")
+        code = _error_code(body)
+        sys.stderr.write(f"create failed: HTTP {error.code} {body[:_ERROR_BODY_LIMIT]}\n")
+        retry_hint = _RETRY_HINTS.get(code) if code else None
         if retry_hint:
             sys.stderr.write(f"{retry_hint}\n")
-        elif _is_bare_not_found(error.code, detail) or any(
-            code in detail for code in _FALLBACK_CODES
-        ):
+        elif _is_bare_not_found(error.code, code) or code in _FALLBACK_CODES:
             sys.stderr.write(f"{_FALLBACK_HINT}\n")
         return 1
     except (OSError, RuntimeError, ValueError) as error:

@@ -780,9 +780,9 @@ pub(crate) struct ServerArgs {
     /// proxy-sync back only while every api-rs replica has this setting, off.
     /// Rolling back to a version from before this feature is not supported.
     ///
-    /// It also needs the proxy CA certificate in a Secret of its own: with the
-    /// certificate and key in one Secret, creation answers unsupported rather
-    /// than read the key.
+    /// It reads only the proxy CA certificate file the chart projects into
+    /// api-rs (`KUBERNETES_FIREWALL_CA_CERT_FILE`); the CA Secret itself is
+    /// never fetched. Without that file creation answers unsupported.
     #[arg(long, env = "TRUSTED_PR_CREATE_ENABLED", default_value_t = false)]
     pub(crate) trusted_pr_create_enabled: bool,
     /// Keyword search backend that migrations install: `paradedb` (requires
@@ -2263,6 +2263,7 @@ impl IronProxyArgs {
             IronProxyConfig::new(self.image.clone(), ca_cert_secret_name, ca_key_secret_name);
         config.ca_cert_secret_key = self.ca.cert_secret_key.clone();
         config.ca_key_secret_key = self.ca.key_secret_key.clone();
+        config.ca_cert_file = self.ca.cert_file.clone();
         config.image_pull_policy = self.image_pull_policy.clone();
         config.resources = resource_requirements(
             self.resources_json.as_deref(),
@@ -2419,6 +2420,15 @@ struct IronProxyCaArgs {
         default_value = "ca-cert.pem"
     )]
     cert_secret_key: String,
+    /// A file holding only the proxy CA certificate, projected from the
+    /// certificate entry of the CA Secret. The trusted pull-request create
+    /// call trusts exactly this file and api-rs never reads the CA Secret
+    /// through the Kubernetes API. Unset leaves that call unsupported.
+    #[arg(
+        long = "kubernetes-firewall-ca-cert-file",
+        env = "KUBERNETES_FIREWALL_CA_CERT_FILE"
+    )]
+    cert_file: Option<PathBuf>,
     #[arg(
         long = "kubernetes-firewall-ca-key-secret-name",
         env = "KUBERNETES_FIREWALL_CA_KEY_SECRET_NAME"
@@ -4069,6 +4079,52 @@ mod tests {
                 "centaur-infra-env".to_owned(),
                 "centaur-secret-env".to_owned()
             ]
+        );
+    }
+
+    #[test]
+    fn the_proxy_ca_certificate_file_is_optional_and_reaches_the_iron_proxy_config() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "centaur-api-server",
+                "--database-url",
+                "postgres://postgres:postgres@localhost/centaur",
+                "--kubernetes-firewall-ca-secret-name",
+                "centaur-firewall-ca",
+                "--kubernetes-firewall-ca-key-secret-name",
+                "centaur-firewall-ca-key",
+            ];
+            argv.extend_from_slice(extra);
+            Args::try_parse_from(argv)
+                .unwrap()
+                .sandbox
+                .iron_proxy
+                .to_config()
+                .unwrap()
+        };
+        // SAFETY: ENV_LOCK is held, so no other test touches the env.
+        unsafe { env::remove_var("KUBERNETES_FIREWALL_CA_CERT_FILE") };
+        assert_eq!(parse(&[]).ca_cert_file, None);
+        {
+            let _env = EnvGuard::set(&[(
+                "KUBERNETES_FIREWALL_CA_CERT_FILE",
+                "/etc/centaur/proxy-ca/ca-cert.pem",
+            )]);
+            let config = parse(&[]);
+            assert_eq!(
+                config.ca_cert_file,
+                Some(PathBuf::from("/etc/centaur/proxy-ca/ca-cert.pem"))
+            );
+            // The proxy and sandbox pods keep using the Secret names.
+            assert_eq!(config.ca_cert_secret_name, "centaur-firewall-ca");
+            assert_eq!(config.ca_key_secret_name, "centaur-firewall-ca-key");
+        }
+        assert_eq!(
+            parse(&["--kubernetes-firewall-ca-cert-file", "/tmp/ca.pem"]).ca_cert_file,
+            Some(PathBuf::from("/tmp/ca.pem"))
         );
     }
 
