@@ -25,22 +25,32 @@ WITH candidate_grants AS (
       AND g.principal_id = $2
       AND g.role_id IS NULL
 ),
--- An owner-only app's token serves only its owner, through the owner's own
--- direct grant, whichever principal the turn runs as. The owner is the
--- requester (or the principal itself when there is none): a Console-user
--- principal of the connecting user, or a Slack principal whose user id and
--- team match the connecting user's single verified Slack identity. Keep in
--- step with PrincipalCredentialReconciliation#connection_owner? and
--- UserIdentity.unambiguous_slack_identity in Console.
-effective_grants AS (
-    SELECT g.* FROM candidate_grants g
-    LEFT JOIN static_secrets ss ON ss.id = g.static_secret_id
-    LEFT JOIN broker_credentials bc ON bc.id = ss.broker_credential_id
-    LEFT JOIN oauth_apps oa ON oa.id = bc.oauth_app_id
-    LEFT JOIN principals actor ON actor.id = COALESCE($2, $1)
-    WHERE oa.owner_only IS NOT TRUE OR (
-        NOT oa.shared AND g.role_id IS NULL AND g.principal_id = actor.id AND (
-            (actor.kind = 'console_user' AND actor.console_user_id = bc.created_by_id) OR
+-- The broker credentials among the candidate grants that the acting human
+-- connected. The actor is the requester (or the principal itself when there
+-- is none). A credential is the actor's when its connecting user is the actor:
+-- a Console-user principal of that user, or a Slack principal whose user id and
+-- team match the user's single verified Slack identity. Keep in step with
+-- PrincipalCredentialReconciliation#connection_owner? and
+-- UserIdentity.unambiguous_slack_identity in Console. Owner-only apps deliver
+-- only these (see effective_grants); every source also reports membership as
+-- `broker_owned_by_actor`.
+actor_owned_credentials AS (
+    SELECT bc.id
+    FROM broker_credentials bc
+    JOIN principals actor ON actor.id = COALESCE($2, $1)
+    WHERE bc.id IN (
+        SELECT ss.broker_credential_id
+        FROM candidate_grants g
+        JOIN static_secrets ss ON ss.id = g.static_secret_id
+        WHERE ss.broker_credential_id IS NOT NULL
+        UNION
+        SELECT src.broker_credential_id
+        FROM candidate_grants g
+        JOIN secret_sources src ON src.static_secret_id = g.static_secret_id
+        WHERE src.broker_credential_id IS NOT NULL
+    )
+    AND (
+        (actor.kind = 'console_user' AND actor.console_user_id = bc.created_by_id) OR
             (actor.kind IS DISTINCT FROM 'console_user' AND EXISTS (
                 SELECT 1 FROM user_identities ui
                 WHERE ui.user_id = bc.created_by_id AND ui.provider = 'slack'
@@ -59,7 +69,20 @@ effective_grants AS (
                         AND (other.subject, other.team_id) IS DISTINCT FROM (ui.subject, ui.team_id)
                   )
             ))
-        )
+    )
+),
+-- An owner-only app's token serves only its owner, through the owner's own
+-- direct grant, whichever principal the turn runs as (see
+-- actor_owned_credentials).
+effective_grants AS (
+    SELECT g.* FROM candidate_grants g
+    LEFT JOIN static_secrets ss ON ss.id = g.static_secret_id
+    LEFT JOIN broker_credentials bc ON bc.id = ss.broker_credential_id
+    LEFT JOIN oauth_apps oa ON oa.id = bc.oauth_app_id
+    LEFT JOIN principals actor ON actor.id = COALESCE($2, $1)
+    WHERE oa.owner_only IS NOT TRUE OR (
+        NOT oa.shared AND g.role_id IS NULL AND g.principal_id = actor.id
+        AND bc.id IN (SELECT id FROM actor_owned_credentials)
     )
 ),
 credential_refs AS (
@@ -132,7 +155,19 @@ sources AS (
         sr.kind,
         sr.credential_id,
         jsonb_agg(
-            sr.source || jsonb_strip_nulls(jsonb_build_object('broker_access_token',
+            sr.source || jsonb_strip_nulls(jsonb_build_object(
+                -- Which provider account a brokered token belongs to, so the
+                -- control plane can name the human behind a delivered token.
+                'broker_provider', oa.provider,
+                'broker_provider_subject', bc.provider_subject,
+                -- Whether Console delivers the app's tokens only through their
+                -- owner's own grant (see effective_grants above), whether the
+                -- app is shared, and whether the acting human connected this
+                -- credential (see actor_owned_credentials above).
+                'broker_owner_only', oa.owner_only,
+                'broker_shared', oa.shared,
+                'broker_owned_by_actor', bc.id IN (SELECT id FROM actor_owned_credentials),
+                'broker_access_token',
                 -- An owner-only token is delivered only while live, from an
                 -- enabled app and an active owner, through its own wrapper.
                 CASE WHEN oa.owner_only IS NOT TRUE THEN bc.access_token

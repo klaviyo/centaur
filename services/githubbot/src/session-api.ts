@@ -14,6 +14,10 @@ import type {
   GithubbotOptions,
   GithubbotRendererSource,
   GithubbotSessionMessage,
+  PrBinding,
+  PrBindingStateUpdate,
+  PrCiFailureReport,
+  PrCiFailureResult,
 } from "./types";
 import {
   elapsedMs,
@@ -662,6 +666,168 @@ function workflowEventRetryDelayMs(attempt: number): number {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---------------------------------------------------------------------------
+// PR session bindings (api-rs `/api/pr-bindings/*`, githubbot's PrBindingsManage
+// capability): thin typed calls over the same headers and error handling as
+// the session routes.
+// ---------------------------------------------------------------------------
+
+export type PrBindingRef = { repository: string; number: number };
+
+/**
+ * The binding for a PR. Only a 404 that api-rs itself labels
+ * `{"code": "pr_binding_not_found"}` means unbound (null). Any other status,
+ * any other 404 (a generic one, as an older api-rs replica without this route
+ * answers during a rolling deploy), or a malformed body throws a non-retryable
+ * error, so callers cannot mistake an unknown binding for an unbound PR.
+ */
+export async function getPrBinding(
+  options: GithubbotOptions,
+  ref: PrBindingRef,
+  // The PR's immutable node id: lets api-rs find a binding whose repository was
+  // since renamed or transferred.
+  nodeId?: string,
+  // Make a miss wait for any trusted PR create still in flight, so it can be
+  // believed. Costs api-rs a lock, so only where a miss decides something.
+  authoritative = false,
+): Promise<PrBinding | null> {
+  const fetchFn = options.fetch ?? fetch;
+  const url = new URL(prBindingUrl(options.apiUrl, ref));
+  if (nodeId) url.searchParams.set("node_id", nodeId);
+  if (authoritative) url.searchParams.set("authoritative", "true");
+  const response = await fetchFn(url.toString(), {
+    method: "GET",
+    headers: apiHeaders(options, false),
+  });
+  if (response.status === 404) {
+    // Read the body once: it says whether this is a real miss.
+    let body = "";
+    try {
+      body = await response.text();
+    } catch {
+      body = "";
+    }
+    if (isBindingNotFound(body)) return null;
+    logApiErrorBody(options, "get pr binding", response, body);
+    throw new SessionApiError({
+      action: "get pr binding",
+      body,
+      retryable: false,
+      status: response.status,
+      statusText: response.statusText,
+    });
+  }
+  await ensureApiOk(response, "get pr binding", options);
+  return parsePrBinding(await response.json());
+}
+
+function isBindingNotFound(body: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    return isJsonObject(parsed) && parsed.code === "pr_binding_not_found";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Record lifecycle state. api-rs applies a write only if it is not older than
+ * the last one; an unapplied write (`applied: false`) is not an error.
+ */
+export async function updatePrBindingState(
+  options: GithubbotOptions,
+  ref: PrBindingRef,
+  update: PrBindingStateUpdate,
+): Promise<{ applied: boolean; binding: PrBinding }> {
+  const payload = await postPrBinding(options, ref, "state", update, "update pr binding state");
+  // Accept the binding flat with `applied` beside it, or `{binding, applied}`.
+  const binding =
+    isJsonObject(payload) && isJsonObject(payload.binding) ? payload.binding : payload;
+  return {
+    applied: !isJsonObject(payload) || payload.applied !== false,
+    binding: parsePrBinding(binding),
+  };
+}
+
+/**
+ * Report a failed check. api-rs revalidates and posts the Slack notice inside
+ * this request, at most once per head; a failed post is an HTTP 502 and throws.
+ */
+export async function reportPrCiFailure(
+  options: GithubbotOptions,
+  ref: PrBindingRef,
+  report: PrCiFailureReport,
+): Promise<PrCiFailureResult> {
+  const payload = await postPrBinding(
+    options,
+    ref,
+    "ci-failures",
+    report,
+    "report pr ci failure",
+  );
+  const notice = isJsonObject(payload) ? payload.notice : undefined;
+  if (notice === "posted" || notice === "duplicate") return { notice };
+  if (notice === "skipped") {
+    return {
+      notice,
+      reason: stringValue((payload as JsonObject).reason) ?? "unknown",
+    };
+  }
+  throw new Error("report pr ci failure returned an unexpected body");
+}
+
+async function postPrBinding(
+  options: GithubbotOptions,
+  ref: PrBindingRef,
+  suffix: string,
+  body: unknown,
+  action: string,
+): Promise<unknown> {
+  const fetchFn = options.fetch ?? fetch;
+  const response = await fetchFn(prBindingUrl(options.apiUrl, ref, suffix), {
+    method: "POST",
+    headers: apiHeaders(options),
+    body: JSON.stringify(body),
+  });
+  await ensureApiOk(response, action, options);
+  return response.json();
+}
+
+function parsePrBinding(payload: unknown): PrBinding {
+  const nonEmpty = (value: unknown) => typeof value === "string" && value.length > 0;
+  if (
+    !isJsonObject(payload) ||
+    typeof payload.repository !== "string" ||
+    !/^[^/\s]+\/[^/\s]+$/.test(payload.repository) ||
+    typeof payload.number !== "number" ||
+    !Number.isInteger(payload.number) ||
+    payload.number <= 0 ||
+    !nonEmpty(payload.head_sha) ||
+    !nonEmpty(payload.thread_key) ||
+    !nonEmpty(payload.pr_node_id) ||
+    typeof payload.revision !== "number" ||
+    !Number.isInteger(payload.revision) ||
+    payload.revision < 0 ||
+    typeof payload.managed !== "boolean" ||
+    typeof payload.closed !== "boolean"
+  ) {
+    throw new Error("pr binding response has an unexpected shape");
+  }
+  return payload as unknown as PrBinding;
+}
+
+function prBindingUrl(
+  apiUrl: string,
+  ref: PrBindingRef,
+  suffix?: string,
+): string {
+  const [owner = "", repo = ""] = ref.repository.toLowerCase().split("/", 2);
+  const path =
+    `/api/pr-bindings/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${ref.number}` +
+    (suffix ? `/${suffix}` : "");
+  return new URL(path, ensureTrailingSlash(apiUrl)).toString();
 }
 
 function apiSessionUrl(

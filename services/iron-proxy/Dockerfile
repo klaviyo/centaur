@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
+# Pin: the PR-create guard's `//repos/*/*/pulls` marker (PR_CREATE_GUARD_PATH) relies on this version; rerun the C10 d1-oauth-placeholder-proof on any bump.
 FROM ironsh/iron-proxy:0.56.0@sha256:727da0cc35a6d73ed2913a38d56c4b9b4476c075149492e4fbf75552e83361ff
 
 USER root

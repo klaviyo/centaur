@@ -4,6 +4,7 @@ mod auth;
 pub mod client;
 mod error;
 mod mcp;
+mod pr_bindings;
 mod routes;
 mod slack_external_teams;
 mod slack_proxy;

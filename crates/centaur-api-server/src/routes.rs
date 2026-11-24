@@ -53,6 +53,9 @@ use crate::{
     api_jwt::{bearer_jwt_from_headers, decode_jwt_payload, verify_console_jwt},
     auth::{ApiAuthConfig, AuthenticatedCaller, CallerClass, Capability, LINEARBOT_IDENTITY},
     mcp::{mcp_get, mcp_post, mcp_protected_resource_metadata},
+    pr_bindings::{
+        create_session_pull_request, get_pr_binding, report_pr_ci_failure, update_pr_binding_state,
+    },
     slack_external_teams::{get_slack_external_team_ids, replace_slack_external_team_ids},
     slack_proxy::slack_proxy_router,
     types::{
@@ -72,6 +75,9 @@ pub struct AppState {
     auth: ApiAuthConfig,
     /// Console's database, read for API client authentication.
     console_db: Option<PgPool>,
+    /// Whether `POST /api/session/{thread_key}/pull-requests` is enabled.
+    /// Off by default (see `--trusted-pr-create-enabled`).
+    trusted_pr_create: bool,
 }
 
 #[derive(Clone)]
@@ -88,7 +94,18 @@ impl AppState {
             metrics: prometheus_handle().expect("failed to initialize Prometheus metrics recorder"),
             auth,
             console_db: None,
+            trusted_pr_create: false,
         }
+    }
+
+    /// Turns trusted pull-request creation on or off. Off by default.
+    pub fn with_trusted_pr_create(mut self, enabled: bool) -> Self {
+        self.trusted_pr_create = enabled;
+        self
+    }
+
+    pub(crate) fn trusted_pr_create_enabled(&self) -> bool {
+        self.trusted_pr_create
     }
 
     /// Enables API clients, which Console stores in its database.
@@ -254,6 +271,22 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .route(
             "/api/session/{thread_key}/sandbox",
             delete(release_session_sandbox),
+        )
+        .route(
+            "/api/session/{thread_key}/pull-requests",
+            post(create_session_pull_request),
+        )
+        .route(
+            "/api/pr-bindings/{owner}/{repo}/{number}",
+            get(get_pr_binding),
+        )
+        .route(
+            "/api/pr-bindings/{owner}/{repo}/{number}/state",
+            post(update_pr_binding_state),
+        )
+        .route(
+            "/api/pr-bindings/{owner}/{repo}/{number}/ci-failures",
+            post(report_pr_ci_failure),
         )
         .route("/api/sandboxes/drain", post(drain_sandboxes))
         .route(
@@ -570,6 +603,16 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
         | (&Method::POST, "/api/session/{thread_key}/execute")
         | (&Method::POST, "/api/session/{thread_key}/interrupt") => {
             capability(Capability::SessionsWrite)
+        }
+        // The sandbox's own proxy identity creates and binds its session's PR.
+        (&Method::POST, "/api/session/{thread_key}/pull-requests") => {
+            Some(RouteAccess::PrincipalOnly)
+        }
+        // githubbot's alone: no other caller class holds this capability.
+        (&Method::GET, "/api/pr-bindings/{owner}/{repo}/{number}")
+        | (&Method::POST, "/api/pr-bindings/{owner}/{repo}/{number}/state")
+        | (&Method::POST, "/api/pr-bindings/{owner}/{repo}/{number}/ci-failures") => {
+            capability(Capability::PrBindingsManage)
         }
         (&Method::DELETE, "/api/session/{thread_key}/sandbox") => {
             Some(RouteAccess::ApiClientOrOperatorSessionWrite)
@@ -892,7 +935,8 @@ async fn admit_api_client_execution(
 /// the runtime can safely honor Console requesters on any thread namespace.
 /// Likewise `linear_user_id` (and its display name) names the Linear user a
 /// turn runs as; only linearbot reads it from a signature-verified webhook, so
-/// it is stripped from every other caller.
+/// it is stripped from every other caller. The execution's requester record
+/// (`centaur.requester`) is stripped from all of them.
 fn sanitize_execute_metadata(
     caller_class: CallerClass,
     caller_identity: &str,
@@ -904,6 +948,8 @@ fn sanitize_execute_metadata(
     if caller_class != CallerClass::Console {
         fields.remove("requester_principal_foreign_id");
     }
+    // api-rs's own record of an execution's requester, which no caller sets.
+    fields.remove(centaur_session_sqlx::EXECUTION_REQUESTER_KEY);
     if !(caller_class == CallerClass::Ingress && caller_identity == LINEARBOT_IDENTITY) {
         fields.remove("linear_user_id");
         fields.remove("linear_user_name");
@@ -1058,7 +1104,10 @@ async fn authorize_principal_session_read(
     ))
 }
 
-fn principal_subject_owns_session(subject: Option<&str>, session_principal: Option<&str>) -> bool {
+pub(crate) fn principal_subject_owns_session(
+    subject: Option<&str>,
+    session_principal: Option<&str>,
+) -> bool {
     subject.is_none_or(|subject| session_principal == Some(subject))
 }
 
@@ -1141,6 +1190,28 @@ mod session_authorization_tests {
             assert_eq!(
                 sanitize_execute_metadata(caller_class, identity, Some(metadata.clone())),
                 Some(json!({ "source": "console" }))
+            );
+        }
+    }
+
+    #[test]
+    fn no_caller_may_plant_the_execution_requester_record() {
+        let metadata = json!({
+            "source": "slackbot",
+            "centaur.requester": {"principal_id": "prn_alice"}
+        });
+        for (caller_class, identity) in [
+            (CallerClass::Admin, "api-rs-admin"),
+            (CallerClass::Console, "centaur-console"),
+            (CallerClass::Ingress, "slackbot"),
+            (CallerClass::Ingress, LINEARBOT_IDENTITY),
+            (CallerClass::Principal, "prn_sandbox"),
+            (CallerClass::ApiClient, "acl_test"),
+        ] {
+            assert_eq!(
+                sanitize_execute_metadata(caller_class, identity, Some(metadata.clone())),
+                Some(json!({ "source": "slackbot" })),
+                "{caller_class:?} {identity}"
             );
         }
     }

@@ -52,6 +52,7 @@
 [GitHub PR Attribution]
 |When opening a PR, add one standalone `Prompted by: ...` line to the body. Copy the exact `Prompted by:` line from [Requester Context] when present; for Slack, prefer the verified GitHub handle from the requester's profile.
 |Never infer a GitHub username from a Slack name, email, or thread history. Credit the user who prompted the current turn.
+|In a Slack channel session, open pull requests with `create_pull_request` (`uv run --no-project python -m centaur_sdk.pull_requests create <owner/repo> --head <branch> --base <branch> --title <title>`) instead of `gh pr create`, so failed CI is reported to this thread. Elsewhere, or if it reports the session is unsupported, open them as you normally would.
 
 [Tools]
 |Tools are shell CLIs. Run `centaur-tools list` to see what is available and `<tool> --help` before using an unfamiliar tool, unless a skill or this prompt gives the exact command. Never guess command names.

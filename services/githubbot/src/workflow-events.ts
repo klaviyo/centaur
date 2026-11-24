@@ -41,7 +41,7 @@ function reviewCorrelationId(
   return `${owner}/${repo}:pr-${number}:${headSha}:${reviewer}`.toLowerCase();
 }
 
-const FAILED_CONCLUSIONS = new Set([
+export const FAILED_CONCLUSIONS = new Set([
   "action_required",
   "cancelled",
   "failure",
@@ -75,13 +75,71 @@ export function isCentaurSkipCheck(name: string | null | undefined): boolean {
   return (name ?? "").toLowerCase().includes(CENTAUR_SKIP_MARKER);
 }
 
-export type CiCheck = { status: string; conclusion: string | null; name: string };
-export type CiStatus = { state: string; context: string };
+const MAX_NOTICE_URL_BYTES = 2_048;
+// Unicode White_Space and control characters (Rust's `char::is_whitespace` and
+// `char::is_control`), plus the three characters that break a Slack link.
+const UNRENDERABLE_URL_CHARS = /[\p{White_Space}\p{Cc}<>|]/u;
+
+/**
+ * The first candidate api-rs will keep as a notice link, so a check's unusable
+ * details URL never shadows a usable permalink or html URL. It mirrors both of
+ * api-rs's rules (which keep their own validation):
+ * - `is_usable_url`: starts with `https://` and is at most 2,048 bytes;
+ * - the Slack renderer's `slack_link`: no whitespace, no control character,
+ *   and none of `<`, `>`, `|`, which would break or forge a Slack link.
+ * Where Rust and JavaScript could differ, this errs strict: skipping to a later
+ * candidate is safe, keeping one api-rs then drops is the bug.
+ */
+export function firstUsableUrl(
+  ...candidates: (string | null | undefined)[]
+): string | undefined {
+  return candidates.find(
+    (url): url is string =>
+      typeof url === "string" &&
+      url.startsWith("https://") &&
+      new TextEncoder().encode(url).length <= MAX_NOTICE_URL_BYTES &&
+      !UNRENDERABLE_URL_CHARS.test(url),
+  );
+}
+
+export type CiCheck = {
+  status: string;
+  conclusion: string | null;
+  name: string;
+  /** Where the check's own page or log lives (details or html URL). */
+  url?: string | null;
+  /** The GitHub App that reported the check run, when the rollup says. */
+  appId?: number | null;
+};
+export type CiStatus = { state: string; context: string; url?: string | null };
+
+/** A failing check as the bound-PR notice names it, with its usable link. */
+export type CiNoticeFailure = {
+  name: string;
+  url?: string;
+  /** What `name` names, so it can be looked up again. */
+  kind: "check_run" | "status";
+  /** For a check run: the app that reported it (a name alone is ambiguous). */
+  appId?: number;
+  /**
+   * Taken from an incomplete rollup, where a newer run of the same check may be
+   * among the unreadable ones. It must be confirmed still failing, by a fresh
+   * read of that check's latest run, before it is named.
+   */
+  provisional?: true;
+};
 
 export type CiEvaluation = {
   settled: boolean;
   failed: boolean;
   failingNames: string[];
+  /**
+   * The first failing check this evaluation could read, for the failed-CI
+   * notice of a PR bound to a Slack session. Only that path reads it: the
+   * unbound flow (fix prompt, escalation, workflow events) uses `failingNames`
+   * alone, which this never alters.
+   */
+  noticeFailure?: CiNoticeFailure;
 };
 
 export function evaluateCi(
@@ -105,10 +163,27 @@ export function evaluateCi(
     ...failingChecks.map((c) => c.name),
     ...failingStatuses.map((s) => s.context),
   ];
+  const firstCheck = failingChecks[0];
+  const firstStatus = failingStatuses[0];
+  const noticeFailure: CiNoticeFailure | undefined = firstCheck
+    ? {
+        name: firstCheck.name,
+        kind: "check_run",
+        ...(firstCheck.url ? { url: firstCheck.url } : {}),
+        ...(typeof firstCheck.appId === "number" ? { appId: firstCheck.appId } : {}),
+      }
+    : firstStatus
+      ? {
+          name: firstStatus.context,
+          kind: "status",
+          ...(firstStatus.url ? { url: firstStatus.url } : {}),
+        }
+      : undefined;
   return {
     settled: !anyCheckPending && !anyStatusPending,
     failed: failingNames.length > 0,
     failingNames,
+    ...(noticeFailure ? { noticeFailure } : {}),
   };
 }
 
@@ -128,15 +203,17 @@ const CI_ROLLUP_QUERY = `query($owner: String!, $repo: String!, $sha: GitObjectI
                 status
                 conclusion
                 startedAt
+                detailsUrl
+                permalink
                 checkSuite {
-                  app { slug }
+                  app { slug databaseId }
                   workflowRun {
                     event
                     workflow { name }
                   }
                 }
               }
-              ... on StatusContext { context state createdAt }
+              ... on StatusContext { context state createdAt targetUrl }
             }
             pageInfo { hasNextPage endCursor }
             checkRunCountsByState { state count }
@@ -151,13 +228,16 @@ const CI_ROLLUP_QUERY = `query($owner: String!, $repo: String!, $sha: GitObjectI
 type CiRollupContext = {
   __typename: string;
   checkSuite?: {
-    app?: { slug?: string | null } | null;
+    app?: { slug?: string | null; databaseId?: number | null } | null;
     workflowRun?: {
       event?: string | null;
       workflow?: { name?: string | null } | null;
     } | null;
   } | null;
   createdAt?: string | null;
+  detailsUrl?: string | null;
+  permalink?: string | null;
+  targetUrl?: string | null;
   name?: string;
   status?: string;
   conclusion?: string | null;
@@ -262,12 +342,26 @@ export async function fetchCiEvaluation(
   else if (countsPending !== undefined) {
     settled = !aggregatePending && !countsPending;
   }
+  // Without a complete detail set, the verdict is the aggregate's and
+  // `failingNames` stays empty, exactly as before. But a failing check among
+  // the contexts that *were* readable is still a real failing check: keep it,
+  // separately, for the bound-PR notice alone.
+  const named = detail ?? (nodes.length > 0 ? evaluateCiRollupContexts(nodes) : null);
   return {
     settled,
     // GitHub computes rollupState over every context, marked ones included, so
     // OR-ing it in would undo the filter. A readable detail set is authoritative.
     failed: detail ? detail.failed : rollupState === "FAILURE" || rollupState === "ERROR",
     failingNames: detail?.failingNames ?? [],
+    ...(named?.noticeFailure
+      ? {
+          // From an incomplete detail set it is only provisional: a newer run
+          // of that very check may be among the contexts that couldn't be read.
+          noticeFailure: detail
+            ? named.noticeFailure
+            : { ...named.noticeFailure, provisional: true as const },
+        }
+      : {}),
   };
 }
 
@@ -324,14 +418,20 @@ async function evaluateCiViaActions(
         status: job.status.toLowerCase(),
         conclusion: job.conclusion?.toLowerCase() ?? null,
         name: job.name,
+        url: firstUsableUrl(job.htmlUrl),
       })),
-    statuses.map((node) => ({ state: node.state.toLowerCase(), context: node.context })),
+    statuses.map((node) => ({
+      state: node.state.toLowerCase(),
+      context: node.context,
+      url: firstUsableUrl(node.targetUrl),
+    })),
   );
 }
 
 type ActionsCiJob = {
   conclusion: string | null;
   event: string;
+  htmlUrl: string | null;
   name: string;
   runAttempt: number;
   runId: number;
@@ -374,6 +474,7 @@ async function fetchActionsJobs(
         ...response.data.jobs.map((job) => ({
           conclusion: job.conclusion ?? null,
           event: run.event,
+          htmlUrl: job.html_url ?? null,
           name: job.name,
           runAttempt: job.run_attempt ?? run.run_attempt ?? 0,
           runId: run.id,
@@ -411,10 +512,13 @@ function evaluateCiRollupContexts(nodes: CiRollupContext[]): CiEvaluation {
       status: node.status.toLowerCase(),
       conclusion: node.conclusion?.toLowerCase() ?? null,
       name: node.name,
+      url: firstUsableUrl(node.detailsUrl, node.permalink),
+      appId: node.checkSuite?.app?.databaseId,
     }));
   const statuses = latestCiStatuses(nodes).map((node) => ({
     state: node.state.toLowerCase(),
     context: node.context,
+    url: firstUsableUrl(node.targetUrl),
   }));
   return evaluateCi(checks, statuses);
 }

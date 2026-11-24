@@ -5,16 +5,29 @@ import { resolveAllowedAuthorAssociations } from "./authorization";
 import { reactWorkingOnReview, settleReviewReaction } from "./reactions";
 import { runTurnStream, turnOutputChars } from "./turn";
 import {
+  FAILED_CONCLUSIONS,
   fetchCiEvaluation,
+  firstUsableUrl,
+  isCentaurSkipCheck,
   maybeEmitReviewSubmitted,
   prepareCiCompleted,
   type CiEvaluation,
 } from "./workflow-events";
+import {
+  getPrBinding,
+  isRetryableSessionApiError,
+  reportPrCiFailure,
+  SessionApiError,
+  updatePrBindingState,
+  type PrBindingRef,
+} from "./session-api";
 import type {
   ForwardSessionInput,
   GithubbotApiMessage,
   GithubbotOptions,
   GithubbotTrace,
+  PrBinding,
+  PrBindingStateUpdate,
 } from "./types";
 import { errorMessage, noopLogger, nowMs, stringValue, traceLog } from "./utils";
 
@@ -38,12 +51,18 @@ export type PrManagerContext = {
   options: GithubbotOptions;
   state: StateAdapter;
   userName: string;
+  /** Delays between in-process attempts at a critical state write; tests inject their own. */
+  stateWriteRetryDelaysMs?: number[];
+  /** Timer for those delays; tests inject an instant one. */
+  sleep?: (ms: number) => Promise<void>;
 };
 
 const STATE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 const CLAIM_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_CI_FIX_MAX_ATTEMPTS = 3;
-
+// Close, unassign and reopen writes invalidate a notice, so they get 3 attempts
+// over about 30s (10s then 20s apart) before githubbot gives up and logs.
+const DEFAULT_STATE_WRITE_RETRY_DELAYS_MS = [10_000, 20_000];
 // ---------------------------------------------------------------------------
 // Pure decision helpers (unit-tested without GitHub).
 // ---------------------------------------------------------------------------
@@ -183,13 +202,17 @@ type PullRequestSummary = {
   draft: boolean;
   headRef: string;
   headRepoFullName: string | null;
+  baseRepoFullName: string | null;
   headSha: string;
+  htmlUrl: string | null;
   labels: string[];
   mergeableState: string;
   merged: boolean;
+  nodeId: string | null;
   number: number;
   state: string;
   title: string;
+  updatedAt: string | null;
 };
 
 function assigneeLogins(
@@ -201,13 +224,17 @@ function assigneeLogins(
 
 function summarizePr(pr: {
   draft?: boolean | null;
+  base?: { repo?: { full_name?: string | null } | null } | null;
   head: { ref: string; repo?: { full_name?: string | null } | null; sha: string };
+  html_url?: string | null;
   labels: { name?: string }[];
   mergeable_state?: string;
   merged?: boolean;
+  node_id?: string | null;
   number: number;
   state: string;
   title: string;
+  updated_at?: string | null;
   assignees?: ({ login?: string } | null)[] | null;
 }): PullRequestSummary {
   return {
@@ -215,13 +242,17 @@ function summarizePr(pr: {
     draft: pr.draft === true,
     headRef: pr.head.ref,
     headRepoFullName: pr.head.repo?.full_name ?? null,
+    baseRepoFullName: pr.base?.repo?.full_name ?? null,
     headSha: pr.head.sha,
+    htmlUrl: pr.html_url ?? null,
     labels: pr.labels.map((l) => l.name ?? "").filter(Boolean),
     mergeableState: pr.mergeable_state ?? "unknown",
     merged: pr.merged === true,
+    nodeId: pr.node_id ?? null,
     number: pr.number,
     state: pr.state,
     title: pr.title,
+    updatedAt: pr.updated_at ?? null,
   };
 }
 
@@ -296,6 +327,40 @@ export async function handlePullRequestEvent(
   if (!repo || !isRecord(prNode)) return;
   const number = numberValue(prNode.number);
   if (number === undefined) return;
+  // A PR opened through a session binding keeps its lifecycle state in api-rs,
+  // recorded before (and regardless of) the unbound handling below.
+  // The PR's node id from the signed payload lets api-rs find a binding whose
+  // repository was since renamed.
+  // A miss is only believed (made authoritative) where it would send an
+  // explicit assignment of the bot down the unbound path.
+  const botAssigned =
+    action === "assigned" &&
+    isRecord(payload.assignee) &&
+    stringValue(payload.assignee.login)?.toLowerCase() === ctx.userName.toLowerCase();
+  const lookup = await lookupBindingWithRetry(
+    ctx,
+    repo.owner,
+    repo.repo,
+    number,
+    stringValue(prNode.node_id),
+    botAssigned,
+  );
+  // An answer for another PR's binding is no basis for anything: no write, no
+  // CI evaluation (which would claim, reset the counter or turn), no merge.
+  if (!lookup.ok && lookup.mismatch) return;
+  // A failed lookup is not "unbound": the invalidating writes (close, unassign,
+  // reopen) are still attempted on the signed payload's node id, which api-rs
+  // checks against the binding.
+  if (!lookup.ok || lookup.binding) {
+    await recordBindingState(
+      ctx,
+      bindingRef(repo.owner, repo.repo, number),
+      lookup.ok ? lookup.binding : null,
+      action,
+      payload,
+      prNode,
+    );
+  }
   if (action === "closed") return; // nothing to drive once closed/merged.
 
   const pr = await fetchPr(ctx, repo.owner, repo.repo, number);
@@ -312,6 +377,241 @@ export async function handlePullRequestEvent(
   // Any other state change that could flip mergeability re-evaluates the merge
   // gate; it's deterministic and idempotent, so over-calling is harmless.
   await tryMerge(ctx, repo.owner, repo.repo, number);
+}
+
+function bindingRef(owner: string, repo: string, number: number): PrBindingRef {
+  return { repository: `${owner}/${repo}`.toLowerCase(), number };
+}
+
+type BindingLookup =
+  | { ok: true; binding: PrBinding | null }
+  // `mismatch`: api-rs answered, but with another PR's binding.
+  | { ok: false; error: unknown; mismatch?: true };
+
+/**
+ * The PR's session binding. `binding: null` is a coded miss (unbound);
+ * `ok: false` means api-rs could not say, which is never the same as unbound.
+ * That includes an answer for a *different* PR than the node id asked about:
+ * a node-id lookup that returns anything else than its own PR's binding, or a
+ * coded miss, is an error, not a reason to treat the PR as unbound.
+ */
+async function lookupBinding(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  number: number,
+  nodeId?: string,
+  authoritative = false,
+): Promise<BindingLookup> {
+  try {
+    const binding = await getPrBinding(
+      ctx.options,
+      bindingRef(owner, repo, number),
+      nodeId,
+      authoritative,
+    );
+    if (binding && nodeId && binding.pr_node_id !== nodeId) {
+      logger(ctx).warn("githubbot_pr_binding_node_mismatch", {
+        expected_node_id: nodeId,
+        pr: `${owner}/${repo}#${number}`,
+        received_node_id: binding.pr_node_id,
+      });
+      return {
+        ok: false,
+        mismatch: true,
+        error: new Error("binding lookup answered with another PR's binding"),
+      };
+    }
+    return { ok: true, binding };
+  } catch (error) {
+    logger(ctx).warn("githubbot_pr_binding_lookup_failed", {
+      error: errorMessage(error),
+      pr: `${owner}/${repo}#${number}`,
+    });
+    return { ok: false, error };
+  }
+}
+
+/**
+ * `lookupBinding`, retried within the bounded budget used for critical state
+ * writes when api-rs fails transiently, so a lifecycle event that is delivered
+ * once (an `assigned`, say) isn't lost to a brief outage.
+ */
+async function lookupBindingWithRetry(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  number: number,
+  nodeId?: string,
+  authoritative = false,
+): Promise<BindingLookup> {
+  const delays = ctx.stateWriteRetryDelaysMs ?? DEFAULT_STATE_WRITE_RETRY_DELAYS_MS;
+  const sleep = ctx.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  for (let attempt = 0; ; attempt += 1) {
+    const lookup = await lookupBinding(ctx, owner, repo, number, nodeId, authoritative);
+    if (lookup.ok || attempt >= delays.length || !isRetryableSessionApiError(lookup.error)) {
+      return lookup;
+    }
+    await sleep(delays[attempt] ?? 0);
+  }
+}
+
+/**
+ * Record a lifecycle event on the binding, only for the PR the binding was
+ * created for (`pr_node_id`). Every write is derived from a fresh fetch, never
+ * the payload, and carries that fetch's `updated_at` so api-rs can drop a write
+ * a later one has superseded: reordered or concurrent deliveries converge.
+ * Management is enabled only by an explicit assignment: the event's own
+ * `assignee` is the bot and the bot is still assigned on the fresh read.
+ *
+ * `binding` is null when the binding lookup failed; only the invalidating
+ * actions are attempted then, on the signed payload's node id.
+ */
+async function recordBindingState(
+  ctx: PrManagerContext,
+  ref: PrBindingRef,
+  binding: PrBinding | null,
+  action: string,
+  payload: Record<string, unknown>,
+  prNode: Record<string, unknown>,
+): Promise<void> {
+  const prLabel = `${ref.repository}#${ref.number}`;
+  const assigneeIsBot =
+    isRecord(payload.assignee) &&
+    stringValue(payload.assignee.login)?.toLowerCase() === ctx.userName.toLowerCase();
+  const botAssignment = assigneeIsBot && (action === "assigned" || action === "unassigned");
+  if (!["closed", "reopened", "synchronize"].includes(action) && !botAssignment) return;
+  const invalidating = action === "closed" || action === "reopened" || action === "unassigned";
+  if (!binding && !invalidating) return;
+
+  const [owner = "", repo = ""] = ref.repository.split("/", 2);
+  // Derive the write from a fresh read. Run again if api-rs reports a conflict,
+  // so a retry recomputes from GitHub's current state, not a stale one.
+  let current = binding;
+  const build = async (reread = false): Promise<PrBindingStateUpdate | undefined> => {
+    // A conflict means another writer got in: read the binding again, for its
+    // new revision, *before* reading the PR it will be compared against.
+    if (reread) {
+      const again = await lookupBinding(
+        ctx,
+        owner,
+        repo,
+        ref.number,
+        current?.pr_node_id ?? stringValue(prNode.node_id),
+      );
+      // Another PR's binding answers nothing about this one: abandon the write.
+      if (!again.ok && again.mismatch) return undefined;
+      if (again.ok) {
+        if (!again.binding) return undefined;
+        current = again.binding;
+      }
+    }
+    const fresh = await fetchPr(ctx, owner, repo, ref.number);
+    if (!fresh?.updatedAt) {
+      logger(ctx).warn("githubbot_pr_binding_no_fresh_state", { action, pr: prLabel });
+      return undefined;
+    }
+    // The binding only speaks for the PR it was created for.
+    const payloadNodeId = stringValue(prNode.node_id);
+    const expectedNodeId = current?.pr_node_id ?? payloadNodeId;
+    if (
+      !expectedNodeId ||
+      (payloadNodeId && payloadNodeId !== expectedNodeId) ||
+      fresh.nodeId !== expectedNodeId
+    ) {
+      logger(ctx).warn("githubbot_pr_binding_identity_mismatch", { action, pr: prLabel });
+      return undefined;
+    }
+    let update: Partial<PrBindingStateUpdate> | undefined;
+    if (action === "closed" || action === "reopened") {
+      update = { closed: fresh.state !== "open" || fresh.merged };
+    } else if (action === "synchronize") update = { head_sha: fresh.headSha };
+    else if (action === "assigned") {
+      update = owns(ctx, fresh) ? { managed: true, head_sha: fresh.headSha } : undefined;
+    } else if (action === "unassigned") {
+      update = owns(ctx, fresh) ? undefined : { managed: false };
+    }
+    if (!update) return undefined;
+    return {
+      ...update,
+      pr_node_id: expectedNodeId,
+      observed_updated_at: fresh.updatedAt,
+      ...(current ? { expected_revision: current.revision } : {}),
+    };
+  };
+  const update = await build();
+  if (!update) return;
+  // Enabling management is as unrepeatable as disabling it (one delivery, no
+  // redelivery), so both get the bounded retry.
+  // api-rs knows the PR by the coordinates it was bound under, which a rename
+  // or transfer may have left different from this event's.
+  const target = current ? { repository: current.repository, number: current.number } : ref;
+  await writeBindingState(ctx, target, update, invalidating || action === "assigned", action, () =>
+    build(true),
+  );
+}
+
+/** api-rs refused a write whose timestamp ties the stored one but contradicts it. */
+function isStateConflict(error: unknown): boolean {
+  return (
+    error instanceof SessionApiError &&
+    error.status === 409 &&
+    error.body.includes("binding_state_conflict")
+  );
+}
+
+/**
+ * Write binding state; with `retry`, up to three attempts with bounded backoff
+ * for retryable and network errors. A `binding_state_conflict` is retried within
+ * the same budget whatever `retry` says, after `rebuild` re-derives the write
+ * from a fresh read of both the binding and the PR (it may find nothing left to
+ * write). Resolves true when
+ * api-rs accepted the call (an unapplied, superseded write counts), false after
+ * giving up.
+ */
+async function writeBindingState(
+  ctx: PrManagerContext,
+  ref: PrBindingRef,
+  initial: PrBindingStateUpdate,
+  retry: boolean,
+  action: string,
+  rebuild?: () => Promise<PrBindingStateUpdate | undefined>,
+): Promise<boolean> {
+  const delays = ctx.stateWriteRetryDelaysMs ?? DEFAULT_STATE_WRITE_RETRY_DELAYS_MS;
+  const sleep = ctx.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  let update = initial;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const { applied } = await updatePrBindingState(ctx.options, ref, update);
+      if (!applied) {
+        logger(ctx).debug("githubbot_pr_binding_state_superseded", {
+          action,
+          pr: `${ref.repository}#${ref.number}`,
+        });
+      }
+      return true;
+    } catch (error) {
+      const conflict = rebuild !== undefined && isStateConflict(error);
+      const last =
+        attempt >= delays.length || !(conflict || (retry && isRetryableSessionApiError(error)));
+      logger(ctx).warn(
+        last ? "githubbot_pr_binding_state_failed" : "githubbot_pr_binding_state_retrying",
+        {
+          action,
+          attempt: attempt + 1,
+          error: errorMessage(error),
+          pr: `${ref.repository}#${ref.number}`,
+        },
+      );
+      if (last) return false;
+      await sleep(delays[attempt] ?? 0);
+      if (conflict) {
+        const next = await rebuild();
+        if (!next) return false;
+        update = next;
+      }
+    }
+  }
 }
 
 /** `pull_request_review` submitted -> address review, or merge on approval. */
@@ -416,11 +716,197 @@ export async function handleCiEvent(
     target.prNumbers.length > 0
       ? target.prNumbers
       : await fetchPrNumbersForCommit(ctx, repo.owner, repo.repo, target.headSha);
+  const eventFailure = ciEventFailure(eventType, payload, repo, target.headSha);
   await Promise.all(
     prNumbers.map((number) =>
-      processCi(ctx, repo.owner, repo.repo, number, target.headSha, false, evaluation),
+      processCi(ctx, repo.owner, repo.repo, number, target.headSha, false, evaluation, eventFailure),
     ),
   );
+}
+
+/** A failing check as the signed completion event itself names it. */
+type CiEventFailure = {
+  kind: "check_run" | "status" | "workflow_run";
+  owner: string;
+  repo: string;
+  headSha: string;
+  /** The workflow's id, which the latest run of that workflow is looked up by. */
+  workflowId?: number;
+  /** The GitHub App that reported the check run; only its runs can confirm it. */
+  appId?: number;
+  name: string;
+  url?: string;
+};
+
+/**
+ * The failing check the signed completion event names, as a candidate for a
+ * report whose CI evaluation settled red without naming one. Only a failing
+ * check_run, status or workflow_run qualifies: a passing one finishing last
+ * says nothing about what failed. It is only a candidate: `confirmEventFailure`
+ * must see it still failing before it is used.
+ */
+function ciEventFailure(
+  eventType: string,
+  payload: JsonRecord,
+  repo: { owner: string; repo: string },
+  headSha: string,
+): CiEventFailure | undefined {
+  let name: string | undefined;
+  let url: string | undefined;
+  let id: number | undefined;
+  let appId: number | undefined;
+  if (eventType === "status") {
+    const state = stringValue(payload.state);
+    if (state !== "failure" && state !== "error") return undefined;
+    name = stringValue(payload.context);
+    url = firstUsableUrl(stringValue(payload.target_url));
+  } else if (eventType === "check_run" || eventType === "workflow_run") {
+    const node = eventType === "check_run" ? payload.check_run : payload.workflow_run;
+    if (!isRecord(node)) return undefined;
+    const conclusion = stringValue(node.conclusion)?.toLowerCase();
+    if (!conclusion || !FAILED_CONCLUSIONS.has(conclusion)) return undefined;
+    name = stringValue(node.name);
+    url = firstUsableUrl(stringValue(node.details_url), stringValue(node.html_url));
+    if (eventType === "workflow_run") id = numberValue(node.workflow_id);
+    if (eventType === "check_run" && isRecord(node.app)) appId = numberValue(node.app.id);
+  }
+  if (!name || isCentaurSkipCheck(name) || (eventType !== "status" && eventType !== "check_run" && eventType !== "workflow_run")) {
+    return undefined;
+  }
+  return {
+    ...repo,
+    headSha,
+    kind: eventType,
+    name,
+    ...(id !== undefined ? { workflowId: id } : {}),
+    ...(appId !== undefined ? { appId } : {}),
+    ...(url ? { url } : {}),
+  };
+}
+
+type FailingCheck = { name: string; url?: string };
+
+/**
+ * Read the event's check fresh, with the existing GitHub client, and return it
+ * only if its *latest* run is still failing on exactly this repository and
+ * head. The event's own run id is never trusted: a check that failed, was rerun
+ * and passed as a new run would still read as failing by that id. A check that
+ * has since passed, or can't be read, is not used.
+ */
+async function confirmEventFailure(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  headSha: string,
+  event: CiEventFailure,
+): Promise<FailingCheck | undefined> {
+  const confirmed = await readEventFailure(ctx, owner, repo, headSha, event);
+  // A `centaur-skip` check is never counted red, so it is never named either.
+  return confirmed && !isCentaurSkipCheck(confirmed.name) ? confirmed : undefined;
+}
+
+async function readEventFailure(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  headSha: string,
+  event: CiEventFailure,
+): Promise<FailingCheck | undefined> {
+  if (
+    event.owner.toLowerCase() !== owner.toLowerCase() ||
+    event.repo.toLowerCase() !== repo.toLowerCase() ||
+    event.headSha !== headSha
+  ) {
+    return undefined;
+  }
+  const failedConclusion = (conclusion: string | null | undefined) =>
+    Boolean(conclusion && FAILED_CONCLUSIONS.has(conclusion.toLowerCase()));
+  try {
+    if (event.kind === "check_run") {
+      // Only the event's own app can confirm it: another app's passing run of
+      // the same name says nothing about this one's failure.
+      if (event.appId === undefined) return undefined;
+      const appId = event.appId;
+      const { data } = await ctx.octokit.rest.checks.listForRef({
+        owner,
+        repo,
+        ref: headSha,
+        check_name: event.name,
+        app_id: appId,
+        filter: "latest",
+        per_page: 100,
+      });
+      // The latest run of that app for this check's name, newest by start time.
+      const latest = [...data.check_runs]
+        .filter((run) => run.name === event.name && run.head_sha === headSha && run.app?.id === appId)
+        .sort(
+          (a, b) =>
+            (b.started_at ?? "").localeCompare(a.started_at ?? "") || b.id - a.id,
+        )[0];
+      if (!latest || latest.status !== "completed" || !failedConclusion(latest.conclusion)) {
+        return undefined;
+      }
+      const url = firstUsableUrl(latest.details_url, latest.html_url);
+      return { name: latest.name, ...(url ? { url } : {}) };
+    }
+    if (event.kind === "workflow_run") {
+      if (event.workflowId === undefined) return undefined;
+      // The latest run of this workflow on this head (a rerun is a later run
+      // number or attempt, so an old failed run can't stand in for it).
+      const { data } = await ctx.octokit.rest.actions.listWorkflowRuns({
+        owner,
+        repo,
+        workflow_id: event.workflowId,
+        head_sha: headSha,
+        per_page: 100,
+      });
+      const latest = [...data.workflow_runs]
+        .filter((run) => run.head_sha === headSha)
+        .sort(
+          (a, b) =>
+            (b.run_number ?? 0) - (a.run_number ?? 0) ||
+            (b.run_attempt ?? 0) - (a.run_attempt ?? 0) ||
+            b.id - a.id,
+        )[0];
+      if (!latest || latest.status !== "completed" || !failedConclusion(latest.conclusion)) {
+        return undefined;
+      }
+      const name = latest.name ?? event.name;
+      const url = firstUsableUrl(latest.html_url);
+      return name ? { name, ...(url ? { url } : {}) } : undefined;
+    }
+    // A status: the combined status lists the latest one per context, a page
+    // of 100 at a time, so follow every page to find the context.
+    type CommitStatus = { context: string; state: string; target_url: string | null };
+    const statuses = await ctx.octokit.paginate(
+      ctx.octokit.rest.repos.getCombinedStatusForRef,
+      { owner, repo, ref: headSha, per_page: 100 },
+      // The client hands back either the statuses themselves or the combined
+      // object they sit in, depending on how it normalizes the page.
+      (response): CommitStatus[] => {
+        const data = response.data as unknown as CommitStatus[] | { statuses: CommitStatus[] };
+        return Array.isArray(data) ? data : data.statuses;
+      },
+    );
+    const latest = statuses.find((status) => status.context === event.name);
+    if (!latest || (latest.state !== "failure" && latest.state !== "error")) return undefined;
+    const url = firstUsableUrl(latest.target_url);
+    return { name: latest.context, ...(url ? { url } : {}) };
+  } catch (error) {
+    logger(ctx).warn("githubbot_ci_event_check_unconfirmed", {
+      error: errorMessage(error),
+      pr: `${owner}/${repo}`,
+    });
+    return undefined;
+  }
+}
+
+/** api-rs's `check_name` limit, in characters. */
+const CHECK_NAME_MAX_CHARS = 200;
+
+function truncateCheckName(name: string): string {
+  const chars = Array.from(name);
+  return chars.length <= CHECK_NAME_MAX_CHARS ? name : chars.slice(0, CHECK_NAME_MAX_CHARS).join("");
 }
 
 async function processCi(
@@ -431,6 +917,7 @@ async function processCi(
   headSha: string,
   force = false,
   knownEvaluation?: CiEvaluation | null,
+  eventFailure?: CiEventFailure,
 ): Promise<void> {
   const pr = await fetchPr(ctx, owner, repo, number);
   if (!pr || !owns(ctx, pr)) return;
@@ -440,13 +927,44 @@ async function processCi(
   const evaluation =
     knownEvaluation ?? (await fetchCiEvaluation(ctx, owner, repo, headSha));
   if (!evaluation?.settled) return; // wait until *all* checks are done (and readable).
-  // Act once per fully-settled SHA (the last-arriving check event wins).
-  const firstSettle = await claim(
-    ctx,
-    `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:ci-settled:${owner}/${repo}#${number}:${headSha}`,
-  );
-
+  const prefix = ctx.options.stateKeyPrefix ?? "centaur-githubbot";
   const trace = makeTrace(managementThreadKey(owner, repo, number), `ci-${headSha}`);
+
+  // A red PR bound to a Slack session never gets an automated CI turn, and its
+  // report must not depend on the shared settled claim (a green result or an
+  // early skip may already have consumed it). Only an explicit 404 means
+  // unbound: if api-rs can't say, do nothing at all, and take no claim.
+  if (evaluation.failed) {
+    // A miss here means the unfixed-by-binding flow, so it must be believed.
+    const lookup = await lookupBinding(ctx, owner, repo, number, pr.nodeId ?? undefined, true);
+    if (!lookup.ok) return;
+    if (lookup.binding) {
+      // The lookup already refused another PR's binding (a lookup error). A PR
+      // whose node id is unknown can't be matched to one, so it is left alone.
+      if (!pr.nodeId) {
+        traceLog(ctx.options, "githubbot_bound_ci_skipped", trace, {
+          pr: `${owner}/${repo}#${number}`,
+          reason: "pr_node_id_unknown",
+        });
+        return;
+      }
+      await reportBoundCiFailure(
+        ctx,
+        owner,
+        repo,
+        number,
+        headSha,
+        lookup.binding,
+        evaluation,
+        trace,
+        eventFailure,
+      );
+      return;
+    }
+  }
+
+  // Act once per fully-settled SHA (the last-arriving check event wins).
+  const firstSettle = await claim(ctx, `${prefix}:ci-settled:${owner}/${repo}#${number}:${headSha}`);
   if (!evaluation.failed) {
     // Green: reset the fix counter and consider merging. The merge gate is
     // deterministic and has its own claim, so it runs on every green settle:
@@ -489,6 +1007,143 @@ async function processCi(
     consecutiveCiFixes: attempts + 1,
   });
   fireCiFixTurn(ctx, owner, repo, pr, evaluation.failingNames, attempts + 1, maxAttempts);
+}
+
+/**
+ * Report a red head on a bound PR. Eligibility comes first: the binding is for
+ * this exact PR and managed and not closed, and a fresh read still shows the
+ * failing head. Nothing is claimed locally; api-rs dedupes the notice.
+ */
+async function reportBoundCiFailure(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  number: number,
+  headSha: string,
+  binding: PrBinding,
+  evaluation: CiEvaluation,
+  trace: GithubbotTrace,
+  eventFailure?: CiEventFailure,
+): Promise<void> {
+  const prLabel = `${owner}/${repo}#${number}`;
+  // api-rs knows the PR by the coordinates it was bound under, which a rename
+  // or transfer may have left different from this event's.
+  const bindingTarget = { repository: binding.repository, number: binding.number };
+  const skip = (reason: string) =>
+    traceLog(ctx.options, "githubbot_bound_ci_skipped", trace, { pr: prLabel, reason });
+  if (!binding.managed) return skip("not_managed");
+  if (binding.closed) return skip("closed");
+
+  // Name the failing check before the final PR read, so that read stays the
+  // last one. A failing check read from a complete rollup is named as is. One
+  // read from an incomplete rollup is only provisional (a newer run of it may be
+  // among the unreadable contexts), so it is named only once the same latest-run
+  // confirmation the signed event's check gets shows it still failing. When
+  // neither stands, there is nothing true to say: report nothing.
+  const noticeFailure = evaluation.noticeFailure;
+  let failing: FailingCheck | undefined =
+    noticeFailure && !noticeFailure.provisional
+      ? { name: noticeFailure.name, url: noticeFailure.url }
+      : undefined;
+  if (!failing && noticeFailure?.provisional) {
+    failing = await confirmEventFailure(ctx, owner, repo, headSha, {
+      kind: noticeFailure.kind,
+      owner,
+      repo,
+      headSha,
+      name: noticeFailure.name,
+      ...(noticeFailure.appId !== undefined ? { appId: noticeFailure.appId } : {}),
+    });
+  }
+  if (!failing && eventFailure) {
+    failing = await confirmEventFailure(ctx, owner, repo, headSha, eventFailure);
+  }
+  if (!failing) return skip("no_failing_check");
+
+  // api-rs revalidates and posts inside the report request, so its inputs must
+  // be fresh, and the whole report is built from the last GitHub read before
+  // it. Every read fails closed: no read, no report.
+  let fresh = await fetchPr(ctx, owner, repo, number);
+  if (!fresh) return skip("pr_unreadable");
+  if (fresh.nodeId !== binding.pr_node_id) return skip("identity_mismatch");
+  if (!fresh.updatedAt) return skip("pr_unreadable");
+  if (fresh.headSha !== headSha) return skip("stale_head");
+
+  // The failing head is confirmed current. If the binding still records an
+  // older one (CI beat the synchronize event), record it first so api-rs
+  // doesn't refuse the report as stale.
+  if (binding.head_sha !== fresh.headSha) {
+    const recorded = await writeBindingState(
+      ctx,
+      bindingTarget,
+      {
+        pr_node_id: fresh.nodeId,
+        observed_updated_at: fresh.updatedAt,
+        // The revision of the binding read before the fetch above.
+        expected_revision: binding.revision,
+        head_sha: fresh.headSha,
+      },
+      false,
+      "ci_head_sync",
+      async () => {
+        // Binding first (its new revision), then the PR it is compared with.
+        const rebound = await lookupBinding(ctx, owner, repo, number, binding.pr_node_id);
+        if (!rebound.ok || !rebound.binding || rebound.binding.pr_node_id !== binding.pr_node_id) {
+          return undefined;
+        }
+        const again = await fetchPr(ctx, owner, repo, number);
+        if (!again?.updatedAt || again.nodeId !== binding.pr_node_id || again.headSha !== headSha) {
+          return undefined;
+        }
+        return {
+          pr_node_id: again.nodeId,
+          observed_updated_at: again.updatedAt,
+          expected_revision: rebound.binding.revision,
+          head_sha: again.headSha,
+        };
+      },
+    );
+    if (!recorded) return skip("head_not_recorded");
+    // The write took time: the PR may have closed or moved on since the read
+    // it was derived from. Read again and build the report from that.
+    fresh = await fetchPr(ctx, owner, repo, number);
+    if (!fresh) return skip("pr_unreadable");
+    if (fresh.nodeId !== binding.pr_node_id) return skip("identity_mismatch");
+    if (!fresh.updatedAt) return skip("pr_unreadable");
+    if (fresh.headSha !== headSha) return skip("stale_head");
+  }
+
+  // open and assigned come from the fresh read; api-rs decides and records. It
+  // is also the only dedupe authority, keyed by (pr_node_id, head_sha): a
+  // repeat delivery is answered `duplicate`, so githubbot keeps no claim here.
+  try {
+    const result = await reportPrCiFailure(ctx.options, bindingTarget, {
+      pr_node_id: fresh.nodeId,
+      observed_updated_at: fresh.updatedAt,
+      head_sha: headSha,
+      current_head_sha: fresh.headSha,
+      // Where the PR lives now, from the same fresh read; the route path keeps
+      // the coordinates it was bound under.
+      current_repository: (fresh.baseRepoFullName ?? `${owner}/${repo}`).toLowerCase(),
+      current_number: fresh.number,
+      open: fresh.state === "open" && !fresh.merged,
+      assigned: owns(ctx, fresh),
+      check_name: truncateCheckName(failing.name),
+      ...(failing.url ? { details_url: failing.url } : {}),
+      html_url: fresh.htmlUrl ?? `https://github.com/${owner}/${repo}/pull/${number}`,
+    });
+    // `posted` and `duplicate` are both done; a skip is api-rs's decision.
+    traceLog(ctx.options, "githubbot_bound_ci_reported", trace, {
+      notice: result.notice,
+      pr: prLabel,
+      ...(result.reason ? { reason: result.reason } : {}),
+    });
+  } catch (error) {
+    logger(ctx).warn("githubbot_bound_ci_report_failed", {
+      error: errorMessage(error),
+      pr: prLabel,
+    });
+  }
 }
 
 /** Deterministic merge gate — no agent; GitHub's mergeable_state decides. */

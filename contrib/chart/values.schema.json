@@ -470,6 +470,7 @@
         "syncInfraSecrets": { "type": "boolean" },
         "mcpV2Enabled": { "type": "boolean" },
         "mcpPublicUrl": { "type": "string" },
+        "trustedPrCreateEnabled": { "type": "boolean" },
         "sessionPrincipalAdmission": {
           "type": "string",
           "enum": ["automatic", "preapproved"]

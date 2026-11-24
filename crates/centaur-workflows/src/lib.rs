@@ -4354,7 +4354,10 @@ fn python_slack_message_payload(
     payload
 }
 
-async fn send_slack_request(
+/// Calls a Slack Web API `method` with `payload` using the deployment's bot
+/// token (`SLACK_BOT_TOKEN`) and base URL (`SLACK_API_URL`), and returns
+/// Slack's response once it reports `ok`. Errors never include the token.
+pub async fn send_slack_request(
     method: &'static str,
     payload: Value,
 ) -> Result<Value, WorkflowRuntimeError> {

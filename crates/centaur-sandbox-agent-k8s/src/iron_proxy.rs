@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use centaur_iron_proxy::{ProxyFragment, SourceKind, SourcePolicy};
 use centaur_sandbox_core::{
-    ResourceRequirements, SandboxError, SandboxId, SandboxResult, SandboxSpec,
+    GITHUB_API_HOST, PrOauthPlaceholder, ProxyHttpsResponse, ResourceRequirements, SandboxError,
+    SandboxId, SandboxResult, SandboxSpec, github_pull_requests_path,
 };
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvFromSource,
@@ -97,6 +99,15 @@ pub struct IronProxyConfig {
     pub ca_cert_secret_name: String,
     /// Entry in `ca_cert_secret_name` holding the PEM CA certificate.
     pub ca_cert_secret_key: String,
+    /// A file holding only the PEM CA certificate, projected into api-rs from
+    /// the certificate entry of `ca_cert_secret_name` alone. The trusted
+    /// pull-request create call trusts exactly this file, and api-rs never
+    /// reads the CA Secret through the Kubernetes API. The certificate entry
+    /// must hold only the certificate: a combined certificate-and-key entry
+    /// would be mounted as is, and api-rs then refuses the file (see
+    /// `parse_proxy_ca`). `None` leaves that call unsupported. Proxy and
+    /// sandbox pods ignore it and keep using the Secret names.
+    pub ca_cert_file: Option<PathBuf>,
     pub ca_key_secret_name: String,
     /// Entry in `ca_key_secret_name` holding the PEM CA private key.
     pub ca_key_secret_key: String,
@@ -141,6 +152,7 @@ impl IronProxyConfig {
             source_policy: SourcePolicy::default(),
             ca_cert_secret_name: ca_cert_secret_name.into(),
             ca_cert_secret_key: CA_CERT_FILE.to_owned(),
+            ca_cert_file: None,
             ca_key_secret_name: ca_key_secret_name.into(),
             ca_key_secret_key: CA_KEY_FILE.to_owned(),
             env_from_secret_names: Vec::new(),
@@ -1387,6 +1399,302 @@ impl AgentSandboxBackend {
     }
 }
 
+/// How long the GitHub pull-request create call may take end to end.
+const GITHUB_PULL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the Kubernetes preflight of the create call (the NetworkPolicy
+/// check and the CA certificate read) may take in all. api-rs holds its shared
+/// global PR-create lock across the whole call, and every authoritative
+/// binding lookup that misses waits on that lock, so a stalled Kubernetes API,
+/// whose own client timeouts are minutes long, must not be able to hold them.
+/// The GitHub request that follows has its own, separate
+/// [`GITHUB_PULL_REQUEST_TIMEOUT`].
+const GITHUB_PULL_REQUEST_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Most response bytes read back from the create call.
+const GITHUB_PULL_REQUEST_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+/// The generic GitHub placeholder: Console's canonical `github_token`
+/// credential replaces it in `Authorization` on `api.github.com` whether that
+/// credential is an OAuth token or a personal access token. The create call
+/// does not use it, because the account check only means something for an
+/// OAuth token (see `github_pr_authorization`); tests assert
+/// the call never carries it.
+#[cfg(test)]
+const GITHUB_TOKEN_PLACEHOLDER_AUTHORIZATION: &str = "Bearer GITHUB_TOKEN";
+/// The marker the create call puts in front of its path: the request goes to
+/// `//repos/{owner}/{repo}/pulls`, with a literal leading double slash.
+///
+/// proxy-sync's PR-create guard (`require: true`, last writer of
+/// `Authorization`) matches `POST api.github.com //repos/*/*/pulls`. In the
+/// pinned iron-proxy 0.56.0 rules match on the raw request path, while the
+/// request forwarded to GitHub is normalized to the ordinary
+/// `/repos/{owner}/{repo}/pulls`. The marker therefore sends only this call
+/// through the guard: a sandbox's ordinary `/repos/...` PR creation with
+/// `GITHUB_TOKEN` never matches the guard rule and is untouched. The pairing
+/// with the guard's path depends on that matcher/forwarder behaviour, so the
+/// offline proof (`d1-oauth-placeholder-proof/`) must be rerun on any
+/// iron-proxy bump.
+const GITHUB_PR_CREATE_PATH_MARKER: &str = "/";
+/// `Authorization` value of the create call: `Bearer` plus the identity-bound
+/// placeholder (see [`PrOauthPlaceholder`]), a placeholder and not a
+/// credential. The sandbox's proxy replaces it only with the attested OAuth
+/// credential's token, only for `POST api.github.com //repos/*/*/pulls` (see
+/// [`GITHUB_PR_CREATE_PATH_MARKER`]), and only if its guard was built for
+/// exactly this account and requester: Console's config builder derives the
+/// guard's placeholder from the same two values. If the credential has since
+/// turned into a personal access token, the account changed, or the proxy was
+/// rebound to another requester, the guard expects a different string and the
+/// proxy refuses the call (or, with no guard match, the placeholder reaches
+/// GitHub unsubstituted and is rejected), so no pull request is created under a
+/// credential the attestation does not describe.
+fn github_pr_authorization(placeholder: &PrOauthPlaceholder) -> String {
+    format!("Bearer {}", placeholder.as_str())
+}
+
+impl AgentSandboxBackend {
+    /// Creates a pull request through the sandbox's own proxy: HTTP CONNECT to
+    /// the proxy service's tunnel port, then TLS to `api.github.com` trusting
+    /// only the proxy's CA certificate. The proxy terminates TLS, swaps the
+    /// identity-bound placeholder (see [`github_pr_authorization`]) for the
+    /// bound human's attested OAuth token and forwards the request, so the PR
+    /// is authored as that person.
+    ///
+    /// The method, host, path and headers are fixed here; `owner` and `repo`
+    /// are validated before anything else happens, so a bad value never
+    /// reaches the network or Kubernetes. The proxy's CA certificate is read
+    /// from `ca_cert_file`, projected from the certificate entry alone; the CA
+    /// Secret itself is never fetched, so a key kept in a separate entry never
+    /// reaches api-rs. The certificate entry must hold only the certificate: a
+    /// key-bearing file is refused (see `parse_proxy_ca`).
+    pub(crate) async fn create_github_pull_request_through_proxy(
+        &self,
+        id: &SandboxId,
+        owner: &str,
+        repo: &str,
+        placeholder: &PrOauthPlaceholder,
+        payload: &Value,
+    ) -> SandboxResult<ProxyHttpsResponse> {
+        let path = github_pull_requests_path(owner, repo)?;
+        let Some(iron_proxy) = self.config.iron_proxy.as_ref() else {
+            return Err(SandboxError::Unsupported {
+                backend: crate::BACKEND_NAME,
+                operation: "create_github_pull_request",
+            });
+        };
+        // Without the projected certificate file the call is unsupported,
+        // before any Kubernetes call.
+        if iron_proxy.ca_cert_file.is_none() {
+            return Err(SandboxError::Unsupported {
+                backend: crate::BACKEND_NAME,
+                operation: "create_github_pull_request",
+            });
+        }
+        let ca = self
+            .github_pull_request_preflight(id, iron_proxy, GITHUB_PULL_REQUEST_PREFLIGHT_TIMEOUT)
+            .await?;
+        let proxy_url = format!(
+            "http://{}.{}.svc:{PROXY_TUNNEL_PORT}",
+            iron_proxy_service_name(id),
+            self.config.namespace
+        );
+        let client = github_pull_request_client(&proxy_url, ca)?;
+        send_github_pull_request(&client, &path, placeholder, payload).await
+    }
+
+    /// The Kubernetes steps the create call needs before it can reach the
+    /// proxy, bounded together by `deadline`: the NetworkPolicy check (older
+    /// sandboxes lack the tunnel rule; add it so their proxy admits this call)
+    /// and the CA certificate file read. A stalled Kubernetes API (or file
+    /// system) fails the call as
+    /// [`SandboxError::NotReady`], which api-rs reports as the sandbox proxy
+    /// being unavailable, without echoing anything to the caller.
+    async fn github_pull_request_preflight(
+        &self,
+        id: &SandboxId,
+        iron_proxy: &IronProxyConfig,
+        deadline: Duration,
+    ) -> SandboxResult<Vec<reqwest::Certificate>> {
+        tokio::time::timeout(deadline, async {
+            self.ensure_api_tunnel_ingress(id, iron_proxy).await?;
+            self.proxy_ca_certificate(iron_proxy).await
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(SandboxError::NotReady(
+                "the Kubernetes API did not answer in time".to_owned(),
+            ))
+        })
+    }
+
+    /// Makes sure the sandbox proxy's NetworkPolicy admits api-rs on the tunnel
+    /// port, adding the one rule the policy builder gives new proxies if an
+    /// older policy lacks it. Idempotent: a policy that already has it is not
+    /// written. Fails when the policy cannot be read or updated, which the
+    /// caller reports as the sandbox proxy being unavailable.
+    async fn ensure_api_tunnel_ingress(
+        &self,
+        id: &SandboxId,
+        iron_proxy: &IronProxyConfig,
+    ) -> SandboxResult<()> {
+        let name = iron_proxy_policy_name(id);
+        let policies = self.network_policies();
+        let existing = policies
+            .get(&name)
+            .await
+            .map_err(|err| map_kube_error("get iron-proxy network policy", err))?;
+        let Some(ingress) = ingress_with_api_tunnel(&existing, iron_proxy, PROXY_TUNNEL_PORT)
+        else {
+            return Ok(());
+        };
+        policies
+            .patch(
+                &name,
+                &PatchParams::default(),
+                &Patch::Merge(json!({ "spec": { "ingress": ingress } })),
+            )
+            .await
+            .map_err(|err| map_kube_error("update iron-proxy network policy", err))?;
+        Ok(())
+    }
+
+    /// The proxy CA's public certificate, from `ca_cert_file`: a file the
+    /// chart projects from the certificate entry of the CA Secret alone. The
+    /// Secrets API is never called, so a CA key kept in a separate entry, even
+    /// of the same Secret, never reaches api-rs. A missing, unreadable or
+    /// key-bearing file is a backend error.
+    async fn proxy_ca_certificate(
+        &self,
+        iron_proxy: &IronProxyConfig,
+    ) -> SandboxResult<Vec<reqwest::Certificate>> {
+        let path = iron_proxy
+            .ca_cert_file
+            .as_deref()
+            .ok_or_else(|| SandboxError::Unsupported {
+                backend: crate::BACKEND_NAME,
+                operation: "create_github_pull_request",
+            })?;
+        let pem = tokio::fs::read(path)
+            .await
+            .map_err(|err| SandboxError::backend_source("read proxy CA certificate file", err))?;
+        parse_proxy_ca(&pem)
+    }
+}
+
+/// The tail of every PEM private-key header (`PRIVATE KEY`, `RSA PRIVATE KEY`,
+/// `EC PRIVATE KEY`, `ENCRYPTED PRIVATE KEY`).
+const PEM_PRIVATE_KEY_MARKER: &[u8] = b"PRIVATE KEY-----";
+
+/// The certificates in the proxy CA PEM. An entry with none is an error, not an
+/// empty trust set.
+fn parse_proxy_ca(pem: &[u8]) -> SandboxResult<Vec<reqwest::Certificate>> {
+    // The projected entry must hold the certificate alone. One that also holds
+    // a private key was provisioned wrong (the chart refuses the obvious alias
+    // at render time): refuse it rather than use it, and say so without
+    // echoing anything from the file.
+    if pem
+        .windows(PEM_PRIVATE_KEY_MARKER.len())
+        .any(|window| window == PEM_PRIVATE_KEY_MARKER)
+    {
+        return Err(SandboxError::backend(
+            "proxy CA certificate file also holds a private key; project the certificate alone",
+        ));
+    }
+    let certificates = reqwest::Certificate::from_pem_bundle(pem)
+        .map_err(|err| SandboxError::backend_source("parse proxy CA certificate", err))?;
+    if certificates.is_empty() {
+        return Err(SandboxError::backend(
+            "proxy CA certificate file holds no certificate",
+        ));
+    }
+    Ok(certificates)
+}
+
+/// A client that reaches the internet only through `proxy_url` and trusts only
+/// `ca`: no environment proxies, no built-in roots and no redirects, so the
+/// call cannot be steered to another host or trust anyone else's certificate.
+fn github_pull_request_client(
+    proxy_url: &str,
+    ca: Vec<reqwest::Certificate>,
+) -> SandboxResult<reqwest::Client> {
+    let proxy = reqwest::Proxy::all(proxy_url)
+        .map_err(|err| SandboxError::backend_source("configure sandbox proxy", err))?;
+    reqwest::Client::builder()
+        // Clears environment proxies; the explicit proxy below is the only one.
+        .no_proxy()
+        .proxy(proxy)
+        .tls_certs_only(ca)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(GITHUB_PULL_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|err| SandboxError::backend_source("build sandbox proxy client", err))
+}
+
+/// The fixed pull-request create request, to `base` (the API host, or a test
+/// stand-in for it) with the path sent verbatim behind
+/// [`GITHUB_PR_CREATE_PATH_MARKER`]. GitHub requires a `User-Agent`.
+fn github_pull_request_request(
+    client: &reqwest::Client,
+    base: &str,
+    path: &str,
+    placeholder: &PrOauthPlaceholder,
+    payload: &Value,
+) -> reqwest::RequestBuilder {
+    client
+        .post(format!("{base}{GITHUB_PR_CREATE_PATH_MARKER}{path}"))
+        .header(
+            reqwest::header::AUTHORIZATION,
+            github_pr_authorization(placeholder),
+        )
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header(reqwest::header::USER_AGENT, "centaur-api-rs")
+        .json(payload)
+}
+
+async fn send_github_pull_request(
+    client: &reqwest::Client,
+    path: &str,
+    placeholder: &PrOauthPlaceholder,
+    payload: &Value,
+) -> SandboxResult<ProxyHttpsResponse> {
+    send_github_pull_request_to(
+        client,
+        &format!("https://{GITHUB_API_HOST}"),
+        path,
+        placeholder,
+        payload,
+    )
+    .await
+}
+
+async fn send_github_pull_request_to(
+    client: &reqwest::Client,
+    base: &str,
+    path: &str,
+    placeholder: &PrOauthPlaceholder,
+    payload: &Value,
+) -> SandboxResult<ProxyHttpsResponse> {
+    let mut response = github_pull_request_request(client, base, path, placeholder, payload)
+        .send()
+        .await
+        .map_err(|err| {
+            SandboxError::backend_source("create GitHub pull request through proxy", err)
+        })?;
+    let status = response.status().as_u16();
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| SandboxError::backend_source("read GitHub pull request response", err))?
+    {
+        if body.len() + chunk.len() > GITHUB_PULL_REQUEST_MAX_RESPONSE_BYTES {
+            return Err(SandboxError::backend(
+                "GitHub pull request response is too large",
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(ProxyHttpsResponse { status, body })
+}
+
 /// Address + bearer key of a managed proxy's management API.
 struct ProxyManagementEndpoint {
     base_url: String,
@@ -1958,6 +2266,7 @@ fn build_iron_proxy_network_policies(
                         from: Some(vec![pod_peer(iron_proxy.api_pod_labels.clone())]),
                         ports: Some(vec![network_port(PROXY_MANAGEMENT_PORT)]),
                     },
+                    api_tunnel_ingress_rule(iron_proxy, resolved.proxy_port),
                 ]),
                 egress: Some(proxy_egress_rules(iron_proxy, control_targets)),
             }),
@@ -1974,6 +2283,41 @@ fn build_iron_proxy_network_policies(
             }),
         },
     ]
+}
+
+/// api-rs -> proxy tunnel port. This exists only for
+/// `SandboxBackend::create_github_pull_request`, the one call api-rs makes
+/// through a sandbox's proxy so GitHub sees the human's token, never api-rs's.
+/// The backend fixes that request's method, host, path and headers.
+fn api_tunnel_ingress_rule(
+    iron_proxy: &IronProxyConfig,
+    tunnel_port: u16,
+) -> NetworkPolicyIngressRule {
+    NetworkPolicyIngressRule {
+        from: Some(vec![pod_peer(iron_proxy.api_pod_labels.clone())]),
+        ports: Some(vec![network_port(tunnel_port)]),
+    }
+}
+
+/// The ingress list `existing` should have to admit api-rs on the tunnel port:
+/// `None` when it already does, otherwise its rules plus the api tunnel rule.
+/// Existing rules are kept as they are, so this only ever adds that one rule.
+fn ingress_with_api_tunnel(
+    existing: &NetworkPolicy,
+    iron_proxy: &IronProxyConfig,
+    tunnel_port: u16,
+) -> Option<Vec<NetworkPolicyIngressRule>> {
+    let rule = api_tunnel_ingress_rule(iron_proxy, tunnel_port);
+    let mut ingress = existing
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.ingress.clone())
+        .unwrap_or_default();
+    if ingress.contains(&rule) {
+        return None;
+    }
+    ingress.push(rule);
+    Some(ingress)
 }
 
 fn sandbox_to_proxy_ports(resolved: &ResolvedIronProxy) -> Vec<NetworkPolicyPort> {
@@ -2586,7 +2930,13 @@ fn unique_suffix() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+
+    fn placeholder() -> PrOauthPlaceholder {
+        PrOauthPlaceholder::derive("90210001", Some("prn_alice")).unwrap()
+    }
 
     fn no_scheduling() -> ProxyPodScheduling<'static> {
         static EMPTY_SELECTOR: BTreeMap<String, String> = BTreeMap::new();
@@ -3971,5 +4321,757 @@ mod tests {
             now,
             Duration::from_secs(800),
         ));
+    }
+
+    /// A public test certificate (its key was discarded): the shape of the
+    /// proxy CA entry, not a trust root for anything.
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBdzCCARygAwIBAgIUfcWwY30B3Q9VwoRGlMocSsa+kg4wCgYIKoZIzj0EAwIw
+IDEeMBwGA1UEAwwVY2VudGF1ci10ZXN0LXByb3h5LWNhMCAXDTI2MTEyNDAxMDIy
+N1oYDzIxMjYxMDMxMDEwMjI3WjAgMR4wHAYDVQQDDBVjZW50YXVyLXRlc3QtcHJv
+eHktY2EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR0aDguld9vKCGvmUAkyTvx
+2i8Vh3JvAhXpkFkdxaqNmoMT+FQZ8++eQ4INrOuFHUQV/DK4I/7QytfEbSed5R8Q
+ozIwMDAdBgNVHQ4EFgQURpn83k3AcR3/IRj3LzNfhFxQpCkwDwYDVR0TAQH/BAUw
+AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
++g5VPQ7qvm8CIQCfi9WQ5RZkSnBGVNV5jy143M8ihNcx5G/uVFF2bwGg6w==
+-----END CERTIFICATE-----
+";
+
+    fn test_ca() -> Vec<reqwest::Certificate> {
+        parse_proxy_ca(TEST_CA_PEM.as_bytes()).unwrap()
+    }
+
+    fn ingress_ports_for_api_pods(iron_proxy: &IronProxyConfig) -> Vec<Vec<i32>> {
+        let policies = build_iron_proxy_network_policies(
+            &SandboxId::new("asbx-test"),
+            &resolved(),
+            iron_proxy,
+            &[],
+            None,
+        );
+        policies[1]
+            .spec
+            .as_ref()
+            .unwrap()
+            .ingress
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|rule| {
+                rule.from.as_ref().is_some_and(|peers| {
+                    peers.iter().any(|peer| {
+                        peer.pod_selector.as_ref().is_some_and(|selector| {
+                            selector.match_labels.as_ref() == Some(&iron_proxy.api_pod_labels)
+                        })
+                    })
+                })
+            })
+            .map(|rule| {
+                rule.ports
+                    .iter()
+                    .flatten()
+                    .filter_map(|port| match port.port {
+                        Some(IntOrString::Int(port)) => Some(port),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn proxy_policy_allows_api_pods_to_the_tunnel_port_for_the_pull_request_call() {
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        let ports = ingress_ports_for_api_pods(&iron_proxy);
+        // One rule per port, next to the management-port rule.
+        assert!(ports.contains(&vec![i32::from(PROXY_MANAGEMENT_PORT)]));
+        assert!(ports.contains(&vec![i32::from(PROXY_TUNNEL_PORT)]));
+        assert_eq!(ports.len(), 2, "{ports:?}");
+
+        // The rule follows the configured api-rs pod labels, nothing broader.
+        let mut custom = iron_proxy.clone();
+        custom.api_pod_labels = BTreeMap::from([("app".to_owned(), "control".to_owned())]);
+        assert_eq!(ingress_ports_for_api_pods(&custom), ports);
+    }
+
+    #[test]
+    fn pull_request_request_is_fixed_and_carries_only_the_token_placeholder() {
+        let client = reqwest::Client::new();
+        let payload =
+            json!({"title": "Fix", "head": "fix", "base": "main", "body": "", "draft": false});
+        let request = github_pull_request_request(
+            &client,
+            "https://api.github.com",
+            &github_pull_requests_path("acme", "widgets").unwrap(),
+            &placeholder(),
+            &payload,
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(request.method(), reqwest::Method::POST);
+        // The marker's literal double slash survives URL parsing.
+        assert_eq!(
+            request.url().as_str(),
+            "https://api.github.com//repos/acme/widgets/pulls"
+        );
+        assert_eq!(request.url().path(), "//repos/acme/widgets/pulls");
+        let headers = request.headers();
+        // Only the identity-bound OAuth placeholder derived from the caller's
+        // validated account and requester, never the generic one that a
+        // personal access token would also satisfy.
+        assert_eq!(
+            headers["authorization"],
+            format!("Bearer {}", placeholder().as_str()).as_str()
+        );
+        assert!(
+            headers["authorization"]
+                .to_str()
+                .unwrap()
+                .starts_with("Bearer CENTAUR_PR_OAUTH_U90210001_")
+        );
+        assert_ne!(
+            headers["authorization"],
+            GITHUB_TOKEN_PLACEHOLDER_AUTHORIZATION
+        );
+        assert_eq!(headers["accept"], "application/vnd.github+json");
+        assert_eq!(headers["x-github-api-version"], "2022-11-28");
+        assert_eq!(headers["content-type"], "application/json");
+        assert_eq!(headers.len(), 5, "{headers:?}");
+        let body: Value =
+            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(body, payload);
+    }
+
+    #[tokio::test]
+    async fn the_create_call_sends_the_marker_path_verbatim_on_the_wire() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A plain-HTTP stand-in for the API host, so the request line is
+        // observable (the real call is inside TLS).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..read]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 201 Created\r\ncontent-length: 2\r\n\r\n{}")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&head).into_owned()
+        });
+
+        let response = send_github_pull_request_to(
+            &reqwest::Client::new(),
+            &base,
+            &github_pull_requests_path("acme", "widgets").unwrap(),
+            &placeholder(),
+            &json!({"title": "Fix"}),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status, 201);
+        let head = server.await.unwrap();
+        // The request line is `POST //repos/...`: not collapsed to one slash,
+        // which would send it past the guard that matches the marker.
+        assert_eq!(
+            head.lines().next().unwrap(),
+            "POST //repos/acme/widgets/pulls HTTP/1.1",
+            "{head}"
+        );
+        // And the bearer is the identity-bound placeholder, nothing else.
+        let authorization = head
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+            .unwrap();
+        assert_eq!(
+            authorization.split_once(':').unwrap().1.trim(),
+            format!("Bearer {}", placeholder().as_str())
+        );
+    }
+
+    #[test]
+    fn pull_request_client_requires_a_parseable_proxy_ca() {
+        assert_eq!(test_ca().len(), 1);
+        assert!(github_pull_request_client("http://proxy.example:8080", test_ca()).is_ok());
+        // Malformed DER inside a PEM block is not checked here; it can only
+        // make the TLS handshake fail, never trust more.
+        for pem in [&b""[..], b"not a certificate"] {
+            assert!(
+                matches!(parse_proxy_ca(pem), Err(SandboxError::Backend { .. })),
+                "{pem:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_request_call_tunnels_to_the_github_api_host_through_the_proxy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A stand-in proxy that records the CONNECT it receives and refuses
+        // it, so nothing leaves the machine.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 512];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..read]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&head).into_owned()
+        });
+
+        let client = github_pull_request_client(&proxy_url, test_ca()).unwrap();
+        let result = send_github_pull_request(
+            &client,
+            &github_pull_requests_path("acme", "widgets").unwrap(),
+            &placeholder(),
+            &json!({"title": "Fix"}),
+        )
+        .await;
+
+        assert!(matches!(result, Err(SandboxError::Backend { .. })));
+        let connect = proxy.await.unwrap();
+        assert!(
+            connect.starts_with("CONNECT api.github.com:443 HTTP/1.1"),
+            "{connect}"
+        );
+        // Nothing but the tunnel request crossed: no credential, no path.
+        assert!(!connect.to_lowercase().contains("authorization"));
+        assert!(!connect.contains("/repos/"));
+    }
+
+    fn offline_backend(iron_proxy: Option<IronProxyConfig>) -> AgentSandboxBackend {
+        // Nothing listens here, and these tests never reach the client.
+        backend_at("http://127.0.0.1:1", iron_proxy)
+    }
+
+    fn backend_at(api_server: &str, iron_proxy: Option<IronProxyConfig>) -> AgentSandboxBackend {
+        // kube builds a TLS connector even for http URLs.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let client =
+            kube::Client::try_from(kube::Config::new(api_server.parse().unwrap())).unwrap();
+        let mut config =
+            crate::AgentSandboxConfig::new("centaur", crate::test_iron_control_settings());
+        config.iron_proxy = iron_proxy;
+        AgentSandboxBackend::new(client, config)
+    }
+
+    #[tokio::test]
+    async fn invalid_owner_or_repo_is_refused_before_any_request_is_made() {
+        let backend = offline_backend(Some(IronProxyConfig::new(
+            "proxy:test",
+            "ca-cert",
+            "ca-key",
+        )));
+        let id = SandboxId::new("asbx-test");
+        for (owner, repo) in [
+            ("", "widgets"),
+            ("acme", ""),
+            (".", "widgets"),
+            ("acme", ".."),
+            ("acme/evil", "widgets"),
+            ("acme", "widgets/pulls/../../user"),
+            ("acme", "widgets?per_page=1"),
+            ("acme", "wid gets"),
+            ("acme", "widgets#"),
+            ("acme", "wïdgets"),
+        ] {
+            let error = backend
+                .create_github_pull_request_through_proxy(
+                    &id,
+                    owner,
+                    repo,
+                    &placeholder(),
+                    &json!({}),
+                )
+                .await
+                .unwrap_err();
+            // InvalidSpec, not a Kubernetes or network error: validation ran
+            // first, ahead of the CA file read and the proxy connection.
+            assert!(
+                matches!(error, SandboxError::InvalidSpec(_)),
+                "{owner:?}/{repo:?}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_requests_need_a_managed_proxy() {
+        let backend = offline_backend(None);
+        let error = backend
+            .create_github_pull_request_through_proxy(
+                &SandboxId::new("asbx-test"),
+                "acme",
+                "widgets",
+                &placeholder(),
+                &json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SandboxError::Unsupported { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_stalled_kubernetes_api_fails_the_preflight_within_its_deadline() {
+        use std::time::{Duration, Instant};
+
+        // A stand-in API server that accepts connections and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let held = tokio::spawn(async move {
+            let mut streams = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                streams.push(stream);
+            }
+        });
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        let backend = backend_at(&url, Some(iron_proxy.clone()));
+
+        let started = Instant::now();
+        let error = backend
+            .github_pull_request_preflight(
+                &SandboxId::new("asbx-test"),
+                &iron_proxy,
+                Duration::from_millis(300),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        // `NotReady` is not one of the variants api-rs singles out (an invalid
+        // spec, an unsupported operation), so it reaches the default
+        // `sandbox_proxy_unavailable` arm, whose response echoes nothing.
+        assert!(matches!(error, SandboxError::NotReady(_)), "{error:?}");
+        held.abort();
+        // The named bound is finite and shorter than the GitHub request's.
+        assert!(GITHUB_PULL_REQUEST_PREFLIGHT_TIMEOUT <= Duration::from_secs(10));
+        assert!(GITHUB_PULL_REQUEST_PREFLIGHT_TIMEOUT < GITHUB_PULL_REQUEST_TIMEOUT);
+    }
+
+    /// A file holding the test CA certificate, as the chart's projection of the
+    /// certificate entry would, for `label`'s test.
+    fn ca_file(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "centaur-test-proxy-ca-{}-{label}.pem",
+            std::process::id()
+        ));
+        std::fs::write(&path, TEST_CA_PEM).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn a_create_without_a_projected_ca_file_is_unsupported_before_any_kubernetes_call() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A stand-in API server that only counts the connections it gets.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counted = connections.clone();
+        let held = tokio::spawn(async move {
+            let mut streams = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                streams.push(stream);
+            }
+        });
+        // Whatever the Secret layout (certificate and key in one Secret
+        // included), with no projected file there is nothing to read.
+        for iron_proxy in [
+            IronProxyConfig::new("proxy:test", "ca", "ca"),
+            IronProxyConfig::new("proxy:test", "ca-cert", "ca-key"),
+        ] {
+            assert_eq!(iron_proxy.ca_cert_file, None);
+            let backend = backend_at(&url, Some(iron_proxy));
+            let error = backend
+                .create_github_pull_request_through_proxy(
+                    &SandboxId::new("asbx-test"),
+                    "acme",
+                    "widgets",
+                    &PrOauthPlaceholder::unattested(),
+                    &json!({"head": "feature", "base": "main", "title": "t"}),
+                )
+                .await
+                .unwrap_err();
+
+            // Unsupported (api-rs answers `pull_requests_unsupported`, and the
+            // SDK falls back), before any Kubernetes call at all.
+            assert!(
+                matches!(error, SandboxError::Unsupported { .. }),
+                "{error:?}"
+            );
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(connections.load(Ordering::SeqCst), 0);
+        held.abort();
+    }
+
+    #[tokio::test]
+    async fn the_preflight_reads_the_ca_file_and_never_the_secrets_api() {
+        let mut iron_proxy = IronProxyConfig::new("proxy:test", "ca", "ca");
+        iron_proxy.ca_cert_file = Some(ca_file("preflight"));
+        let id = SandboxId::new("asbx-new");
+        let current =
+            build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, &[], None).remove(1);
+        let (url, received) = spawn_policy_api(iron_proxy_policy_name(&id), current).await;
+        let backend = backend_at(&url, Some(iron_proxy.clone()));
+
+        let ca = backend
+            .github_pull_request_preflight(&id, &iron_proxy, GITHUB_PULL_REQUEST_PREFLIGHT_TIMEOUT)
+            .await
+            .unwrap();
+
+        assert_eq!(ca.len(), 1);
+        // Only the NetworkPolicy was asked of the API server: the CA Secret
+        // (which may also hold the key) was never requested.
+        let requests = received.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0].method, "GET");
+        assert!(requests[0].path.contains("networkpolicies"));
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.path.contains("/secrets")),
+            "{requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_empty_ca_file_is_a_backend_error() {
+        let id = SandboxId::new("asbx-new");
+        let empty = std::env::temp_dir().join(format!(
+            "centaur-test-proxy-ca-{}-empty.pem",
+            std::process::id()
+        ));
+        std::fs::write(&empty, "").unwrap();
+        // A certificate entry that also carries a key (a fake one: only the
+        // header matters) is refused, never used.
+        let with_key = std::env::temp_dir().join(format!(
+            "centaur-test-proxy-ca-{}-with-key.pem",
+            std::process::id()
+        ));
+        std::fs::write(
+            &with_key,
+            format!(
+                "{TEST_CA_PEM}\n-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n"
+            ),
+        )
+        .unwrap();
+        for (label, file) in [
+            (
+                "missing",
+                std::env::temp_dir().join("centaur-no-such-ca.pem"),
+            ),
+            ("empty", empty),
+            ("with a private key", with_key),
+        ] {
+            let mut iron_proxy = IronProxyConfig::new("proxy:test", "ca", "ca");
+            iron_proxy.ca_cert_file = Some(file);
+            let current =
+                build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, &[], None)
+                    .remove(1);
+            let (url, _) = spawn_policy_api(iron_proxy_policy_name(&id), current).await;
+            let backend = backend_at(&url, Some(iron_proxy.clone()));
+
+            let error = backend
+                .github_pull_request_preflight(
+                    &id,
+                    &iron_proxy,
+                    GITHUB_PULL_REQUEST_PREFLIGHT_TIMEOUT,
+                )
+                .await
+                .unwrap_err();
+
+            // A backend error maps to `sandbox_proxy_unavailable`.
+            assert!(
+                matches!(error, SandboxError::Backend { .. }),
+                "{label}: {error:?}"
+            );
+            // Nothing from the file is echoed.
+            assert!(!format!("{error:?}").contains("AAAA"), "{label}: {error:?}");
+        }
+    }
+
+    /// One request a stub API server received.
+    #[derive(Clone, Debug)]
+    struct Received {
+        method: String,
+        path: String,
+        content_type: String,
+        body: String,
+    }
+
+    /// A stand-in Kubernetes API server for one NetworkPolicy: it serves the
+    /// policy on GET, records every request, and answers a PATCH with the
+    /// policy unchanged. Any other path is a 404.
+    async fn spawn_policy_api(
+        policy_name: String,
+        policy: NetworkPolicy,
+    ) -> (String, Arc<std::sync::Mutex<Vec<Received>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let received = Arc::new(std::sync::Mutex::new(Vec::<Received>::new()));
+        let log = received.clone();
+        let policy_path =
+            format!("/apis/networking.k8s.io/v1/namespaces/centaur/networkpolicies/{policy_name}");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let log = log.clone();
+                let policy_path = policy_path.clone();
+                let policy = serde_json::to_string(&policy).unwrap();
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        // Read one request: head, then Content-Length bytes.
+                        let (head, body_start) = loop {
+                            if let Some(end) =
+                                buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                            {
+                                let head = String::from_utf8_lossy(&buffer[..end]).into_owned();
+                                break (head, end + 4);
+                            }
+                            match stream.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                            }
+                        };
+                        let header = |name: &str| {
+                            head.lines()
+                                .find_map(|line| {
+                                    let (key, value) = line.split_once(':')?;
+                                    key.eq_ignore_ascii_case(name)
+                                        .then(|| value.trim().to_owned())
+                                })
+                                .unwrap_or_default()
+                        };
+                        let length: usize = header("content-length").parse().unwrap_or(0);
+                        while buffer.len() < body_start + length {
+                            match stream.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                            }
+                        }
+                        let body =
+                            String::from_utf8_lossy(&buffer[body_start..body_start + length])
+                                .into_owned();
+                        buffer.drain(..body_start + length);
+                        let mut request_line = head.lines().next().unwrap_or_default().split(' ');
+                        let method = request_line.next().unwrap_or_default().to_owned();
+                        let path = request_line.next().unwrap_or_default().to_owned();
+                        log.lock().unwrap().push(Received {
+                            method,
+                            path: path.clone(),
+                            content_type: header("content-type"),
+                            body,
+                        });
+                        let (status, payload) = if path.split('?').next()
+                            == Some(policy_path.as_str())
+                        {
+                            ("200 OK", policy.clone())
+                        } else {
+                            (
+                                "404 Not Found",
+                                r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404,"message":"not found"}"#
+                                    .to_owned(),
+                            )
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{payload}",
+                            payload.len()
+                        );
+                        if stream.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (url, received)
+    }
+
+    /// The proxy policy a sandbox created before the tunnel rule has: the
+    /// builder's, minus every rule on the tunnel port.
+    fn pre_rollout_proxy_policy(id: &SandboxId, iron_proxy: &IronProxyConfig) -> NetworkPolicy {
+        let mut policy =
+            build_iron_proxy_network_policies(id, &resolved(), iron_proxy, &[], None).remove(1);
+        let tunnel = api_tunnel_ingress_rule(iron_proxy, PROXY_TUNNEL_PORT);
+        policy
+            .spec
+            .as_mut()
+            .unwrap()
+            .ingress
+            .as_mut()
+            .unwrap()
+            .retain(|rule| *rule != tunnel);
+        policy
+    }
+
+    #[test]
+    fn an_older_proxy_policy_gets_exactly_the_api_tunnel_rule_added() {
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        let id = SandboxId::new("asbx-test");
+        let older = pre_rollout_proxy_policy(&id, &iron_proxy);
+        let before = older.spec.as_ref().unwrap().ingress.clone().unwrap();
+        assert_eq!(before.len(), 2);
+
+        let ingress = ingress_with_api_tunnel(&older, &iron_proxy, PROXY_TUNNEL_PORT)
+            .expect("the older policy lacks the rule");
+        assert_eq!(ingress.len(), 3);
+        assert_eq!(ingress[..2], before[..]);
+        assert_eq!(
+            ingress[2],
+            api_tunnel_ingress_rule(&iron_proxy, PROXY_TUNNEL_PORT)
+        );
+
+        // A current policy, built fresh, needs nothing.
+        let current =
+            build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, &[], None).remove(1);
+        assert_eq!(
+            ingress_with_api_tunnel(&current, &iron_proxy, PROXY_TUNNEL_PORT),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn the_create_path_adds_the_tunnel_rule_to_a_proxy_that_lacks_it_once() {
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        let id = SandboxId::new("asbx-old");
+        let older = pre_rollout_proxy_policy(&id, &iron_proxy);
+        let (url, received) = spawn_policy_api(iron_proxy_policy_name(&id), older).await;
+        let backend = backend_at(&url, Some(iron_proxy.clone()));
+
+        backend
+            .ensure_api_tunnel_ingress(&id, &iron_proxy)
+            .await
+            .unwrap();
+
+        let requests = received.lock().unwrap().clone();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            ["GET", "PATCH"]
+        );
+        let patch = &requests[1];
+        assert!(
+            patch
+                .path
+                .split('?')
+                .next()
+                .unwrap()
+                .ends_with(&iron_proxy_policy_name(&id)),
+            "{}",
+            patch.path
+        );
+        assert!(
+            patch.content_type.contains("merge-patch"),
+            "{}",
+            patch.content_type
+        );
+        let body: Value = serde_json::from_str(&patch.body).unwrap();
+        let ingress = body["spec"]["ingress"].as_array().unwrap();
+        let ports = |rule: &Value| rule["ports"][0]["port"].as_i64();
+        assert_eq!(
+            ingress.iter().map(ports).collect::<Vec<_>>(),
+            [
+                Some(i64::from(PROXY_TUNNEL_PORT)),
+                Some(i64::from(PROXY_MANAGEMENT_PORT)),
+                Some(i64::from(PROXY_TUNNEL_PORT))
+            ]
+        );
+        // The added rule admits the configured api-rs pods and no one else.
+        assert_eq!(
+            ingress[2]["from"][0]["podSelector"]["matchLabels"],
+            json!(iron_proxy.api_pod_labels)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_create_path_leaves_a_current_proxy_policy_alone() {
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        let id = SandboxId::new("asbx-new");
+        let current =
+            build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, &[], None).remove(1);
+        let (url, received) = spawn_policy_api(iron_proxy_policy_name(&id), current).await;
+        let backend = backend_at(&url, Some(iron_proxy.clone()));
+
+        backend
+            .ensure_api_tunnel_ingress(&id, &iron_proxy)
+            .await
+            .unwrap();
+
+        let methods: Vec<String> = received
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.method.clone())
+            .collect();
+        assert_eq!(methods, ["GET"]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_reconcile_stops_the_create_before_the_ca_or_github_are_touched() {
+        let mut iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        iron_proxy.ca_cert_file = Some(ca_file("reconcile"));
+        // The API server knows no policy for this sandbox.
+        let (url, received) =
+            spawn_policy_api("some-other-policy".to_owned(), NetworkPolicy::default()).await;
+        let backend = backend_at(&url, Some(iron_proxy));
+
+        let error = backend
+            .create_github_pull_request_through_proxy(
+                &SandboxId::new("asbx-gone"),
+                "acme",
+                "widgets",
+                &placeholder(),
+                &json!({}),
+            )
+            .await
+            .unwrap_err();
+
+        // Not InvalidSpec or Unsupported: the API maps it to the
+        // sandbox-proxy-unavailable error.
+        assert!(
+            matches!(
+                error,
+                SandboxError::NotFound(_) | SandboxError::Backend { .. }
+            ),
+            "{error:?}"
+        );
+        let requests = received.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0].method, "GET");
+        assert!(requests[0].path.contains("networkpolicies"));
     }
 }

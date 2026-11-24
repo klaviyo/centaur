@@ -533,3 +533,329 @@ def test_company_context_database_url_reads_dsn_env(monkeypatch):
 
 def test_company_context_database_url_ignores_unresolved_placeholder():
     assert company_context_database_url("CENTAUR_POSTGRES_DSN") == ""
+
+
+_CREATED = (
+    b'{"pull_request":{"number":42,"html_url":"https://github.com/acme/widgets/pull/42",'
+    b'"node_id":"PR_placeholder"},"bound":true}'
+)
+
+
+def _capture_pr_request(
+    monkeypatch: pytest.MonkeyPatch, response: bytes = _CREATED
+) -> dict[str, object]:
+    requested: dict[str, object] = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self) -> bytes:
+            return response
+
+    def fake_urlopen(request, timeout):
+        requested["url"] = request.full_url
+        requested["method"] = request.get_method()
+        requested["body"] = request.data
+        requested["timeout"] = timeout
+        requested["authorization"] = request.get_header("Authorization")
+        return FakeResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    return requested
+
+
+def test_create_pull_request_posts_to_the_current_session(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import json
+
+    from centaur_sdk import create_pull_request
+
+    requested = _capture_pr_request(monkeypatch)
+    token = set_tool_context(
+        ToolContext(
+            name="fake-tool",
+            thread_key="slack:T1:C123:123.456",
+            secrets={"CENTAUR_API_URL": "http://api:8000/"},
+        )
+    )
+    try:
+        result = create_pull_request(
+            "acme/widgets", "feature", "main", "Add widgets", body="Details", draft=True
+        )
+    finally:
+        reset_tool_context(token)
+
+    assert result["bound"] is True
+    assert result["pull_request"]["number"] == 42
+    assert requested["method"] == "POST"
+    assert (
+        requested["url"] == "http://api:8000/api/session/slack%3AT1%3AC123%3A123.456/pull-requests"
+    )
+    assert json.loads(requested["body"]) == {
+        "repository": "acme/widgets",
+        "head": "feature",
+        "base": "main",
+        "title": "Add widgets",
+        "body": "Details",
+        "draft": True,
+    }
+    # The api token is injected by the proxy, never by the sandbox.
+    assert requested["authorization"] is None
+    # Covers the API's lock wait plus its own 30s GitHub call.
+    assert requested["timeout"] == 120
+
+
+def test_create_pull_request_defaults_to_a_non_draft_with_no_body(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import json
+
+    from centaur_sdk import create_pull_request
+
+    requested = _capture_pr_request(monkeypatch)
+    token = set_tool_context(
+        ToolContext(
+            name="fake-tool",
+            thread_key="slack:T1:C1:1.2",
+            secrets={"CENTAUR_API_URL": "http://api:8000"},
+        )
+    )
+    try:
+        create_pull_request("acme/widgets", "feature", "main", "Add widgets")
+    finally:
+        reset_tool_context(token)
+    assert json.loads(requested["body"])["body"] == ""
+    assert json.loads(requested["body"])["draft"] is False
+
+
+def test_create_pull_request_returns_an_unbound_result_as_is(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from centaur_sdk import create_pull_request
+
+    _capture_pr_request(
+        monkeypatch,
+        b'{"pull_request":{"number":7,"html_url":"u","node_id":"n"},'
+        b'"bound":false,"reason":"author_mismatch"}',
+    )
+    token = set_tool_context(
+        ToolContext(
+            name="fake-tool",
+            thread_key="slack:T1:C1:1.2",
+            secrets={"CENTAUR_API_URL": "http://api:8000"},
+        )
+    )
+    try:
+        result = create_pull_request("acme/widgets", "feature", "main", "t")
+    finally:
+        reset_tool_context(token)
+    assert result["bound"] is False
+    assert result["reason"] == "author_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("repository", "head", "base", "title", "body", "draft"),
+    [
+        ("widgets", "f", "main", "t", "", False),
+        ("acme/widgets/extra", "f", "main", "t", "", False),
+        ("acme/widgets", " ", "main", "t", "", False),
+        ("acme/widgets", "f", "", "t", "", False),
+        ("acme/widgets", "f", "main", "  ", "", False),
+        ("acme/widgets", "f", "main", "t", None, False),
+        ("acme/widgets", "f", "main", "t", "", "yes"),
+    ],
+)
+def test_create_pull_request_rejects_malformed_input(
+    monkeypatch: pytest.MonkeyPatch, repository, head, base, title, body, draft
+):
+    from centaur_sdk import create_pull_request
+
+    requested = _capture_pr_request(monkeypatch)
+    token = set_tool_context(
+        ToolContext(
+            name="fake-tool",
+            thread_key="slack:T1:C1:1.2",
+            secrets={"CENTAUR_API_URL": "http://api:8000"},
+        )
+    )
+    try:
+        with pytest.raises(ValueError):
+            create_pull_request(repository, head, base, title, body, draft)
+    finally:
+        reset_tool_context(token)
+    assert requested == {}
+
+
+def test_create_pull_request_cli_prints_result(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    from centaur_sdk import pull_requests
+
+    requested = _capture_pr_request(monkeypatch)
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "slack:T1:C123:123.456")
+    monkeypatch.setattr(
+        registry, "_backend", MappingBackend({"CENTAUR_API_URL": "http://api:8000"})
+    )
+
+    exit_code = pull_requests.main(
+        ["create", "acme/widgets", "--head", "feature", "--base", "main", "--title", "T"]
+    )
+    assert exit_code == 0
+    assert '"bound":true' in capsys.readouterr().out
+    assert str(requested["url"]).endswith("/pull-requests")
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "fallback"),
+    [
+        (409, "github_oauth_required", True),
+        (403, "slack_session_required", True),
+        (403, "dm_not_supported", True),
+        (403, "sandbox_mismatch", True),
+        (503, "sandbox_proxy_unavailable", True),
+        (501, "pull_requests_unsupported", True),
+        (403, "sandbox_claim_required", True),
+        (409, "requester_not_applied", False),
+        (409, "no_active_execution", False),
+        (502, "upstream_error", False),
+    ],
+)
+def test_create_pull_request_cli_reports_http_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    status: int,
+    code: str,
+    fallback: bool,
+):
+    import io
+    import json
+    import urllib.error
+
+    from centaur_sdk import pull_requests
+
+    def refuse(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            status,
+            "Error",
+            {},
+            io.BytesIO(json.dumps({"error": {"code": code}}).encode()),
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", refuse)
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "slack:T1:C123:123.456")
+    monkeypatch.setattr(
+        registry, "_backend", MappingBackend({"CENTAUR_API_URL": "http://api:8000"})
+    )
+
+    exit_code = pull_requests.main(
+        ["create", "acme/widgets", "--head", "feature", "--base", "main", "--title", "T"]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert f"HTTP {status}" in captured.err
+    assert code in captured.err
+    assert ("open the pull request as you normally would" in captured.err) is fallback
+    # The identity switch is retried, never worked around.
+    retry = {
+        "requester_not_applied": "still switching to the current speaker",
+        "no_active_execution": "turn is still starting",
+    }
+    assert ("retry in a few seconds" in captured.err) is (code in retry)
+    if code in retry:
+        assert retry[code] in captured.err
+    assert captured.out == ""
+
+
+@pytest.mark.parametrize(
+    ("body", "fallback"),
+    [
+        # An api-rs from before the route: the router's bare 404.
+        (b"", True),
+        (b"Not Found", True),
+        (b'{"ok":false,"error":"not found"}', True),
+        # A coded 404 is reported as itself, not as a fallback.
+        (b'{"ok":false,"error":"x","code":"pr_binding_not_found"}', False),
+        # `"code": null` is no code, whatever the text contains.
+        (b'{"ok":false,"error":"x","code":null}', True),
+        (b'{"error":{"code":null}}', True),
+        (b'{"code":42}', True),
+        # A coded 404 whose code sits past the displayed 500 characters.
+        (
+            b'{"error":"' + b"x" * 600 + b'","code":"pr_binding_not_found"}',
+            False,
+        ),
+    ],
+)
+def test_create_pull_request_cli_falls_back_on_a_bare_404(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    body: bytes,
+    fallback: bool,
+):
+    import io
+    import urllib.error
+
+    from centaur_sdk import pull_requests
+
+    def refuse(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, io.BytesIO(body))
+
+    monkeypatch.setattr("urllib.request.urlopen", refuse)
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "slack:T1:C123:123.456")
+    monkeypatch.setattr(
+        registry, "_backend", MappingBackend({"CENTAUR_API_URL": "http://api:8000"})
+    )
+
+    exit_code = pull_requests.main(
+        ["create", "acme/widgets", "--head", "feature", "--base", "main", "--title", "T"]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "HTTP 404" in captured.err
+    assert ("open the pull request as you normally would" in captured.err) is fallback
+
+
+def test_create_pull_request_cli_classifies_on_the_whole_body(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    import io
+    import urllib.error
+
+    from centaur_sdk import pull_requests
+
+    def run(status: int, body: bytes) -> str:
+        def refuse(request, timeout):
+            raise urllib.error.HTTPError(request.full_url, status, "Error", {}, io.BytesIO(body))
+
+        monkeypatch.setattr("urllib.request.urlopen", refuse)
+        monkeypatch.setenv("CENTAUR_THREAD_KEY", "slack:T1:C123:123.456")
+        monkeypatch.setattr(
+            registry, "_backend", MappingBackend({"CENTAUR_API_URL": "http://api:8000"})
+        )
+        exit_code = pull_requests.main(
+            ["create", "acme/widgets", "--head", "feature", "--base", "main", "--title", "T"]
+        )
+        assert exit_code == 1
+        return capsys.readouterr().err
+
+    filler = b'"detail":"' + b"x" * 600 + b'",'
+    # A fallback code past the displayed 500 characters still gets the hint, and
+    # the displayed text is truncated.
+    late_fallback = run(403, b"{" + filler + b'"code":"slack_session_required"}')
+    assert "open the pull request as you normally would" in late_fallback
+    assert "slack_session_required" not in late_fallback
+    # So does a retry code.
+    late_retry = run(409, b"{" + filler + b'"code":"no_active_execution"}')
+    assert "turn is still starting" in late_retry
+    # A code that merely appears inside another field's text is not the code.
+    mentioned = run(500, b'{"error":"saw sandbox_mismatch and no_active_execution"}')
+    assert "open the pull request as you normally would" not in mentioned
+    assert "retry in a few seconds" not in mentioned
+    # Not JSON at all, on a non-404, gets no hint either.
+    assert "open the pull request as you normally would" not in run(502, b"sandbox_mismatch")

@@ -31,7 +31,8 @@ use centaur_session_core::{
     SessionMessageInput, ThreadKey,
 };
 use centaur_session_sqlx::{
-    PgSessionStore, ProxyBindingLock, SessionEventListener, SessionStoreError, default_metadata,
+    EXECUTION_REQUESTER_KEY, PgSessionStore, ProxyBindingLock, SessionEventListener,
+    SessionStoreError, default_metadata,
 };
 use centaur_telemetry::{
     record_sandbox_warm_pool_claim, record_session_execution_finished,
@@ -952,6 +953,40 @@ impl SessionRuntime {
         thread_key: &ThreadKey,
     ) -> Result<Option<String>, SessionRuntimeError> {
         Ok(self.store.get_session_title(thread_key).await?)
+    }
+
+    /// The durable store, for callers that own a table of their own, such as
+    /// PR session bindings. Authorization stays the caller's job.
+    pub fn store(&self) -> &PgSessionStore {
+        &self.store
+    }
+
+    /// Creates a pull request through `sandbox_id`'s own credential-injecting
+    /// proxy (see [`SandboxBackend::create_github_pull_request`]), so GitHub
+    /// authors it as the human that proxy is bound to. The caller must have
+    /// established that the sandbox belongs to the session it acts for, and
+    /// must verify the response before trusting it. `placeholder` binds the
+    /// call to the identity the caller validated (see
+    /// [`centaur_sandbox_core::PrOauthPlaceholder`]).
+    pub async fn create_github_pull_request(
+        &self,
+        sandbox_id: &str,
+        owner: &str,
+        repo: &str,
+        placeholder: &centaur_sandbox_core::PrOauthPlaceholder,
+        payload: Value,
+    ) -> Result<centaur_sandbox_core::ProxyHttpsResponse, SessionRuntimeError> {
+        Ok(self
+            .sandbox_runtime
+            .manager
+            .create_github_pull_request(
+                &SandboxId::new(sandbox_id),
+                owner,
+                repo,
+                placeholder,
+                payload,
+            )
+            .await?)
     }
 
     /// Load the durable session for API resource authorization.
@@ -2483,6 +2518,19 @@ impl SessionRuntime {
                     return Err(error);
                 }
             };
+            // Record what this execution intends before binding it to the
+            // sandbox's proxy, so a caller acting in the turn can be checked
+            // against api-rs's own record rather than anything it claims.
+            if let Err(error) = self
+                .store
+                .set_execution_requester(&execution.execution_id, requester_principal_id.as_deref())
+                .await
+            {
+                let error = SessionRuntimeError::Store(error);
+                self.record_execution_failure(thread_key, &execution.execution_id, &error)
+                    .await;
+                return Err(error);
+            }
             let desired_capabilities = match pre_resolved_sandbox_capabilities {
                 Some(capabilities) => capabilities,
                 None => match self
@@ -3183,7 +3231,7 @@ impl SessionRuntime {
                 // recreates the proxy from the requester annotation, so a
                 // turn-end unbind must not interleave with either step.
                 let _binding = match iron_control_principal {
-                    Some(_) => lock_proxy_binding_for_unbind(&self.store, thread_key).await?,
+                    Some(_) => lock_proxy_binding_for_rebind(&self.store, thread_key).await?,
                     None => None,
                 };
                 match self.sandbox_runtime.manager.status(&id).await {
@@ -6403,6 +6451,21 @@ async fn lock_proxy_binding_for_unbind(
     Ok(Some(store.lock_proxy_binding(thread_key).await?))
 }
 
+/// The thread's proxy-binding lock for rebinding a reused or resumed
+/// sandbox's proxy to the turn's requester: held for Linear threads, whose
+/// requester is also unbound at turn end, and for Slack threads, where a
+/// speaker change rebinds the proxy and a pull request created at that moment
+/// would otherwise be authored with the next speaker's token. `None` elsewhere.
+async fn lock_proxy_binding_for_rebind(
+    store: &PgSessionStore,
+    thread_key: &ThreadKey,
+) -> Result<Option<ProxyBindingLock>, SessionRuntimeError> {
+    if !unbinds_requester_at_turn_end(thread_key) && !thread_key.as_str().starts_with("slack:") {
+        return Ok(None);
+    }
+    Ok(Some(store.lock_proxy_binding(thread_key).await?))
+}
+
 async fn release_turn_requester(
     ctx: &RuntimeContext,
     thread_key: &ThreadKey,
@@ -8132,6 +8195,10 @@ fn execution_metadata(
 ) -> Value {
     let mut metadata = default_metadata(metadata);
     if let Value::Object(object) = &mut metadata {
+        // The requester record is api-rs's alone (see
+        // `PgSessionStore::set_execution_requester`); a caller cannot plant
+        // one for the PR-creation check to read.
+        object.remove(EXECUTION_REQUESTER_KEY);
         // A persona-pinned model overrides whatever model the caller recorded.
         if let Some(model) = persona_model {
             object.insert("model".to_owned(), json!(model));
@@ -9049,6 +9116,24 @@ mod tests {
         assert_eq!(
             sandbox_dead_detail(&SandboxStatus::Created, None),
             "sandbox no longer accepts io (status Created)"
+        );
+    }
+
+    #[test]
+    fn caller_metadata_never_carries_the_execution_requester_record() {
+        let metadata = execution_metadata(
+            Some(json!({
+                "source": "test",
+                "centaur.requester": {"principal_id": "prn_alice"},
+            })),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(metadata["source"], "test");
+        assert!(
+            metadata.get(EXECUTION_REQUESTER_KEY).is_none(),
+            "{metadata}"
         );
     }
 
@@ -12112,6 +12197,16 @@ mod adoption_tests {
 
         let spec = backend.created_specs().pop().expect("created cold spec");
         assert_eq!(spec.iron_control_requester_principal, None);
+        // api-rs recorded, before binding, that this turn runs without one.
+        let recorded = store
+            .latest_execution_for_thread(&thread_key)
+            .await
+            .expect("load execution")
+            .expect("execution exists");
+        assert_eq!(
+            centaur_session_sqlx::execution_requester(&recorded),
+            Some(None)
+        );
         assert!(
             !requests
                 .lock()
@@ -12886,6 +12981,140 @@ mod adoption_tests {
             .expect("load session")
             .sandbox_id
             .expect("session has a sandbox")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_requester_record_planted_in_caller_metadata_is_never_api_rs_s() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let thread_key = ThreadKey::parse(format!(
+            "slack:T123:C123:{}.000100",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let runtime = runtime_with(&store, backend);
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+
+        let queued = runtime
+            .enqueue_session_execution(
+                &thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: None,
+                    metadata: Some(json!({
+                        "centaur.requester": {"principal_id": "prn_alice"},
+                        "source": "attacker",
+                    })),
+                    input_lines: vec![
+                        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#
+                            .to_owned(),
+                    ],
+                    idle_timeout_ms: None,
+                    max_duration_ms: None,
+                },
+            )
+            .await
+            .expect("enqueue");
+
+        let stored = store
+            .latest_execution_for_thread(&thread_key)
+            .await
+            .expect("load execution")
+            .expect("execution exists");
+        assert_eq!(stored.execution_id, queued.execution_id);
+        assert_eq!(stored.metadata["source"], "attacker");
+        assert!(stored.metadata.get(EXECUTION_REQUESTER_KEY).is_none());
+        assert_eq!(centaur_session_sqlx::execution_requester(&stored), None);
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slack_rebind_waits_for_the_proxy_binding_lock() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let (base_url, _requests, server) = spawn_execute_iron_control_stub().await;
+        let thread_key = ThreadKey::parse(format!(
+            "slack:T123:C123:{}.000100",
+            uuid::Uuid::new_v4().simple()
+        ))
+        .unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime =
+            runtime_with_registrar(&store, backend.clone(), requester_test_registrar(base_url));
+        runtime
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .expect("create session");
+        execute_with_metadata(&runtime, &thread_key, json!({})).await;
+        stdout
+            .write_all(&completed_output_bytes("Done."))
+            .await
+            .expect("write terminal output");
+        wait_for_event(&store, &thread_key, "session.execution_completed").await;
+        assert!(backend.proxy_ensures().is_empty());
+
+        // The next turn reuses the sandbox and rebinds its proxy. While a
+        // pull-request creation holds the thread's lock, the rebind waits.
+        let (io, _stdout, _stdin) = mock_io();
+        backend.push_io(io).await;
+        let binding = store
+            .lock_proxy_binding(&thread_key)
+            .await
+            .expect("take the proxy-binding lock");
+        runtime
+            .enqueue_session_execution(
+                &thread_key,
+                ExecuteSessionInput {
+                    idempotency_key: None,
+                    metadata: Some(json!({})),
+                    input_lines: vec![
+                        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"again"}]}}"#
+                            .to_owned(),
+                    ],
+                    idle_timeout_ms: None,
+                    max_duration_ms: None,
+                },
+            )
+            .await
+            .expect("enqueue the next turn");
+        sleep(Duration::from_millis(400)).await;
+        assert!(
+            backend.proxy_ensures().is_empty(),
+            "the Slack rebind waits while the lock is held"
+        );
+
+        drop(binding);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while backend.proxy_ensures().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the rebind never ran after the lock was released"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
+        reset_test_store(&store).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

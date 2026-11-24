@@ -213,6 +213,61 @@ export type GithubbotThreadState = {
   reviewedDeliveryIds?: string[];
 };
 
+/** A `pr_session_bindings` row as api-rs returns it (fields githubbot reads). */
+export type PrBinding = {
+  repository: string;
+  number: number;
+  thread_key: string;
+  /** GitHub node id of the exact PR this binding was created for. */
+  pr_node_id: string;
+  /** Compare-and-set token: a state write may name the revision it was derived from. */
+  revision: number;
+  head_sha: string;
+  managed: boolean;
+  closed: boolean;
+};
+
+export type PrBindingStateUpdate = {
+  /** Must equal the binding's `pr_node_id`; api-rs refuses a mismatch. */
+  pr_node_id: string;
+  /**
+   * `updated_at` (RFC3339) of the fetched PR the write was derived from. api-rs
+   * applies a write only if it is not older than the last one it applied.
+   */
+  observed_updated_at: string;
+  /**
+   * The binding `revision` read before the fresh GitHub fetch this write was
+   * derived from. Resolves an equal-`updated_at` tie: a contradicting write
+   * applies only if nothing else was written since.
+   */
+  expected_revision?: number;
+  managed?: boolean;
+  closed?: boolean;
+  head_sha?: string;
+};
+
+/** A failed-CI observation, filled from a fresh GitHub fetch just before sending. */
+export type PrCiFailureReport = {
+  /** Must equal the binding's `pr_node_id`; api-rs refuses a mismatch. */
+  pr_node_id: string;
+  /** `updated_at` (RFC3339) of the fresh PR fetch this report was built from. */
+  observed_updated_at: string;
+  head_sha: string;
+  current_head_sha: string;
+  /** Lowercased `owner/repo` the PR lives under now, which a rename may have changed. */
+  current_repository: string;
+  current_number: number;
+  open: boolean;
+  assigned: boolean;
+  check_name: string;
+  details_url?: string;
+  html_url: string;
+};
+
+export type PrCiFailureResult =
+  | { notice: "posted" | "duplicate"; reason?: undefined }
+  | { notice: "skipped"; reason: string };
+
 export type GithubbotRendererSource = RustSessionStreamEvent | JsonObject;
 
 export type GithubbotTrace = {

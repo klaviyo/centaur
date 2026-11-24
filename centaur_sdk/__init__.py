@@ -2,6 +2,7 @@
 
 Public API:
     secret(key)       — resolve a secret via the pluggable backend
+    create_pull_request(repository, head, base, title) — open a PR bound to this session
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ from __future__ import annotations
 from centaur_sdk.tool_sdk import (
     ToolContext,
     company_context_database_url,
+    create_pull_request,
     current_chat_destination,
     current_discord_thread,
     current_github_thread,
@@ -29,6 +31,7 @@ from centaur_sdk.tool_sdk import (
 __all__ = [
     "ToolContext",
     "company_context_database_url",
+    "create_pull_request",
     "current_chat_destination",
     "current_discord_thread",
     "current_github_thread",

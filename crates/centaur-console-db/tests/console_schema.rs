@@ -8,10 +8,12 @@ use std::env;
 
 use active_record_encryption::ActiveRecordEncryption;
 use centaur_console_db::{
-    ApiClient, ApiClientPrincipal, REDACTED, SecretValues, SlackChannelPermission, Subject,
-    api_client_principals, build_config, find_api_client, find_direct_slack_channel_permission,
+    ApiClient, ApiClientPrincipal, PR_CREATE_GUARD_PATH, REDACTED, SecretValues,
+    SlackChannelPermission, Subject, api_client_principals, build_config,
+    build_config_with_github_user_id, find_api_client, find_direct_slack_channel_permission,
     find_principal, find_principal_by_foreign_id, find_user_id_by_email, models::Config,
 };
+use centaur_sandbox_core::{PR_OAUTH_PLACEHOLDER_PREFIX, PrOauthPlaceholder};
 use serde_json::{Value, json};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 
@@ -21,6 +23,19 @@ const SALT: &str = "dev_ar_encryption_key_derivation_salt_000000000";
 const ENCRYPTED: &str =
     r#"{"p":"xOiyro9XYBkfABUF","h":{"iv":"pCjJC5SxH78ZN0Nm","at":"s9DIUyHAkF8ZAthKO6ROtw=="}}"#;
 const PLAINTEXT: &str = "known secret";
+
+/// An obviously fake GitHub OAuth App user token.
+fn oauth_token() -> String {
+    format!("gho_{}", "A".repeat(36))
+}
+
+/// `token` encrypted the way Console stores it. Key derivation is slow, so the
+/// encryption is built once.
+fn encrypt(token: &str) -> String {
+    static ENCRYPTION: std::sync::LazyLock<ActiveRecordEncryption> =
+        std::sync::LazyLock::new(|| ActiveRecordEncryption::new(PRIMARY_KEY, SALT));
+    ENCRYPTION.encrypt(token).unwrap()
+}
 
 async fn database() -> Option<PgPool> {
     let Ok(url) = env::var("CONSOLE_DB_TEST_DATABASE_URL") else {
@@ -38,6 +53,30 @@ async fn database() -> Option<PgPool> {
             .await
             .expect("connect to the test database"),
     )
+}
+
+/// How a brokered test credential reaches the proxy.
+#[derive(Clone, Copy)]
+enum Wrapper {
+    /// Console's canonical `github_token`: a `GITHUB_TOKEN` placeholder
+    /// replacement in `Authorization`, on the whole host.
+    Canonical,
+    /// A custom secret that injects `Authorization` directly.
+    Injected,
+    /// The canonical replacement, but its rule allows only `GET`.
+    ReadOnly,
+}
+
+/// The OAuth app and connection behind a brokered test credential.
+#[derive(Clone, Copy)]
+struct App {
+    owner_only: bool,
+    shared: bool,
+    /// The Console user who connected the credential.
+    connected_by: i64,
+    wrapper: Wrapper,
+    /// Whether any requester granted the wrapper directly may use it.
+    always_available: bool,
 }
 
 struct Fixture {
@@ -135,6 +174,139 @@ impl Fixture {
         .fetch_one(&self.pool)
         .await
         .unwrap()
+    }
+
+    /// A personal GitHub-style app (neither shared nor owner-only) whose
+    /// connection the admin user made.
+    fn personal(&self) -> App {
+        App {
+            owner_only: false,
+            shared: false,
+            connected_by: self.admin,
+            wrapper: Wrapper::Canonical,
+            always_available: false,
+        }
+    }
+
+    /// Another Console user, who can connect credentials of their own.
+    async fn other_user(&self, label: &str) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO users (email, admin, status, created_at, updated_at) \
+             VALUES ($1, false, 'active', now(), now()) RETURNING id",
+        )
+        .bind(format!("{}@example.com", self.name(label)))
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
+    /// A `console_user` principal for the admin user, the owner of the
+    /// credentials `brokered_token` creates.
+    async fn owner_principal(&self, label: &str) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO principals (foreign_id, name, kind, labels, console_user_id, created_by_id, created_at, updated_at) \
+             VALUES ($1, 'Owner', 'console_user', '{}', $2, $2, now(), now()) RETURNING id",
+        )
+        .bind(self.name(label))
+        .bind(self.admin)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
+    /// A brokered token for `provider` account `subject`, wrapped in a static
+    /// secret that injects `Authorization` on `host`, and granted directly to
+    /// `principal` at `priority`. The app is `owner_only` as given; Console
+    /// delivers an owner-only token only to the owner's own principal
+    /// (`owner_principal`). Returns the static secret's id.
+    #[allow(clippy::too_many_arguments)]
+    async fn brokered_token(
+        &self,
+        principal: i64,
+        label: &str,
+        provider: &str,
+        subject: Option<&str>,
+        host: &str,
+        priority: i32,
+        app_shape: App,
+    ) -> i64 {
+        let app: i64 = sqlx::query_scalar(
+            "INSERT INTO oauth_apps (slug, provider, client_id, owner_only, shared, always_available, created_by_id, created_at, updated_at) \
+             VALUES ($1, $2, 'client', $3, $4, $6, $5, now(), now()) RETURNING id",
+        )
+        .bind(self.name(label))
+        .bind(provider)
+        .bind(app_shape.owner_only)
+        .bind(app_shape.shared)
+        .bind(self.admin)
+        .bind(app_shape.always_available)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        let broker: i64 = sqlx::query_scalar(
+            "INSERT INTO broker_credentials (foreign_id, token_endpoint, access_token, oauth_app_id, provider_subject, created_by_id, created_at, updated_at) \
+             VALUES ($1, 'https://idp.example/token', $2, $3, $4, $5, now(), now()) RETURNING id",
+        )
+        .bind(self.name(label))
+        .bind(encrypt(&oauth_token()))
+        .bind(app)
+        .bind(subject)
+        .bind(app_shape.connected_by)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        let secret: i64 = sqlx::query_scalar(
+            "INSERT INTO static_secrets (foreign_id, inject_config, replace_config, broker_credential_id, created_by_id, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, now(), now()) RETURNING id",
+        )
+        .bind(self.name(label))
+        .bind(match app_shape.wrapper {
+            Wrapper::Injected => Some(json!({ "header": "Authorization" })),
+            Wrapper::Canonical | Wrapper::ReadOnly => None,
+        })
+        .bind(match app_shape.wrapper {
+            Wrapper::Injected => None,
+            Wrapper::Canonical | Wrapper::ReadOnly => Some(json!({
+                "proxy_value": "GITHUB_TOKEN",
+                "match_headers": ["Authorization"],
+                "require": false,
+            })),
+        })
+        .bind(broker)
+        .bind(self.admin)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        self.source(
+            "static_secret_id",
+            secret,
+            "token_broker",
+            None,
+            Some(broker),
+        )
+        .await;
+        self.rule("static_secret_id", secret, host).await;
+        if matches!(app_shape.wrapper, Wrapper::ReadOnly) {
+            sqlx::query(
+                "UPDATE request_rules SET http_methods = '[\"GET\"]' WHERE static_secret_id = $1",
+            )
+            .bind(secret)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO grants (principal_id, static_secret_id, priority, created_by_id, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, now(), now())",
+        )
+        .bind(principal)
+        .bind(secret)
+        .bind(priority)
+        .bind(self.admin)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+        secret
     }
 
     async fn source(
@@ -458,4 +630,807 @@ async fn reads_api_clients_and_their_principals() {
             },
         ]
     );
+}
+
+/// The delivered config and the GitHub account derived with it, in one call.
+async fn github_config(fixture: &Fixture, principal: i64) -> (Config, Option<String>) {
+    github_config_for(fixture, principal, None).await
+}
+
+async fn github_config_for(
+    fixture: &Fixture,
+    principal: i64,
+    requester: Option<i64>,
+) -> (Config, Option<String>) {
+    let encryption = ActiveRecordEncryption::new(PRIMARY_KEY, SALT);
+    let empty = json!([]);
+    let labels = json!({});
+    let subject = Subject {
+        principal_id: principal,
+        principal: None,
+        console_user_id: None,
+        console_user_email: None,
+        slack_history_channel_ids: &empty,
+        proxy_labels: &labels,
+    };
+    build_config_with_github_user_id(
+        &fixture.pool,
+        SecretValues::Live(&encryption),
+        &subject,
+        requester,
+    )
+    .await
+    .unwrap()
+}
+
+async fn github_account(fixture: &Fixture, principal: i64) -> Option<String> {
+    github_config(fixture, principal).await.1
+}
+
+/// The `Authorization` secrets the config delivers for `api.github.com`.
+fn github_secrets(config: &Config) -> Vec<&Value> {
+    config
+        .secrets
+        .iter()
+        .filter(|secret| {
+            secret["replace"]["proxy_value"] == "GITHUB_TOKEN"
+                && secret["rules"] == json!([{ "host": "api.github.com" }])
+        })
+        .collect()
+}
+
+fn is_pr_oauth_placeholder(value: &Value) -> bool {
+    value
+        .as_str()
+        .is_some_and(|value| value.starts_with(PR_OAUTH_PLACEHOLDER_PREFIX))
+}
+
+/// The guards in `config`: secrets under the PR-create OAuth placeholder, in
+/// `secrets` or inside any `secrets` transform. A healthy config has exactly
+/// one, in the last transform.
+fn pr_oauth_secrets(config: &Config) -> Vec<&Value> {
+    let in_secrets = config
+        .secrets
+        .iter()
+        .filter(|secret| is_pr_oauth_placeholder(&secret["replace"]["proxy_value"]));
+    let in_transforms = config
+        .transforms
+        .iter()
+        .filter(|transform| transform["name"] == "secrets")
+        .flat_map(|transform| {
+            transform["config"]["secrets"]
+                .as_array()
+                .into_iter()
+                .flatten()
+        })
+        .filter(|secret| is_pr_oauth_placeholder(&secret["replace"]["proxy_value"]));
+    in_secrets.chain(in_transforms).collect()
+}
+
+/// The sentinel the guard carries when no account is attested.
+fn sentinel() -> Value {
+    json!({"type": "control_plane", "value": "centaur-unattested-oauth"})
+}
+
+/// The guard's placeholder, the `proxy_value` of the last transform's secret.
+fn guard_placeholder(config: &Config) -> String {
+    config.transforms.last().unwrap()["config"]["secrets"][0]["replace"]["proxy_value"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// The guard of a config with no attested account: the fixed unattested
+/// placeholder, with the sentinel source.
+fn assert_unattested_guard(config: &Config) {
+    assert_eq!(assert_guard_last(config), sentinel());
+    assert_eq!(guard_placeholder(config), "CENTAUR_PR_OAUTH_UNATTESTED");
+}
+
+/// Checks that `config` ends with exactly one PR-create guard: the last
+/// element of `transforms`, a `secrets` transform holding that one secret,
+/// `require: true`, for the one create operation, and that nothing is in
+/// `secrets`. A managed proxy runs `secrets` first and then each transform in
+/// order, so only the last transform can be the last `Authorization` writer.
+/// Returns the guard's source.
+fn assert_guard_last(config: &Config) -> Value {
+    assert!(
+        config
+            .secrets
+            .iter()
+            .all(|secret| !is_pr_oauth_placeholder(&secret["replace"]["proxy_value"])),
+        "the guard must not be in `secrets`"
+    );
+    let guards = pr_oauth_secrets(config);
+    assert_eq!(guards.len(), 1, "{guards:?}");
+    let last = config.transforms.last().expect("a trailing transform");
+    assert_eq!(last["name"], "secrets");
+    assert_eq!(last["config"]["secrets"].as_array().map(Vec::len), Some(1));
+    assert_eq!(&last["config"]["secrets"][0], guards[0]);
+    // An identity-bound placeholder: placeholder-safe, and never one the
+    // generic `GITHUB_TOKEN` replacement could match.
+    let placeholder = guard_placeholder(config);
+    assert!(
+        placeholder
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'),
+        "{placeholder}"
+    );
+    assert!(!placeholder.contains("GITHUB_TOKEN"), "{placeholder}");
+    assert_eq!(
+        guards[0]["replace"],
+        json!({
+            "proxy_value": placeholder,
+            "match_headers": ["Authorization"],
+            "require": true,
+        })
+    );
+    assert_eq!(
+        guards[0]["rules"],
+        json!([{
+            "host": "api.github.com",
+            "methods": ["POST"],
+            // The marker path api-rs's one create call sends to; ordinary
+            // `/repos/*/*/pulls` creation is not guarded.
+            "paths": ["//repos/*/*/pulls"],
+        }])
+    );
+    assert_eq!(PR_CREATE_GUARD_PATH, "//repos/*/*/pulls");
+    assert!(guards[0].get("inject").is_none());
+    guards[0]["source"].clone()
+}
+
+#[tokio::test]
+async fn the_pr_create_guard_is_in_every_build_and_names_the_attested_credential() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    // Nothing granted: the guard is still there, with the sentinel.
+    let actor = fixture.owner_principal("pr-oauth").await;
+    let (config, account) = github_config(&fixture, actor).await;
+    assert_eq!(account, None);
+    assert_unattested_guard(&config);
+
+    fixture
+        .brokered_token(
+            actor,
+            "github-pr-oauth",
+            "github",
+            Some("90210001"),
+            "api.github.com",
+            100,
+            fixture.personal(),
+        )
+        .await;
+    let (config, account) = github_config(&fixture, actor).await;
+    assert_eq!(account.as_deref(), Some("90210001"));
+
+    // Attested: the guard carries the credential's own delivered source.
+    let delivered = github_secrets(&config);
+    assert_eq!(delivered.len(), 1);
+    let source = assert_guard_last(&config);
+    assert_eq!(source, delivered[0]["source"]);
+    assert_eq!(source["type"], "control_plane");
+    assert_ne!(source, sentinel());
+    // Its placeholder names the account and, with no requester bound, NONE.
+    assert_eq!(
+        guard_placeholder(&config),
+        "CENTAUR_PR_OAUTH_U90210001_NONE"
+    );
+
+    // The plain config (Console's effective-config preview, for one) never
+    // carries it.
+    let encryption = ActiveRecordEncryption::new(PRIMARY_KEY, SALT);
+    let empty = json!([]);
+    let labels = json!({});
+    let subject = Subject {
+        principal_id: actor,
+        principal: None,
+        console_user_id: None,
+        console_user_email: None,
+        slack_history_channel_ids: &empty,
+        proxy_labels: &labels,
+    };
+    let plain = build_config(
+        &fixture.pool,
+        SecretValues::Live(&encryption),
+        &subject,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(pr_oauth_secrets(&plain).is_empty());
+
+    // An equal competitor leaves the account unattested: the guard stays, now
+    // with the sentinel instead of either token.
+    fixture
+        .brokered_token(
+            actor,
+            "github-pr-oauth-competing",
+            "github",
+            Some("90210002"),
+            "api.github.com",
+            100,
+            fixture.personal(),
+        )
+        .await;
+    let (config, account) = github_config(&fixture, actor).await;
+    assert_eq!(account, None);
+    assert_unattested_guard(&config);
+}
+
+#[tokio::test]
+async fn the_guard_placeholder_differs_per_account_and_requester() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    // Alice's connection, usable by whoever's turn it is when she is the
+    // requester (an always-available wrapper granted to her directly).
+    let alice = fixture.owner_principal("placeholder-alice").await;
+    fixture
+        .brokered_token(
+            alice,
+            "github-placeholder-alice",
+            "github",
+            Some("90210001"),
+            "api.github.com",
+            100,
+            App {
+                always_available: true,
+                ..fixture.personal()
+            },
+        )
+        .await;
+    let channel = fixture.principal("placeholder-channel").await;
+
+    // Alone, Alice is her own actor: no requester in the placeholder.
+    let (config, account) = github_config(&fixture, alice).await;
+    assert_eq!(account.as_deref(), Some("90210001"));
+    let alone = guard_placeholder(&config);
+    assert_eq!(alone, "CENTAUR_PR_OAUTH_U90210001_NONE");
+
+    // On the channel's proxy with Alice as requester, the same account gets a
+    // placeholder naming her.
+    let (config, account) = github_config_for(&fixture, channel, Some(alice)).await;
+    assert_eq!(account.as_deref(), Some("90210001"));
+    let with_requester = guard_placeholder(&config);
+    assert_eq!(
+        with_requester,
+        PrOauthPlaceholder::derive("90210001", Some(&centaur_console_db::oid("prn", alice)))
+            .unwrap()
+            .as_str()
+    );
+    assert_ne!(with_requester, alone);
+    assert_guard_last(&config);
+
+    // A different account: a different placeholder, even for the same
+    // requester shape.
+    let bob = fixture.owner_principal("placeholder-bob").await;
+    fixture
+        .brokered_token(
+            bob,
+            "github-placeholder-bob",
+            "github",
+            Some("90210002"),
+            "api.github.com",
+            100,
+            App {
+                always_available: true,
+                ..fixture.personal()
+            },
+        )
+        .await;
+    let (config, account) = github_config_for(&fixture, channel, Some(bob)).await;
+    assert_eq!(account.as_deref(), Some("90210002"));
+    let bobs = guard_placeholder(&config);
+    assert_ne!(bobs, with_requester);
+
+    // Nothing attested: the fixed unattested placeholder.
+    let nobody = fixture.owner_principal("placeholder-nobody").await;
+    let (config, account) = github_config(&fixture, nobody).await;
+    assert_eq!(account, None);
+    assert_unattested_guard(&config);
+}
+
+#[tokio::test]
+async fn a_direct_injector_or_a_narrow_rule_gives_no_claim_and_a_sentinel_guard() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    // A custom secret injecting Authorization directly on api.github.com.
+    let injected = fixture.owner_principal("injected").await;
+    fixture
+        .brokered_token(
+            injected,
+            "github-injected",
+            "github",
+            Some("90210001"),
+            "api.github.com",
+            100,
+            App {
+                wrapper: Wrapper::Injected,
+                ..fixture.personal()
+            },
+        )
+        .await;
+    let (config, account) = github_config(&fixture, injected).await;
+    assert_eq!(account, None);
+    assert_unattested_guard(&config);
+
+    // The canonical replacement, but only for GET.
+    let read_only = fixture.owner_principal("read-only").await;
+    fixture
+        .brokered_token(
+            read_only,
+            "github-read-only",
+            "github",
+            Some("90210001"),
+            "api.github.com",
+            100,
+            App {
+                wrapper: Wrapper::ReadOnly,
+                ..fixture.personal()
+            },
+        )
+        .await;
+    let (config, account) = github_config(&fixture, read_only).await;
+    assert_eq!(account, None);
+    assert_unattested_guard(&config);
+}
+
+#[tokio::test]
+async fn a_transform_targeting_the_api_host_withdraws_the_claim() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let actor = fixture.owner_principal("transform").await;
+    fixture
+        .brokered_token(
+            actor,
+            "github-transform",
+            "github",
+            Some("90210001"),
+            "api.github.com",
+            100,
+            fixture.personal(),
+        )
+        .await;
+    assert_eq!(
+        github_account(&fixture, actor).await.as_deref(),
+        Some("90210001")
+    );
+
+    // A GCP auth transform on another host leaves the claim alone ...
+    let gcp: i64 = sqlx::query_scalar(
+        "INSERT INTO gcp_auth_secrets (foreign_id, scopes, created_by_id, created_at, updated_at) \
+         VALUES ($1, '[]', $2, now(), now()) RETURNING id",
+    )
+    .bind(fixture.name("gcp-elsewhere"))
+    .bind(fixture.admin)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    fixture
+        .source(
+            "gcp_auth_secret_id",
+            gcp,
+            "control_plane",
+            Some(ENCRYPTED),
+            None,
+        )
+        .await;
+    fixture
+        .rule("gcp_auth_secret_id", gcp, "storage.example.com")
+        .await;
+    fixture.grant(actor, "gcp_auth_secret_id", gcp).await;
+    assert_eq!(
+        github_account(&fixture, actor).await.as_deref(),
+        Some("90210001")
+    );
+    // The transform is delivered, and the guard still comes after it.
+    let (config, _) = github_config(&fixture, actor).await;
+    assert_eq!(config.transforms.len(), 2);
+    assert_eq!(config.transforms[0]["name"], "gcp_auth");
+    assert_ne!(assert_guard_last(&config), sentinel());
+
+    // ... and one that targets api.github.com withdraws it, leaving the guard
+    // (still last, after the transform) with the sentinel.
+    fixture
+        .rule("gcp_auth_secret_id", gcp, "api.github.com")
+        .await;
+    let (config, account) = github_config(&fixture, actor).await;
+    assert_eq!(account, None);
+    assert_eq!(config.transforms.len(), 2);
+    assert_eq!(config.transforms[0]["name"], "gcp_auth");
+    assert_unattested_guard(&config);
+}
+
+#[tokio::test]
+async fn the_account_is_derived_from_the_credentials_the_config_delivers() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let actor = fixture.owner_principal("one-load").await;
+    fixture
+        .brokered_token(
+            actor,
+            "github-delivered",
+            "github",
+            Some("90210001"),
+            "api.github.com",
+            100,
+            fixture.personal(),
+        )
+        .await;
+
+    // The account is the one behind the single GitHub secret in the config.
+    let (config, account) = github_config(&fixture, actor).await;
+    assert_eq!(account.as_deref(), Some("90210001"));
+    assert_eq!(github_secrets(&config).len(), 1);
+
+    // A weaker competitor is withheld from the config, so it neither changes
+    // the account nor appears.
+    fixture
+        .brokered_token(
+            actor,
+            "github-withheld",
+            "github",
+            Some("90210002"),
+            "api.github.com",
+            0,
+            fixture.personal(),
+        )
+        .await;
+    let (config, account) = github_config(&fixture, actor).await;
+    assert_eq!(account.as_deref(), Some("90210001"));
+    assert_eq!(github_secrets(&config).len(), 1);
+
+    // An equal competitor is delivered too, so the config carries two and no
+    // account is claimed.
+    fixture
+        .brokered_token(
+            actor,
+            "github-competing",
+            "github",
+            Some("90210003"),
+            "api.github.com",
+            100,
+            fixture.personal(),
+        )
+        .await;
+    let (config, account) = github_config(&fixture, actor).await;
+    assert_eq!(account, None);
+    assert_eq!(github_secrets(&config).len(), 2);
+
+    // A token that cannot be delivered (none minted yet) is in neither.
+    let undelivered = fixture.owner_principal("one-load-undelivered").await;
+    let secret = fixture
+        .brokered_token(
+            undelivered,
+            "github-undelivered",
+            "github",
+            Some("90210004"),
+            "api.github.com",
+            100,
+            fixture.personal(),
+        )
+        .await;
+    sqlx::query(
+        "UPDATE broker_credentials SET access_token = NULL \
+         WHERE id = (SELECT broker_credential_id FROM static_secrets WHERE id = $1)",
+    )
+    .bind(secret)
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    let (config, account) = github_config(&fixture, undelivered).await;
+    assert_eq!(account, None);
+    assert!(github_secrets(&config).is_empty());
+}
+
+/// Sets the access token stored on the broker credential behind `secret`.
+async fn set_broker_token(fixture: &Fixture, secret: i64, token: &str) {
+    sqlx::query(
+        "UPDATE broker_credentials SET access_token = $2 \
+         WHERE id = (SELECT broker_credential_id FROM static_secrets WHERE id = $1)",
+    )
+    .bind(secret)
+    .bind(encrypt(token))
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn only_a_github_oauth_app_user_token_is_attested() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let principal = fixture.owner_principal("token-kind").await;
+    let secret = fixture
+        .brokered_token(
+            principal,
+            "github-token-kind",
+            "github",
+            Some("90210001"),
+            "api.github.com",
+            100,
+            fixture.personal(),
+        )
+        .await;
+
+    // A valid OAuth App user token is attested: the claim, and a guard that
+    // delivers that very token under the account's placeholder.
+    let (config, account) = github_config(&fixture, principal).await;
+    assert_eq!(account.as_deref(), Some("90210001"));
+    assert_eq!(
+        assert_guard_last(&config),
+        json!({"type": "control_plane", "value": oauth_token()})
+    );
+    assert_eq!(
+        guard_placeholder(&config),
+        "CENTAUR_PR_OAUTH_U90210001_NONE"
+    );
+
+    // The same eligible row (right app, owner, subject, sharing) holding any
+    // other kind of token is not: no claim, the sentinel, the unattested
+    // placeholder, and the token appears in no guard.
+    let alnum = "A".repeat(36);
+    for (label, token) in [
+        ("classic personal access token", format!("ghp_{alnum}")),
+        (
+            "fine-grained personal access token",
+            format!("github_pat_{alnum}_{alnum}"),
+        ),
+        ("empty token", String::new()),
+        ("gho_ with a non-alphanumeric", format!("gho_{alnum}-A")),
+        ("gho_ alone", "gho_".to_owned()),
+        ("no prefix", alnum.clone()),
+    ] {
+        set_broker_token(&fixture, secret, &token).await;
+        let (config, account) = github_config(&fixture, principal).await;
+        assert_eq!(account, None, "{label}");
+        assert_unattested_guard(&config);
+        assert!(
+            token.is_empty() || !pr_guard_json(&config).contains(&token),
+            "{label}"
+        );
+    }
+
+    // Restored to an OAuth token, it attests again.
+    set_broker_token(&fixture, secret, &oauth_token()).await;
+    assert_eq!(
+        github_account(&fixture, principal).await.as_deref(),
+        Some("90210001")
+    );
+}
+
+/// The guard transform, serialized, for a search of what it carries.
+fn pr_guard_json(config: &Config) -> String {
+    config.transforms.last().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn names_the_github_account_behind_the_token_injected_for_the_api_host() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let principal = fixture.owner_principal("principal").await;
+    assert_eq!(github_account(&fixture, principal).await, None);
+
+    fixture
+        .brokered_token(
+            principal,
+            "github",
+            "github",
+            Some("90210001"),
+            "api.github.com",
+            100,
+            fixture.personal(),
+        )
+        .await;
+    assert_eq!(
+        github_account(&fixture, principal).await.as_deref(),
+        Some("90210001")
+    );
+
+    // A weaker competing grant is withheld by the proxy, so it neither
+    // changes the answer nor makes it ambiguous.
+    fixture
+        .brokered_token(
+            principal,
+            "weaker",
+            "github",
+            Some("90210002"),
+            "api.github.com",
+            0,
+            fixture.personal(),
+        )
+        .await;
+    assert_eq!(
+        github_account(&fixture, principal).await.as_deref(),
+        Some("90210001")
+    );
+
+    // An equal-strength competitor leaves two credentials writing the header.
+    fixture
+        .brokered_token(
+            principal,
+            "equal",
+            "github",
+            Some("90210003"),
+            "api.github.com",
+            100,
+            fixture.personal(),
+        )
+        .await;
+    assert_eq!(github_account(&fixture, principal).await, None);
+}
+
+#[tokio::test]
+async fn only_a_github_app_with_a_subject_names_an_account() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let other_provider = fixture.owner_principal("other-provider").await;
+    fixture
+        .brokered_token(
+            other_provider,
+            "slack",
+            "slack",
+            Some("90210001"),
+            "api.github.com",
+            100,
+            fixture.personal(),
+        )
+        .await;
+    assert_eq!(github_account(&fixture, other_provider).await, None);
+
+    let no_subject = fixture.owner_principal("no-subject").await;
+    fixture
+        .brokered_token(
+            no_subject,
+            "github-no-subject",
+            "github",
+            None,
+            "api.github.com",
+            100,
+            fixture.personal(),
+        )
+        .await;
+    assert_eq!(github_account(&fixture, no_subject).await, None);
+
+    let other_host = fixture.owner_principal("other-host").await;
+    fixture
+        .brokered_token(
+            other_host,
+            "github-other-host",
+            "github",
+            Some("90210001"),
+            "github.com",
+            100,
+            fixture.personal(),
+        )
+        .await;
+    assert_eq!(github_account(&fixture, other_host).await, None);
+
+    // A static token stored in Console, not brokered from an OAuth account,
+    // proves no human identity.
+    let shared = fixture.principal("shared").await;
+    let secret = fixture
+        .static_secret("shared", json!({ "header": "Authorization" }), None)
+        .await;
+    fixture
+        .source(
+            "static_secret_id",
+            secret,
+            "control_plane",
+            Some(ENCRYPTED),
+            None,
+        )
+        .await;
+    fixture
+        .rule("static_secret_id", secret, "api.github.com")
+        .await;
+    fixture.grant(shared, "static_secret_id", secret).await;
+    assert_eq!(github_account(&fixture, shared).await, None);
+}
+
+#[tokio::test]
+async fn only_the_actors_own_unshared_connection_names_an_account() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    // A connection the actor made, from an app that is neither shared nor
+    // owner-only, with the numeric GitHub id Console records.
+    let actor = fixture.owner_principal("actor").await;
+    fixture
+        .brokered_token(
+            actor,
+            "github-mine",
+            "github",
+            Some("90210001"),
+            "api.github.com",
+            100,
+            fixture.personal(),
+        )
+        .await;
+    assert_eq!(
+        github_account(&fixture, actor).await.as_deref(),
+        Some("90210001")
+    );
+
+    // Someone else's connection delivered to the actor by a grant (a channel
+    // or role grant, say) is not the actor's token.
+    let channel_actor = fixture.owner_principal("channel-actor").await;
+    let someone_else = fixture.other_user("someone-else").await;
+    fixture
+        .brokered_token(
+            channel_actor,
+            "github-theirs",
+            "github",
+            Some("90210002"),
+            "api.github.com",
+            100,
+            App {
+                connected_by: someone_else,
+                ..fixture.personal()
+            },
+        )
+        .await;
+    assert_eq!(github_account(&fixture, channel_actor).await, None);
+
+    // A shared app serves one connection to many people.
+    let shared = fixture.owner_principal("shared-app").await;
+    fixture
+        .brokered_token(
+            shared,
+            "github-shared-app",
+            "github",
+            Some("90210003"),
+            "api.github.com",
+            100,
+            App {
+                shared: true,
+                ..fixture.personal()
+            },
+        )
+        .await;
+    assert_eq!(github_account(&fixture, shared).await, None);
+
+    // An owner-only connection, shaped like Console's real callback, records
+    // `owner-<console user oid>` and no GitHub id.
+    let owner_only = fixture.owner_principal("owner-only-app").await;
+    fixture
+        .brokered_token(
+            owner_only,
+            "github-owner-only",
+            "github",
+            Some("owner-usr_Xk3D9a"),
+            "api.github.com",
+            100,
+            App {
+                owner_only: true,
+                ..fixture.personal()
+            },
+        )
+        .await;
+    assert_eq!(github_account(&fixture, owner_only).await, None);
+    // ... even if its subject were numeric.
+    let owner_only_numeric = fixture.owner_principal("owner-only-numeric").await;
+    fixture
+        .brokered_token(
+            owner_only_numeric,
+            "github-owner-only-numeric",
+            "github",
+            Some("90210004"),
+            "api.github.com",
+            100,
+            App {
+                owner_only: true,
+                ..fixture.personal()
+            },
+        )
+        .await;
+    assert_eq!(github_account(&fixture, owner_only_numeric).await, None);
 }

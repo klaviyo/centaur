@@ -130,6 +130,22 @@ pub struct SecretSource {
     pub config: Map<String, Value>,
     pub secret: Option<String>,
     pub broker_access_token: Option<String>,
+    /// The OAuth app provider (for example `github`) behind a brokered token.
+    pub broker_provider: Option<String>,
+    /// The provider's stable account id for the person who connected the
+    /// brokered credential.
+    pub broker_provider_subject: Option<String>,
+    /// Whether the brokered credential's OAuth app is `owner_only`. Console
+    /// records such connections under `owner-<console user>`, not a provider
+    /// account id.
+    pub broker_owner_only: Option<bool>,
+    /// Whether the brokered credential's OAuth app is shared, so one
+    /// connection may serve many people.
+    pub broker_shared: Option<bool>,
+    /// Whether the acting human (the requester, else the principal) connected
+    /// the brokered credential themselves: by Console user, or by their
+    /// unambiguous Slack identity.
+    pub broker_owned_by_actor: Option<bool>,
     pub role: Option<String>,
     pub role_kind: Option<String>,
 }

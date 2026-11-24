@@ -17,6 +17,8 @@ const CONSOLE_SERVICE_SUBJECT: &str = "centaur-console";
 const STATIC_ADMIN_IDENTITY: &str = "api-rs-admin";
 /// The linearbot ingress, the only caller that may name a turn's Linear user.
 pub(crate) const LINEARBOT_IDENTITY: &str = "linearbot";
+/// The githubbot ingress, the only caller that may drive PR session bindings.
+pub(crate) const GITHUBBOT_IDENTITY: &str = "githubbot";
 /// Issuer of the access tokens api-rs mints for API clients. Distinct from
 /// Console's issuer so neither kind of token can be read as the other.
 pub(crate) const API_CLIENT_TOKEN_ISSUER: &str = "centaur-api-rs";
@@ -35,9 +37,15 @@ pub(crate) enum Capability {
     AdminSync,
     SlackExternalTeamsRead,
     SlackExternalTeamsWrite,
+    /// Read and drive PR session bindings and report failed CI for them. Held
+    /// only by the githubbot ingress, which learns PR state from signed GitHub
+    /// webhooks and a fresh GitHub fetch. It is deliberately not in
+    /// [`Self::ALL`], so no operator, Console or sandbox caller holds it.
+    PrBindingsManage,
 }
 
 impl Capability {
+    /// Every operator capability, held by the static admin and Console.
     const ALL: [Self; 10] = [
         Self::SessionsRead,
         Self::SessionsWrite,
@@ -89,7 +97,24 @@ pub(crate) struct AuthenticatedCaller {
     capabilities: BTreeSet<Capability>,
     platform_prefixes: Option<&'static [&'static str]>,
     principal_subject: Option<String>,
+    /// For principal callers only: what the sandbox's own proxy attests.
+    proxy_attestation: ProxyAttestation,
     api_client_token: Option<ApiClientToken>,
+}
+
+/// Claims a sandbox's proxy mints into the API token it injects, from its own
+/// records rather than anything the sandbox sends. Both are optional so tokens
+/// minted before they existed still verify; a caller without them simply
+/// cannot use the routes that require them.
+#[derive(Clone, Debug, Default)]
+struct ProxyAttestation {
+    /// The sandbox the proxy serves (its name).
+    sandbox_id: Option<String>,
+    /// The GitHub account of the human whose OAuth token the proxy would
+    /// inject for `api.github.com`, when that is unambiguous.
+    github_user_id: Option<String>,
+    /// The requester principal the proxy is bound to right now, if any.
+    requester_principal_id: Option<String>,
 }
 
 /// What an API client access token says about its validity.
@@ -131,6 +156,29 @@ impl AuthenticatedCaller {
     pub(crate) fn principal_subject(&self) -> Option<&str> {
         self.principal_subject.as_deref()
     }
+
+    /// The sandbox this principal caller's proxy serves, as its proxy minted
+    /// it. `None` for every other caller class and for older tokens.
+    pub(crate) fn sandbox_id(&self) -> Option<&str> {
+        self.proxy_attestation.sandbox_id.as_deref()
+    }
+
+    /// The GitHub account id its proxy attests for the human behind the token
+    /// injected for `api.github.com`. `None` for every other caller class, for
+    /// older tokens, and whenever the proxy could not name one unambiguously.
+    pub(crate) fn github_user_id(&self) -> Option<&str> {
+        self.proxy_attestation.github_user_id.as_deref()
+    }
+
+    /// The requester principal (`prn_…`) its proxy is bound to right now: the
+    /// person whose credentials the proxy would act with in addition to the
+    /// session's own. `None` for every other caller class, and when its proxy
+    /// has no requester bound. Absence is meaningful (no requester), so a
+    /// caller must compare it with what api-rs intended, never treat it as
+    /// "unknown".
+    pub(crate) fn requester_principal_id(&self) -> Option<&str> {
+        self.proxy_attestation.requester_principal_id.as_deref()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -166,21 +214,7 @@ impl ApiAuthConfig {
             let Some(token) = optional_env(spec.env_var) else {
                 continue;
             };
-            let mut capabilities = vec![Capability::SessionsRead, Capability::SessionsWrite];
-            if spec.workflow_events {
-                capabilities.push(Capability::WorkflowsEvents);
-            }
-            if spec.identity == "slackbot" {
-                capabilities.push(Capability::WorkflowsActions);
-                capabilities.push(Capability::SlackExternalTeamsRead);
-            }
-            callers.push(static_caller(
-                spec.identity,
-                CallerClass::Ingress,
-                token,
-                capabilities,
-                Some(spec.platform_prefixes),
-            ));
+            callers.push(ingress_caller(spec, token));
         }
 
         validate_unique_tokens(&callers)?;
@@ -195,6 +229,20 @@ impl ApiAuthConfig {
     pub fn testing(jwt_secret: impl Into<String>) -> Self {
         Self {
             static_callers: Arc::new(Vec::new()),
+            jwt_secret: Arc::from(jwt_secret.into()),
+            api_clients_enabled: true,
+        }
+    }
+
+    /// Every ingress identity, keyed `test-<identity>-key`.
+    #[cfg(test)]
+    pub(crate) fn testing_with_ingresses(jwt_secret: impl Into<String>) -> Self {
+        let callers = INGRESS_SPECS
+            .iter()
+            .map(|spec| ingress_caller(spec, format!("test-{}-key", spec.identity)))
+            .collect();
+        Self {
+            static_callers: Arc::new(callers),
             jwt_secret: Arc::from(jwt_secret.into()),
             api_clients_enabled: true,
         }
@@ -286,6 +334,7 @@ impl ApiAuthConfig {
                     capabilities: Capability::ALL.into_iter().collect(),
                     platform_prefixes: None,
                     principal_subject: None,
+                    proxy_attestation: ProxyAttestation::default(),
                     api_client_token: None,
                 })
             }
@@ -319,6 +368,11 @@ impl ApiAuthConfig {
                     capabilities,
                     platform_prefixes: None,
                     principal_subject: Some(subject),
+                    proxy_attestation: ProxyAttestation {
+                        sandbox_id: claims.sandbox_id.and_then(non_blank),
+                        github_user_id: claims.github_user_id.and_then(non_blank),
+                        requester_principal_id: claims.requester_principal_id.and_then(non_blank),
+                    },
                     api_client_token: None,
                 })
             }
@@ -381,6 +435,7 @@ impl ApiAuthConfig {
                 .collect(),
             platform_prefixes: None,
             principal_subject: None,
+            proxy_attestation: ProxyAttestation::default(),
             api_client_token: Some(ApiClientToken {
                 secret_fingerprint: claims.secret_fingerprint,
                 expires_at: claims.exp,
@@ -422,6 +477,12 @@ struct ApiJwtClaims {
     sub: String,
     token_use: Option<ApiJwtTokenUse>,
     capabilities: Option<ApiJwtCapabilities>,
+    #[serde(default)]
+    sandbox_id: Option<String>,
+    #[serde(default)]
+    github_user_id: Option<String>,
+    #[serde(default)]
+    requester_principal_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -459,7 +520,7 @@ const INGRESS_SPECS: &[IngressSpec] = &[
     },
     IngressSpec {
         env_var: "GITHUBBOT_API_KEY",
-        identity: "githubbot",
+        identity: GITHUBBOT_IDENTITY,
         platform_prefixes: &[
             "github:",
             "github-issue:",
@@ -490,6 +551,37 @@ struct IngressSpec {
     workflow_events: bool,
 }
 
+/// The capabilities an ingress key carries.
+fn ingress_capabilities(spec: &IngressSpec) -> Vec<Capability> {
+    let mut capabilities = vec![Capability::SessionsRead, Capability::SessionsWrite];
+    if spec.workflow_events {
+        capabilities.push(Capability::WorkflowsEvents);
+    }
+    if spec.identity == "slackbot" {
+        capabilities.push(Capability::WorkflowsActions);
+        capabilities.push(Capability::SlackExternalTeamsRead);
+    }
+    if spec.identity == GITHUBBOT_IDENTITY {
+        capabilities.push(Capability::PrBindingsManage);
+    }
+    capabilities
+}
+
+fn ingress_caller(spec: &IngressSpec, token: String) -> StaticCaller {
+    static_caller(
+        spec.identity,
+        CallerClass::Ingress,
+        token,
+        ingress_capabilities(spec),
+        Some(spec.platform_prefixes),
+    )
+}
+
+fn non_blank(value: String) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
 fn static_caller(
     identity: &str,
     class: CallerClass,
@@ -505,6 +597,7 @@ fn static_caller(
             capabilities: capabilities.into_iter().collect(),
             platform_prefixes,
             principal_subject: None,
+            proxy_attestation: ProxyAttestation::default(),
             api_client_token: None,
         },
     }
@@ -810,6 +903,126 @@ mod tests {
                 !thread_key_matches_platform(githubbot.platform_prefixes, thread_key),
                 "{thread_key}"
             );
+        }
+    }
+
+    #[test]
+    fn only_the_githubbot_ingress_may_manage_pr_bindings() {
+        for spec in INGRESS_SPECS {
+            assert_eq!(
+                ingress_capabilities(spec).contains(&Capability::PrBindingsManage),
+                spec.identity == GITHUBBOT_IDENTITY,
+                "{}",
+                spec.identity
+            );
+        }
+        // Operators hold every capability in `ALL`, which leaves this one out.
+        assert!(!Capability::ALL.contains(&Capability::PrBindingsManage));
+        let admin = static_caller(
+            STATIC_ADMIN_IDENTITY,
+            CallerClass::Admin,
+            "admin-key".to_owned(),
+            Capability::ALL,
+            None,
+        );
+        assert!(!admin.caller.has_capability(Capability::PrBindingsManage));
+        let console = ApiAuthConfig::testing("jwt-secret")
+            .authenticate(&bearer(&sign(json!({
+                "iss": "centaur-console", "sub": "centaur-console", "aud": "centaur-api",
+                "iat": 1_700_000_000i64, "exp": 4_102_444_800i64,
+                "token_use": "console_service",
+            }))))
+            .unwrap();
+        assert!(!console.has_capability(Capability::PrBindingsManage));
+        let principal = ApiAuthConfig::testing("jwt-secret")
+            .authenticate(&bearer(&sign(json!({
+                "iss": "centaur-console", "sub": "prn_test", "aud": "centaur-api",
+                "iat": 1_700_000_000i64, "exp": 4_102_444_800i64,
+                "capabilities": {"sessions_read": true, "workflows_read": true, "workflows_write": true},
+            }))))
+            .unwrap();
+        assert!(!principal.has_capability(Capability::PrBindingsManage));
+        assert_eq!(
+            Capability::from_api_client_scope("pr_bindings:manage"),
+            None
+        );
+    }
+
+    fn sign(claims: serde_json::Value) -> String {
+        encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(b"jwt-secret"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn principal_tokens_expose_the_proxy_attested_sandbox_and_github_account() {
+        let auth = ApiAuthConfig::testing("jwt-secret");
+        let claims = |extra: serde_json::Value| {
+            let mut claims = json!({
+                "iss": "centaur-console", "sub": "prn_test", "aud": "centaur-api",
+                "iat": 1_700_000_000i64, "exp": 4_102_444_800i64,
+                "capabilities": {"sessions_read": true},
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                claims[key] = value.clone();
+            }
+            claims
+        };
+
+        let caller = auth
+            .authenticate(&bearer(&sign(claims(json!({
+                "sandbox_id": "sbx-1", "github_user_id": "90210001",
+                "requester_principal_id": "prn_alice",
+            })))))
+            .unwrap();
+        assert_eq!(caller.class(), CallerClass::Principal);
+        assert_eq!(caller.sandbox_id(), Some("sbx-1"));
+        assert_eq!(caller.github_user_id(), Some("90210001"));
+        assert_eq!(caller.requester_principal_id(), Some("prn_alice"));
+
+        // Tokens minted before the claims existed still verify, with neither.
+        let caller = auth
+            .authenticate(&bearer(&sign(claims(json!({})))))
+            .unwrap();
+        assert_eq!(caller.principal_subject(), Some("prn_test"));
+        assert_eq!(caller.sandbox_id(), None);
+        assert_eq!(caller.github_user_id(), None);
+        assert_eq!(caller.requester_principal_id(), None);
+
+        // Each claim stands alone, and a blank one is no claim.
+        let caller = auth
+            .authenticate(&bearer(&sign(claims(
+                json!({"sandbox_id": " ", "github_user_id": "90210001"}),
+            ))))
+            .unwrap();
+        assert_eq!(caller.sandbox_id(), None);
+        assert_eq!(caller.github_user_id(), Some("90210001"));
+    }
+
+    #[test]
+    fn only_principal_callers_carry_proxy_claims() {
+        let auth = ApiAuthConfig::testing_with_ingresses("jwt-secret");
+        // A Console service token that smuggles the claims in still has none.
+        let console = auth
+            .authenticate(&bearer(&sign(json!({
+                "iss": "centaur-console", "sub": "centaur-console", "aud": "centaur-api",
+                "iat": 1_700_000_000i64, "exp": 4_102_444_800i64, "token_use": "console_service",
+                "sandbox_id": "sbx-1", "github_user_id": "90210001",
+            }))))
+            .unwrap();
+        assert_eq!(
+            (console.sandbox_id(), console.github_user_id()),
+            (None, None)
+        );
+        // As does every ingress.
+        for spec in INGRESS_SPECS {
+            let caller = auth
+                .authenticate(&bearer(&format!("test-{}-key", spec.identity)))
+                .unwrap();
+            assert_eq!((caller.sandbox_id(), caller.github_user_id()), (None, None));
         }
     }
 

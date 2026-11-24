@@ -25,9 +25,18 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 mod migrations;
+mod pr_bindings;
 
 pub use migrations::{TextSearchBackend, migrate, migration_list};
+pub use pr_bindings::{
+    NewPrBinding, PrBinding, PrBindingStateOutcome, PrBindingStateUpdate, PrCiNoticeClaim,
+    normalize_pr_repository,
+};
 
+/// The execution-metadata key api-rs records an execution's requester under.
+/// Only [`PgSessionStore::set_execution_requester`] may set it; code that
+/// persists caller-supplied metadata must strip it.
+pub const EXECUTION_REQUESTER_KEY: &str = "centaur.requester";
 pub const SESSION_EVENTS_CHANNEL: &str = "centaur_session_events";
 const DEFAULT_MAX_CONNECTIONS: u32 = 500;
 /// Proxy-binding locks one replica may hold or wait for at once. Each takes a
@@ -104,10 +113,64 @@ pub struct ProxyBindingLock {
     _permit: OwnedSemaphorePermit,
 }
 
+/// The PR-creation lock, returned by [`PgSessionStore::lock_pr_create`]
+/// (shared, held by a creation) or [`PgSessionStore::lock_pr_create_exclusive`]
+/// (held by an authoritative lookup). Dropping it releases the lock; call
+/// [`Self::release`] to release it at once.
+pub struct PrCreateLock {
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl PrCreateLock {
+    /// Releases the lock now, rather than leaving it to the dropped
+    /// transaction's deferred rollback, discarding anything inserted through
+    /// it.
+    pub async fn release(self) -> Result<(), SessionStoreError> {
+        self.tx.rollback().await?;
+        Ok(())
+    }
+
+    /// Inserts `new` as a binding inside the transaction that holds the lock,
+    /// as a savepoint, so a refused insert (a conflict, say) leaves the lock
+    /// and the transaction usable. The binding becomes visible to anyone else
+    /// only at [`Self::commit`], which is also when the lock is released:
+    /// a lookup waiting on the lock can never miss a binding committed by the
+    /// creation it waited for. If the transaction has failed (a lost
+    /// connection, for instance) this fails and nothing is bound.
+    pub async fn insert_binding(
+        &mut self,
+        new: &NewPrBinding,
+    ) -> Result<PrBinding, SessionStoreError> {
+        use sqlx::Acquire as _;
+        let mut savepoint = (&mut self.tx).begin().await?;
+        match pr_bindings::insert_pr_binding_on(&mut savepoint, new).await {
+            Ok(binding) => {
+                savepoint.commit().await?;
+                Ok(binding)
+            }
+            Err(error) => {
+                // Best effort: if even this fails the transaction is gone and
+                // the caller's commit fails too.
+                let _ = savepoint.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Commits what was inserted through [`Self::insert_binding`] and releases
+    /// the lock, in one step.
+    pub async fn commit(self) -> Result<(), SessionStoreError> {
+        self.tx.commit().await?;
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct PgSessionStore {
     pool: PgPool,
     proxy_binding_permits: Arc<Semaphore>,
+    pr_create_permits: Arc<Semaphore>,
 }
 
 impl PgSessionStore {
@@ -115,6 +178,7 @@ impl PgSessionStore {
         Self {
             pool,
             proxy_binding_permits: Arc::new(Semaphore::new(PROXY_BINDING_LOCK_CONCURRENCY)),
+            pr_create_permits: Arc::new(Semaphore::new(PROXY_BINDING_LOCK_CONCURRENCY)),
         }
     }
 
@@ -546,6 +610,39 @@ impl PgSessionStore {
         Ok(())
     }
 
+    /// Records the requester api-rs resolved for `execution_id`, before it
+    /// binds that requester to the sandbox's proxy: the principal id, or none
+    /// when the turn runs without one. Writing "none" is a record too, so a
+    /// reader can tell a turn api-rs intended to run without a requester from
+    /// one whose requester was not recorded yet. See [`execution_requester`].
+    pub async fn set_execution_requester(
+        &self,
+        execution_id: &str,
+        requester_principal_id: Option<&str>,
+    ) -> Result<(), SessionStoreError> {
+        let updated = sqlx::query_scalar::<_, String>(
+            r#"
+            update session_executions
+            set metadata = metadata || jsonb_build_object(
+                    $3::text, jsonb_build_object('principal_id', $2::text)),
+                updated_at = now()
+            where execution_id = $1
+            returning execution_id
+            "#,
+        )
+        .bind(execution_id)
+        .bind(requester_principal_id)
+        .bind(EXECUTION_REQUESTER_KEY)
+        .fetch_optional(&self.pool)
+        .await?;
+        if updated.is_none() {
+            return Err(SessionStoreError::ExecutionNotFound {
+                execution_id: execution_id.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     pub async fn active_execution_for_thread(
         &self,
         thread_key: &ThreadKey,
@@ -662,6 +759,58 @@ impl PgSessionStore {
         .await?;
         Ok(ProxyBindingLock {
             _tx: tx,
+            _permit: permit,
+        })
+    }
+
+    /// Takes the PR-creation lock in **shared** mode and holds it until the
+    /// returned guard is committed, released or dropped. A trusted PR
+    /// creation holds it from before its GitHub call through its binding
+    /// insert and commit. Being shared, creations never wait on one another,
+    /// whatever repository they are for.
+    ///
+    /// It is one global lock, not one per repository: GitHub's response can
+    /// name the PR in a repository under a different name than the request
+    /// (a rename between the call and the commit), so only a lock that does
+    /// not depend on the name can be waited on by a lookup. Lookups that must
+    /// not miss a binding take it exclusively
+    /// ([`Self::lock_pr_create_exclusive`]) and so wait for every creation in
+    /// flight; other lookups do not lock at all.
+    ///
+    /// Lock order: a creation takes the thread's proxy-binding lock first and
+    /// this one second; a lookup takes only this one. The two use separate
+    /// replica-wide permit pools, so waiting for one kind can never starve the
+    /// holders of the other, and no cycle can form.
+    pub async fn lock_pr_create(&self) -> Result<PrCreateLock, SessionStoreError> {
+        self.lock_pr_create_in("pg_advisory_xact_lock_shared").await
+    }
+
+    /// Takes the PR-creation lock in **exclusive** mode: it waits for every
+    /// creation in flight (in any repository) and blocks new ones until the
+    /// guard is released. Held only for an authoritative binding lookup's
+    /// final read.
+    pub async fn lock_pr_create_exclusive(&self) -> Result<PrCreateLock, SessionStoreError> {
+        self.lock_pr_create_in("pg_advisory_xact_lock").await
+    }
+
+    async fn lock_pr_create_in(
+        &self,
+        lock_function: &'static str,
+    ) -> Result<PrCreateLock, SessionStoreError> {
+        let permit = self
+            .pr_create_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the PR-create semaphore is never closed");
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(&format!(
+            "select {lock_function}(hashtextextended('centaur:pr-create', 0))"
+        ))
+        .execute(&mut *tx)
+        .await?;
+        Ok(PrCreateLock {
+            tx,
             _permit: permit,
         })
     }
@@ -2124,6 +2273,22 @@ pub enum SessionStoreError {
     },
     #[error("session {thread_key} sandbox is owned by its workflow run")]
     WorkflowOwnedSandbox { thread_key: String },
+    #[error("invalid PR binding request: {0}")]
+    InvalidPrBinding(String),
+    #[error("no PR binding for {repository}#{number}")]
+    PrBindingNotFound { repository: String, number: i64 },
+    #[error("PR binding conflict for {repository}#{number}: {reason}")]
+    PrBindingConflict {
+        repository: String,
+        number: i64,
+        reason: String,
+    },
+    #[error("PR binding state conflict for {repository}#{number}: {field}")]
+    PrBindingStateConflict {
+        repository: String,
+        number: i64,
+        field: &'static str,
+    },
     #[error("invalid notification payload on {channel}: {payload}: {error}")]
     InvalidNotification {
         channel: String,
@@ -2403,6 +2568,15 @@ impl TryFrom<SessionEventRow> for SessionEvent {
             created_at: row.created_at,
         })
     }
+}
+
+/// The requester api-rs recorded for `execution` (see
+/// [`PgSessionStore::set_execution_requester`]): `None` when nothing was
+/// recorded yet, `Some(None)` when the turn was recorded as having no
+/// requester, and `Some(Some(id))` for the requester principal.
+pub fn execution_requester(execution: &SessionExecution) -> Option<Option<&str>> {
+    let recorded = execution.metadata.get(EXECUTION_REQUESTER_KEY)?;
+    Some(recorded.get("principal_id").and_then(Value::as_str))
 }
 
 fn parse_persisted<T>(value: String) -> Result<T, SessionStoreError>

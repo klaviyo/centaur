@@ -659,6 +659,23 @@ apiRs:
   # metadata. Empty falls back to slackbotv2.mcpPublicUrl.
   mcpPublicUrl: ""
   runMigrations: true
+  # Enables trusted pull request creation (POST /api/session/{thread_key}/
+  # pull-requests). Turn it on only after every proxy-sync and githubbot
+  # replica runs a version with the PR-create guard and the coded-miss rules,
+  # and turn it off (letting in-flight creates drain) before rolling any of
+  # them back. Once deployed, roll back only to versions that keep this
+  # feature's safeguards: an api-rs with this setting (an older one ignores it
+  # and leaves creation on), migration 0061 and the binding routes with their
+  # coded miss, and a githubbot whose red-CI path is binding-aware. Roll
+  # proxy-sync back only while every api-rs replica has this setting, off.
+  # Rolling back to a version from before this feature is not supported.
+  # When on, the chart projects only the proxy CA certificate entry into the
+  # api-rs container as a file, and api-rs never reads the CA Secret itself.
+  # The certificate Secret must then exist before api-rs starts, and its
+  # certificate entry must hold only the certificate: the chart refuses to
+  # render when the certificate and key selectors name the same entry, and
+  # api-rs refuses a projected file that holds a private key.
+  trustedPrCreateEnabled: false
   # Controls whether a missing automatically derived session principal may be
   # created. "preapproved" admits only principals already present in the
   # Console; missing requester principals are omitted rather than created.
