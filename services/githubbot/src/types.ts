@@ -169,18 +169,6 @@ export type GithubbotOptions = {
   allowedAuthorAssociations?: string[];
   /** Webhook signing secret configured on the GitHub repo/org webhook. */
   webhookSecret: string;
-  /**
-   * Route follow-ups for Centaur-created PRs (verified `pr_session_bindings`)
-   * back to the session that opened them instead of a `github-manage:` session.
-   * Defaults to true; unbound PRs keep the existing flow either way.
-   */
-  prSessionBindings?: boolean;
-  /**
-   * How often the PR follow-up dispatcher retries bindings with queued work
-   * (busy sessions, missed completions, restarts). Default 30000ms; 0 disables
-   * the timer (enqueue and completion still dispatch).
-   */
-  prDispatchIntervalMs?: number;
 };
 
 export type Githubbot = {
@@ -225,6 +213,37 @@ export type GithubbotThreadState = {
   reviewedDeliveryIds?: string[];
 };
 
+/** A `pr_session_bindings` row as api-rs returns it (fields githubbot reads). */
+export type PrBinding = {
+  repository: string;
+  number: number;
+  thread_key: string;
+  head_sha: string;
+  managed: boolean;
+  closed: boolean;
+};
+
+export type PrBindingStateUpdate = {
+  managed?: boolean;
+  closed?: boolean;
+  head_sha?: string;
+};
+
+/** A failed-CI observation, filled from a fresh GitHub fetch just before sending. */
+export type PrCiFailureReport = {
+  head_sha: string;
+  current_head_sha: string;
+  open: boolean;
+  assigned: boolean;
+  check_name: string;
+  details_url?: string;
+  html_url: string;
+};
+
+export type PrCiFailureResult =
+  | { notice: "queued" | "duplicate"; reason?: undefined }
+  | { notice: "skipped"; reason: string };
+
 export type GithubbotRendererSource = RustSessionStreamEvent | JsonObject;
 
 export type GithubbotTrace = {
@@ -264,85 +283,3 @@ export type ForwardSessionInput = {
   threadId: string;
   trace?: GithubbotTrace;
 };
-
-/** A `pr_session_bindings` row as api-rs returns it. */
-export type PrBinding = {
-  repository: string;
-  number: number;
-  thread_key: string;
-  state: "registered" | "verified" | "rejected";
-  pr_node_id?: string | null;
-  pr_author_login?: string | null;
-  pr_created_at?: string | null;
-  head_ref?: string | null;
-  managed: boolean;
-  head_sha?: string | null;
-  automation_paused: boolean;
-  pause_reason?: string | null;
-  push_grant?: JsonObject | null;
-  blocker?: string | null;
-  /** Present on the GET route only. */
-  session_exists?: boolean;
-  /** Present on the GET route only. */
-  active_execution?: boolean;
-};
-
-export type PrFollowupKind =
-  | "review"
-  | "review_comment"
-  | "issue_comment"
-  | "mention"
-  | "ci_failure"
-  | "conflict";
-
-/** Where a dispatched follow-up's reply is posted on GitHub (null for CI). */
-export type PrFollowupReplyTarget = {
-  type: "github_comment";
-  repository: string;
-  number: number;
-  comment_id?: number;
-  review_id?: number;
-};
-
-export type PrFollowupInput = {
-  kind: PrFollowupKind;
-  dedupe_key: string;
-  head_sha: string;
-  actor: { github_user_id: string; github_login: string };
-  prompt: { type: "text"; text: string }[];
-  reply_target: PrFollowupReplyTarget | null;
-};
-
-export type PrFollowup = PrFollowupInput & {
-  id: string;
-  status: "queued" | "dispatched" | "dropped";
-  drop_reason?: string | null;
-  execution_id?: string | null;
-};
-
-export type PrBindingStateUpdate = {
-  managed?: boolean;
-  head_sha?: string;
-  closed?: boolean;
-  automation_paused?: { reason: string } | null;
-  push_grant?: JsonObject | null;
-  blocker?: string | null;
-};
-
-export type PrVerification = {
-  node_id: string;
-  author_login: string;
-  created_at: string;
-  head_ref: string;
-  head_sha: string;
-};
-
-export type PrDispatchRequest = {
-  current_head_sha: string;
-  assigned: boolean;
-  open: boolean;
-};
-
-export type PrDispatchResult =
-  | { dispatched: PrFollowup; execution_id: string; reason?: undefined }
-  | { dispatched: null; reason: string; blocker?: string | null };

@@ -26,6 +26,16 @@ pub enum ApiError {
     PayloadTooLarge(String),
     #[error("{0}")]
     ServiceUnavailable(String),
+    /// A failure the caller can act on, carrying a stable machine-readable
+    /// `code`. The message is written for the caller and is always returned,
+    /// even for 5xx statuses, so it must never carry internals, headers or
+    /// tokens.
+    #[error("{message}")]
+    Coded {
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+    },
     /// Server-side misconfiguration or invariant failure. The message is
     /// logged but never returned to the client.
     #[error("{0}")]
@@ -38,6 +48,21 @@ pub enum ApiError {
     Serialize(#[from] serde_json::Error),
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
+}
+
+impl ApiError {
+    /// A caller-actionable failure with a stable `code` (see [`Self::Coded`]).
+    pub(crate) fn coded(
+        status: StatusCode,
+        code: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::Coded {
+            status,
+            code,
+            message: message.into(),
+        }
+    }
 }
 
 impl From<ThreadKeyError> for ApiError {
@@ -56,6 +81,7 @@ impl IntoResponse for ApiError {
             Self::MethodNotAllowed(_) => StatusCode::METHOD_NOT_ALLOWED,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Coded { status, .. } => *status,
             Self::Runtime(SessionRuntimeError::BadRequest(_)) => StatusCode::BAD_REQUEST,
             Self::Runtime(SessionRuntimeError::ShuttingDown) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Runtime(SessionRuntimeError::Store(SessionStoreError::NotFound { .. })) => {
@@ -70,9 +96,7 @@ impl IntoResponse for ApiError {
             Self::Runtime(SessionRuntimeError::Store(
                 SessionStoreError::ExecutionActive { .. }
                 | SessionStoreError::WorkflowOwnedSandbox { .. }
-                | SessionStoreError::PrBindingConflict { .. }
-                | SessionStoreError::PrBindingInactive { .. }
-                | SessionStoreError::PrNodeIdMismatch { .. },
+                | SessionStoreError::PrBindingConflict { .. },
             )) => StatusCode::CONFLICT,
             Self::Runtime(SessionRuntimeError::Store(SessionStoreError::InvalidPrBinding(_))) => {
                 StatusCode::BAD_REQUEST
@@ -99,7 +123,7 @@ impl IntoResponse for ApiError {
         };
         // 5xx error details are server-side faults: log them for operators but
         // never echo internals (SQL text, hostnames, config refs) to clients.
-        let message = if status.is_server_error() {
+        let message = if status.is_server_error() && !matches!(self, Self::Coded { .. }) {
             tracing::error!(
                 status = status.as_u16(),
                 error = %error_chain(&self),
@@ -151,16 +175,14 @@ impl IntoResponse for ApiError {
             body["code"] = json!("requester_not_linked");
             body["provider"] = json!(provider);
         }
-        if let Self::Runtime(SessionRuntimeError::Store(error)) = &self {
-            let code = match error {
-                SessionStoreError::PrBindingConflict { .. } => Some("binding_conflict"),
-                SessionStoreError::PrBindingInactive { .. } => Some("binding_inactive"),
-                SessionStoreError::PrNodeIdMismatch { .. } => Some("node_id_mismatch"),
-                _ => None,
-            };
-            if let Some(code) = code {
-                body["code"] = json!(code);
-            }
+        if let Self::Coded { code, .. } = &self {
+            body["code"] = json!(code);
+        }
+        if let Self::Runtime(SessionRuntimeError::Store(SessionStoreError::PrBindingConflict {
+            ..
+        })) = &self
+        {
+            body["code"] = json!("binding_conflict");
         }
         let mut response = (status, Json(body)).into_response();
         if status == StatusCode::UNAUTHORIZED {
@@ -259,5 +281,58 @@ mod tests {
         assert_eq!(body["code"], json!("principal_conflict"));
         assert_eq!(body["existing_principal"], json!("prn_finance"));
         assert_eq!(body["requested_principal"], json!("prn_support"));
+    }
+
+    #[tokio::test]
+    async fn coded_errors_return_their_code_and_message_at_any_status() {
+        for status in [StatusCode::CONFLICT, StatusCode::BAD_GATEWAY] {
+            let response = ApiError::coded(status, "github_oauth_required", "connect GitHub first")
+                .into_response();
+            assert_eq!(response.status(), status);
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read response body");
+            let body: serde_json::Value =
+                serde_json::from_slice(&body).expect("decode response body");
+            assert_eq!(body["code"], "github_oauth_required");
+            assert_eq!(body["error"], "connect GitHub first");
+        }
+    }
+
+    #[tokio::test]
+    async fn pr_binding_store_errors_map_to_client_statuses() {
+        for (error, status, code) in [
+            (
+                SessionStoreError::PrBindingNotFound {
+                    repository: "acme/widgets".to_owned(),
+                    number: 7,
+                },
+                StatusCode::NOT_FOUND,
+                None,
+            ),
+            (
+                SessionStoreError::InvalidPrBinding("repository must be owner/repo".to_owned()),
+                StatusCode::BAD_REQUEST,
+                None,
+            ),
+            (
+                SessionStoreError::PrBindingConflict {
+                    repository: "acme/widgets".to_owned(),
+                    number: 7,
+                    reason: "the pull request is already bound".to_owned(),
+                },
+                StatusCode::CONFLICT,
+                Some("binding_conflict"),
+            ),
+        ] {
+            let response = ApiError::Runtime(SessionRuntimeError::Store(error)).into_response();
+            assert_eq!(response.status(), status);
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read response body");
+            let body: serde_json::Value =
+                serde_json::from_slice(&body).expect("decode response body");
+            assert_eq!(body.get("code").and_then(|code| code.as_str()), code);
+        }
     }
 }

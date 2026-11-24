@@ -2,17 +2,6 @@ import type { GitHubAdapter } from "@chat-adapter/github";
 import type { StateAdapter } from "chat";
 import { backgroundWaitUntil } from "./context";
 import { resolveAllowedAuthorAssociations } from "./authorization";
-import {
-  actorFrom,
-  ciFailureFollowup,
-  conflictFollowup,
-  enqueueBoundFollowup,
-  handleBoundPullRequestEvent,
-  resolveBindingRoute,
-  reviewFollowup,
-  type FollowupActor,
-  type PrBindingClient,
-} from "./pr-session";
 import { reactWorkingOnReview, settleReviewReaction } from "./reactions";
 import { runTurnStream, turnOutputChars } from "./turn";
 import {
@@ -21,11 +10,20 @@ import {
   prepareCiCompleted,
   type CiEvaluation,
 } from "./workflow-events";
+import {
+  getPrBinding,
+  isRetryableSessionApiError,
+  reportPrCiFailure,
+  updatePrBindingState,
+  type PrBindingRef,
+} from "./session-api";
 import type {
   ForwardSessionInput,
   GithubbotApiMessage,
   GithubbotOptions,
   GithubbotTrace,
+  PrBinding,
+  PrBindingStateUpdate,
 } from "./types";
 import { errorMessage, noopLogger, nowMs, stringValue, traceLog } from "./utils";
 
@@ -45,12 +43,6 @@ import { errorMessage, noopLogger, nowMs, stringValue, traceLog } from "./utils"
 type Octokit = GitHubAdapter["octokit"];
 
 export type PrManagerContext = {
-  /**
-   * api-rs PR session bindings. When set, a PR bound to the Centaur session
-   * that opened it routes follow-ups to that session's durable queue instead
-   * of a `github-manage:` turn. Unset (or an unbound PR) keeps today's flow.
-   */
-  bindings?: PrBindingClient;
   octokit: Octokit;
   options: GithubbotOptions;
   state: StateAdapter;
@@ -195,21 +187,16 @@ function logger(ctx: PrManagerContext) {
 // Webhook handlers.
 // ---------------------------------------------------------------------------
 
-export type PullRequestSummary = {
+type PullRequestSummary = {
   assignees: string[];
-  /** PR author login (verification evidence for a session binding). */
-  authorLogin: string | null;
-  /** ISO creation time (verification evidence for a session binding). */
-  createdAt: string | null;
   draft: boolean;
   headRef: string;
   headRepoFullName: string | null;
   headSha: string;
+  htmlUrl: string | null;
   labels: string[];
   mergeableState: string;
   merged: boolean;
-  /** GraphQL node id, the PR's stable identity across renames. */
-  nodeId: string | null;
   number: number;
   state: string;
   title: string;
@@ -223,38 +210,34 @@ function assigneeLogins(
 }
 
 function summarizePr(pr: {
-  created_at?: string | null;
   draft?: boolean | null;
   head: { ref: string; repo?: { full_name?: string | null } | null; sha: string };
+  html_url?: string | null;
   labels: { name?: string }[];
   mergeable_state?: string;
   merged?: boolean;
-  node_id?: string | null;
   number: number;
   state: string;
   title: string;
   assignees?: ({ login?: string } | null)[] | null;
-  user?: { login?: string } | null;
 }): PullRequestSummary {
   return {
     assignees: assigneeLogins(pr.assignees),
-    authorLogin: pr.user?.login ?? null,
-    createdAt: pr.created_at ?? null,
     draft: pr.draft === true,
     headRef: pr.head.ref,
     headRepoFullName: pr.head.repo?.full_name ?? null,
     headSha: pr.head.sha,
+    htmlUrl: pr.html_url ?? null,
     labels: pr.labels.map((l) => l.name ?? "").filter(Boolean),
     mergeableState: pr.mergeable_state ?? "unknown",
     merged: pr.merged === true,
-    nodeId: pr.node_id ?? null,
     number: pr.number,
     state: pr.state,
     title: pr.title,
   };
 }
 
-export async function fetchPr(
+async function fetchPr(
   ctx: PrManagerContext,
   owner: string,
   repo: string,
@@ -325,35 +308,11 @@ export async function handlePullRequestEvent(
   if (!repo || !isRecord(prNode)) return;
   const number = numberValue(prNode.number);
   if (number === undefined) return;
-  if (ctx.bindings) {
-    // A PR bound to the Centaur session that opened it never gets a
-    // `github-manage:` session; an unbound PR falls through unchanged.
-    const bound = await handleBoundPullRequestEvent(
-      ctx,
-      payload,
-      action,
-      repo.owner,
-      repo.repo,
-      number,
-    );
-    if (bound.next === "stop") return;
-    if (bound.next === "evaluate_ci") {
-      await processCi(
-        ctx,
-        repo.owner,
-        repo.repo,
-        number,
-        bound.headSha,
-        true,
-        undefined,
-        actorFrom(payload.sender),
-      );
-      return;
-    }
-    if (bound.next === "merge_gate") {
-      await tryMerge(ctx, repo.owner, repo.repo, number, actorFrom(payload.sender));
-      return;
-    }
+  // A PR opened through a session binding keeps its lifecycle state in api-rs,
+  // recorded before (and regardless of) the unbound handling below.
+  const binding = await lookupBinding(ctx, repo.owner, repo.repo, number);
+  if (binding) {
+    await recordBindingState(ctx, bindingRef(repo.owner, repo.repo, number), action, payload, prNode);
   }
   if (action === "closed") return; // nothing to drive once closed/merged.
 
@@ -371,6 +330,66 @@ export async function handlePullRequestEvent(
   // Any other state change that could flip mergeability re-evaluates the merge
   // gate; it's deterministic and idempotent, so over-calling is harmless.
   await tryMerge(ctx, repo.owner, repo.repo, number);
+}
+
+function bindingRef(owner: string, repo: string, number: number): PrBindingRef {
+  return { repository: `${owner}/${repo}`.toLowerCase(), number };
+}
+
+/** The PR's session binding, or null when unbound or when api-rs can't say. */
+async function lookupBinding(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<PrBinding | null> {
+  try {
+    return await getPrBinding(ctx.options, bindingRef(owner, repo, number));
+  } catch (error) {
+    logger(ctx).warn("githubbot_pr_binding_lookup_failed", {
+      error: errorMessage(error),
+      pr: `${owner}/${repo}#${number}`,
+    });
+    return null;
+  }
+}
+
+/**
+ * Record a lifecycle event on the binding. Management is enabled only by an
+ * explicit assignment: the event's own `assignee` is the bot, not merely the
+ * bot appearing in the PR's assignee list.
+ */
+async function recordBindingState(
+  ctx: PrManagerContext,
+  ref: PrBindingRef,
+  action: string,
+  payload: Record<string, unknown>,
+  prNode: Record<string, unknown>,
+): Promise<void> {
+  const assigneeIsBot =
+    isRecord(payload.assignee) &&
+    stringValue(payload.assignee.login)?.toLowerCase() === ctx.userName.toLowerCase();
+  const payloadHead = stringValue(isRecord(prNode.head) ? prNode.head.sha : undefined);
+  const [owner = "", repo = ""] = ref.repository.split("/", 2);
+  let update: PrBindingStateUpdate | undefined;
+  if (action === "closed") update = { closed: true };
+  else if (action === "reopened") update = { closed: false };
+  else if (action === "synchronize") update = payloadHead ? { head_sha: payloadHead } : undefined;
+  else if (action === "assigned" && assigneeIsBot) {
+    // The event can arrive late; record the head the PR has now.
+    const head = (await fetchPr(ctx, owner, repo, ref.number))?.headSha ?? payloadHead;
+    update = { managed: true, ...(head ? { head_sha: head } : {}) };
+  } else if (action === "unassigned" && assigneeIsBot) update = { managed: false };
+  if (!update) return;
+  try {
+    await updatePrBindingState(ctx.options, ref, update);
+  } catch (error) {
+    logger(ctx).warn("githubbot_pr_binding_state_failed", {
+      action,
+      error: errorMessage(error),
+      pr: `${ref.repository}#${ref.number}`,
+    });
+  }
 }
 
 /** `pull_request_review` submitted -> address review, or merge on approval. */
@@ -429,38 +448,6 @@ export async function handleReviewEvent(
     return;
   }
 
-  // A managed bound PR queues the review for the session that opened it. An
-  // approval still reaches the unchanged deterministic merge gate below.
-  if (ctx.bindings && reviewState !== "approved") {
-    const route = await resolveBindingRoute(ctx, repo.owner, repo.repo, number);
-    if (route.kind === "unknown") return;
-    if (route.kind === "bound") {
-      const actor = actorFrom(reviewNode.user);
-      if (
-        actor &&
-        reviewedHeadSha &&
-        (reviewState === "changes_requested" || reviewState === "commented")
-      ) {
-        await enqueueBoundFollowup(
-          ctx,
-          route,
-          reviewFollowup({
-            owner: repo.owner,
-            repo: repo.repo,
-            number,
-            reviewId,
-            reviewNodeId: stringValue(reviewNode.node_id),
-            reviewState,
-            reviewBody: stringValue(reviewNode.body),
-            headSha: reviewedHeadSha,
-            actor,
-          }),
-        );
-      }
-      return;
-    }
-  }
-
   if (
     !(await claim(
       ctx,
@@ -471,7 +458,7 @@ export async function handleReviewEvent(
   }
 
   if (reviewState === "approved") {
-    await tryMerge(ctx, repo.owner, repo.repo, number, actorFrom(reviewNode.user));
+    await tryMerge(ctx, repo.owner, repo.repo, number);
     return;
   }
   if (reviewState === "changes_requested" || reviewState === "commented") {
@@ -509,16 +496,7 @@ export async function handleCiEvent(
       : await fetchPrNumbersForCommit(ctx, repo.owner, repo.repo, target.headSha);
   await Promise.all(
     prNumbers.map((number) =>
-      processCi(
-        ctx,
-        repo.owner,
-        repo.repo,
-        number,
-        target.headSha,
-        false,
-        evaluation,
-        actorFrom(payload.sender),
-      ),
+      processCi(ctx, repo.owner, repo.repo, number, target.headSha, false, evaluation),
     ),
   );
 }
@@ -531,7 +509,6 @@ async function processCi(
   headSha: string,
   force = false,
   knownEvaluation?: CiEvaluation | null,
-  actor?: FollowupActor,
 ): Promise<void> {
   const pr = await fetchPr(ctx, owner, repo, number);
   if (!pr || !owns(ctx, pr)) return;
@@ -541,34 +518,9 @@ async function processCi(
   const evaluation =
     knownEvaluation ?? (await fetchCiEvaluation(ctx, owner, repo, headSha));
   if (!evaluation?.settled) return; // wait until *all* checks are done (and readable).
-  // Red CI on a managed bound PR queues one follow-up per head (api-rs
-  // collapses repeats); green still runs the unchanged merge path below.
-  if (ctx.bindings && evaluation.failed) {
-    const route = await resolveBindingRoute(ctx, owner, repo, number);
-    if (route.kind === "unknown") return;
-    if (route.kind === "bound") {
-      if (actor) {
-        await enqueueBoundFollowup(
-          ctx,
-          route,
-          ciFailureFollowup({
-            owner,
-            repo,
-            number,
-            headSha,
-            failingNames: evaluation.failingNames,
-            actor,
-          }),
-        );
-      }
-      return;
-    }
-  }
   // Act once per fully-settled SHA (the last-arriving check event wins).
-  const firstSettle = await claim(
-    ctx,
-    `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:ci-settled:${owner}/${repo}#${number}:${headSha}`,
-  );
+  const settledClaimKey = `${ctx.options.stateKeyPrefix ?? "centaur-githubbot"}:ci-settled:${owner}/${repo}#${number}:${headSha}`;
+  const firstSettle = await claim(ctx, settledClaimKey);
 
   const trace = makeTrace(managementThreadKey(owner, repo, number), `ci-${headSha}`);
   if (!evaluation.failed) {
@@ -583,10 +535,35 @@ async function processCi(
       }
       traceLog(ctx.options, "githubbot_ci_green", trace, { pr: `${owner}/${repo}#${number}` });
     }
-    await tryMerge(ctx, owner, repo, number, actor);
+    await tryMerge(ctx, owner, repo, number);
     return;
   }
   if (!firstSettle) return;
+
+  // A PR bound to a Slack session never gets an automated CI turn: record the
+  // failure with api-rs, which posts one notice in the bound thread. When
+  // api-rs is transiently unreachable the binding is unknown, so fail closed
+  // (no turn) and let a later event retry. Any other lookup failure leaves the
+  // PR on the existing unbound flow.
+  let binding: PrBinding | null = null;
+  try {
+    binding = await getPrBinding(ctx.options, bindingRef(owner, repo, number));
+  } catch (error) {
+    logger(ctx).warn("githubbot_pr_binding_lookup_failed", {
+      error: errorMessage(error),
+      pr: `${owner}/${repo}#${number}`,
+    });
+    if (isRetryableSessionApiError(error)) {
+      await release(ctx, settledClaimKey);
+      return;
+    }
+  }
+  if (binding) {
+    if (!(await reportBoundCiFailure(ctx, owner, repo, number, headSha, binding, evaluation, trace))) {
+      await release(ctx, settledClaimKey);
+    }
+    return;
+  }
 
   // Red: back off if a human pushed the failing commit (don't step on them) —
   // unless this is a forced takeover (the PR was just assigned to us, so the
@@ -615,13 +592,68 @@ async function processCi(
   fireCiFixTurn(ctx, owner, repo, pr, evaluation.failingNames, attempts + 1, maxAttempts);
 }
 
+/**
+ * Report a red head on a bound PR. Returns false only when the report could
+ * not be delivered, so the caller can release the per-head claim for a retry.
+ */
+async function reportBoundCiFailure(
+  ctx: PrManagerContext,
+  owner: string,
+  repo: string,
+  number: number,
+  headSha: string,
+  binding: PrBinding,
+  evaluation: CiEvaluation,
+  trace: GithubbotTrace,
+): Promise<boolean> {
+  const prLabel = `${owner}/${repo}#${number}`;
+  if (!binding.managed || binding.closed) {
+    traceLog(ctx.options, "githubbot_bound_ci_skipped", trace, {
+      closed: binding.closed,
+      managed: binding.managed,
+      pr: prLabel,
+    });
+    return true;
+  }
+  // api-rs revalidates, but its inputs must be fresh: refetch right before
+  // reporting rather than trusting the PR read from the start of this event.
+  const fresh = await fetchPr(ctx, owner, repo, number);
+  if (!fresh) return false;
+  if (fresh.headSha !== headSha) {
+    traceLog(ctx.options, "githubbot_bound_ci_stale_head", trace, { pr: prLabel });
+    return true;
+  }
+  try {
+    const result = await reportPrCiFailure(ctx.options, bindingRef(owner, repo, number), {
+      head_sha: headSha,
+      current_head_sha: fresh.headSha,
+      open: fresh.state === "open" && !fresh.merged,
+      assigned: owns(ctx, fresh),
+      check_name: evaluation.failingNames[0] ?? "CI checks",
+      ...(evaluation.firstFailingUrl ? { details_url: evaluation.firstFailingUrl } : {}),
+      html_url: fresh.htmlUrl ?? `https://github.com/${owner}/${repo}/pull/${number}`,
+    });
+    traceLog(ctx.options, "githubbot_bound_ci_reported", trace, {
+      notice: result.notice,
+      pr: prLabel,
+      ...(result.reason ? { reason: result.reason } : {}),
+    });
+    return true;
+  } catch (error) {
+    logger(ctx).warn("githubbot_bound_ci_report_failed", {
+      error: errorMessage(error),
+      pr: prLabel,
+    });
+    return false;
+  }
+}
+
 /** Deterministic merge gate — no agent; GitHub's mergeable_state decides. */
 async function tryMerge(
   ctx: PrManagerContext,
   owner: string,
   repo: string,
   number: number,
-  actor?: FollowupActor,
 ): Promise<void> {
   const pr = await fetchPr(ctx, owner, repo, number);
   if (!pr || !owns(ctx, pr)) return;
@@ -697,20 +729,6 @@ async function tryMerge(
     return;
   }
   if (decision === "resolve_conflict") {
-    if (ctx.bindings) {
-      const route = await resolveBindingRoute(ctx, owner, repo, number);
-      if (route.kind === "unknown") return;
-      if (route.kind === "bound") {
-        if (actor) {
-          await enqueueBoundFollowup(
-            ctx,
-            route,
-            conflictFollowup({ owner, repo, number, headSha: pr.headSha, actor }),
-          );
-        }
-        return;
-      }
-    }
     fireConflictTurn(ctx, owner, repo, pr);
   }
 }

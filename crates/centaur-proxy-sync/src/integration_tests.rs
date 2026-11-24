@@ -884,6 +884,85 @@ async fn api_jwt_carries_direct_and_role_slack_permissions() {
     );
 }
 
+/// The API JWT claims in a sync response: the secret that injects for the
+/// configured API host.
+fn api_jwt_claims(body: &Value) -> Value {
+    let secret = body["secrets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|secret| secret["rules"] == json!([{ "host": "api.internal" }]))
+        .expect("API JWT secret");
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+    validation.set_audience(&["centaur-api"]);
+    validation.set_issuer(&["centaur-console"]);
+    jsonwebtoken::decode::<Value>(
+        secret["source"]["value"].as_str().unwrap(),
+        &jsonwebtoken::DecodingKey::from_secret(JWT_SECRET.as_bytes()),
+        &validation,
+    )
+    .unwrap()
+    .claims
+}
+
+#[tokio::test]
+async fn api_jwt_names_the_sandbox_and_the_github_account_behind_its_token() {
+    let Some(f) = Fixture::with_jwt(true).await else {
+        return;
+    };
+    let principal = f.principal("principal").await;
+    let token = f.proxy(Some(principal), None, json!({})).await;
+
+    // No GitHub credential: the sandbox is named, the account is not.
+    let claims = api_jwt_claims(&f.sync(&token).await);
+    assert_eq!(claims["sandbox_id"], f.name("proxy"));
+    assert!(claims.get("github_user_id").is_none());
+
+    let app = f.oauth_app("github-app", false).await;
+    let broker = f.broker_credential("github-user", Some(app), true).await;
+    f.update(
+        "UPDATE broker_credentials SET provider_subject = '90210001' WHERE id = $1",
+        broker,
+    )
+    .await;
+    let wrapper = f
+        .wrapper_secret("github-token", broker, broker, "api.github.com")
+        .await;
+    f.grant(
+        Grantee::Principal(principal),
+        "static_secret_id",
+        wrapper,
+        DIRECT,
+    )
+    .await;
+    f.bump(principal).await;
+    let claims = api_jwt_claims(&f.sync(&token).await);
+    assert_eq!(claims["sandbox_id"], f.name("proxy"));
+    assert_eq!(claims["github_user_id"], "90210001");
+
+    // A second credential writing Authorization on the host makes the
+    // account ambiguous, so the claim disappears rather than guessing.
+    let other = f.broker_credential("github-other", Some(app), true).await;
+    f.update(
+        "UPDATE broker_credentials SET provider_subject = '90210002' WHERE id = $1",
+        other,
+    )
+    .await;
+    let competing = f
+        .wrapper_secret("github-competing", other, other, "api.github.com")
+        .await;
+    f.grant(
+        Grantee::Principal(principal),
+        "static_secret_id",
+        competing,
+        DIRECT,
+    )
+    .await;
+    f.bump(principal).await;
+    let claims = api_jwt_claims(&f.sync(&token).await);
+    assert!(claims.get("github_user_id").is_none());
+}
+
 #[tokio::test]
 async fn sync_returns_only_the_hash_until_grants_change() {
     let Some(f) = Fixture::new().await else {

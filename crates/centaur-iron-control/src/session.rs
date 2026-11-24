@@ -16,8 +16,7 @@ use crate::error::{IronControlError, Result};
 use crate::models::{Principal, PrincipalInput, SlackChannelPermissionInput};
 use crate::principal::{
     PrincipalRef, derive_github_requester_principal, derive_principal_with_slack_team,
-    derive_slack_requester_principal, github_user_principal, is_direct_message, is_linear_thread,
-    slack_conversation_id,
+    derive_slack_requester_principal, is_direct_message, is_linear_thread, slack_conversation_id,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -278,24 +277,6 @@ enum RequesterPlan {
 }
 
 fn requester_plan(thread_key: &str, metadata: &Value) -> Option<RequesterPlan> {
-    // A dispatched PR follow-up runs as the GitHub user whose signed webhook
-    // event queued it, on whatever thread the PR is bound to. Only api-rs's
-    // dispatch sets this field (the API strips it from every caller), and a
-    // present field never falls through to another requester, so the turn
-    // can't inherit a previous Slack participant's identity.
-    if let Some(github_user_id) = metadata.get("pr_followup_github_user_id") {
-        return github_user_id
-            .as_str()
-            .and_then(|github_user_id| {
-                github_user_principal(
-                    github_user_id,
-                    metadata
-                        .get("pr_followup_github_login")
-                        .and_then(Value::as_str),
-                )
-            })
-            .map(RequesterPlan::UpsertDerived);
-    }
     if metadata.get("requester_principal_foreign_id").is_some() {
         let foreign_id = metadata
             .get("requester_principal_foreign_id")
@@ -991,70 +972,6 @@ mod tests {
             };
             assert_eq!(principal.foreign_id, "github-user-90210001");
         }
-    }
-
-    #[test]
-    fn requester_plan_runs_dispatched_pr_followups_as_their_github_actor_on_any_thread() {
-        // A dispatched follow-up on a Slack-born session, whose metadata also
-        // carries Slack and Console fields a caller might try to smuggle in:
-        // the server-set GitHub actor wins and nothing else is consulted.
-        let metadata = json!({
-            "pr_followup": {"repository": "acme/widgets", "number": 12},
-            "pr_followup_github_user_id": "90210001",
-            "pr_followup_github_login": "ada",
-            "push_authorization": "prepare_and_ask",
-            "requester_principal_foreign_id": "console-user-mallory",
-            "slack_user_id": "U1",
-            "slack_team_id": "T123",
-            "slack_home_team_id": "T123"
-        });
-        for thread_key in [
-            "slack:T123:C123:1773364194.179929",
-            "console:9f1b7a3c-2d4e-4f6a-8b0c-1d2e3f4a5b6c",
-            "linear:issue-1",
-            "github-manage:acme/widgets:12",
-        ] {
-            let Some(RequesterPlan::UpsertDerived(principal)) =
-                requester_plan(thread_key, &metadata)
-            else {
-                panic!("expected the PR follow-up's GitHub requester for {thread_key}");
-            };
-            assert_eq!(principal.foreign_id, "github-user-90210001");
-            assert_eq!(principal.kind.as_deref(), Some("github_user"));
-            assert_eq!(
-                principal.labels.get("github_subject").map(String::as_str),
-                Some("90210001")
-            );
-        }
-    }
-
-    #[test]
-    fn requester_plan_never_falls_back_from_an_invalid_pr_followup_actor() {
-        for actor in [json!("ada"), json!(""), json!(90210001), Value::Null] {
-            let metadata = json!({
-                "pr_followup_github_user_id": actor,
-                "slack_user_id": "U1",
-                "slack_team_id": "T123",
-                "slack_home_team_id": "T123"
-            });
-            assert!(
-                requester_plan("slack:T123:C123:1773364194.179929", &metadata).is_none(),
-                "{metadata}"
-            );
-        }
-    }
-
-    #[test]
-    fn requester_plan_keeps_github_prefix_checks_without_the_server_set_field() {
-        // The ordinary githubbot author field still only names a requester on
-        // GitHub-owned threads.
-        assert!(
-            requester_plan(
-                "slack:T123:C123:1773364194.179929",
-                &json!({"user_id": "90210001", "user_name": "ada"})
-            )
-            .is_none()
-        );
     }
 
     #[test]

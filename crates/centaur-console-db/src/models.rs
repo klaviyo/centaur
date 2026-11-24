@@ -130,6 +130,11 @@ pub struct SecretSource {
     pub config: Map<String, Value>,
     pub secret: Option<String>,
     pub broker_access_token: Option<String>,
+    /// The OAuth app provider (for example `github`) behind a brokered token.
+    pub broker_provider: Option<String>,
+    /// The provider's stable account id for the person who connected the
+    /// brokered credential.
+    pub broker_provider_subject: Option<String>,
     pub role: Option<String>,
     pub role_kind: Option<String>,
 }

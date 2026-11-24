@@ -132,7 +132,12 @@ sources AS (
         sr.kind,
         sr.credential_id,
         jsonb_agg(
-            sr.source || jsonb_strip_nulls(jsonb_build_object('broker_access_token',
+            sr.source || jsonb_strip_nulls(jsonb_build_object(
+                -- Which provider account a brokered token belongs to, so the
+                -- control plane can name the human behind a delivered token.
+                'broker_provider', oa.provider,
+                'broker_provider_subject', bc.provider_subject,
+                'broker_access_token',
                 -- An owner-only token is delivered only while live, from an
                 -- enabled app and an active owner, through its own wrapper.
                 CASE WHEN oa.owner_only IS NOT TRUE THEN bc.access_token

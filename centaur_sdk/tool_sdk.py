@@ -180,28 +180,53 @@ def current_session_context() -> dict[str, Any]:
 _PR_REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
-def register_pull_request(repository: str, number: int) -> dict[str, Any]:
-    """Register a pull request this session opened, for same-session follow-ups.
+def create_pull_request(
+    repository: str,
+    head: str,
+    base: str,
+    title: str,
+    body: str = "",
+    draft: bool = False,
+) -> dict[str, Any]:
+    """Open a pull request as the requesting human, bound to this session.
 
-    Records ``{repository, number}`` against :func:`current_thread_key` as a
-    ``registered`` binding. Registration is only a claim: githubbot verifies it
-    from a signed webhook before routing any follow-up here, and a binding
-    never grants GitHub write access. Returns the binding the API stored.
+    Posts to the API's trusted creation route for :func:`current_thread_key`.
+    The API makes the GitHub call through this sandbox's proxy, which injects
+    the authorized human's own GitHub credential; none is ever visible here.
+    Failed CI on a bound pull request is later reported back to this thread.
+
+    Returns the parsed response: ``{"pull_request": {"number", "html_url",
+    "node_id"}, "bound": true}``, or ``"bound": false`` with a ``reason`` when
+    the pull request was created but could not be bound. HTTP errors from the
+    API (for example 409 ``github_oauth_required``) raise ``urllib.error.HTTPError``.
     """
     repository = repository.strip()
     if not _PR_REPOSITORY_PATTERN.match(repository):
         raise ValueError(f"repository must be 'owner/repo', got {repository!r}")
-    if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
-        raise ValueError(f"number must be a positive integer, got {number!r}")
+    for name, value in (("head", head), ("base", base), ("title", title)):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} must be a non-empty string")
+    if not isinstance(body, str):
+        raise ValueError("body must be a string")
+    if not isinstance(draft, bool):
+        raise ValueError("draft must be a boolean")
     thread_key = current_thread_key()
     base_url = secret("CENTAUR_API_URL", "http://api:8000").rstrip("/")
+    payload = {
+        "repository": repository,
+        "head": head.strip(),
+        "base": base.strip(),
+        "title": title,
+        "body": body,
+        "draft": draft,
+    }
     request = urllib.request.Request(
-        f"{base_url}/api/session/{quote(thread_key, safe='')}/pr-bindings",
-        data=json.dumps({"repository": repository.lower(), "number": number}).encode(),
+        f"{base_url}/api/session/{quote(thread_key, safe='')}/pull-requests",
+        data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with urllib.request.urlopen(request, timeout=60) as response:
         return json.loads(response.read())
 
 

@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use centaur_sandbox_core::{
-    ObservedSandbox, SandboxBackend, SandboxHandle, SandboxId, SandboxIo, SandboxResult,
-    SandboxSpec, SandboxStatus,
+    ObservedSandbox, ProxyHttpsResponse, SandboxBackend, SandboxHandle, SandboxId, SandboxIo,
+    SandboxResult, SandboxSpec, SandboxStatus,
 };
 use centaur_telemetry::{record_sandbox_operation, record_sandbox_startup_duration};
 use tokio::time::Instant;
@@ -222,6 +222,21 @@ impl SandboxManager {
             .await
     }
 
+    /// Create a pull request through the sandbox's proxy; see
+    /// [`SandboxBackend::create_github_pull_request`]. Backends without proxy
+    /// support return `SandboxError::Unsupported`.
+    pub async fn create_github_pull_request(
+        &self,
+        id: &SandboxId,
+        owner: &str,
+        repo: &str,
+        payload: serde_json::Value,
+    ) -> SandboxResult<ProxyHttpsResponse> {
+        self.backend
+            .create_github_pull_request(id, owner, repo, payload)
+            .await
+    }
+
     pub async fn enable_observability(&self, id: &SandboxId) -> SandboxResult<()> {
         self.backend.enable_observability(id).await
     }
@@ -241,4 +256,97 @@ impl SandboxManager {
 
 fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use serde_json::json;
+
+    use super::*;
+
+    type PullRequestCall = (String, String, String, serde_json::Value);
+
+    #[derive(Default)]
+    struct Backend {
+        calls: Mutex<Vec<PullRequestCall>>,
+    }
+
+    #[async_trait]
+    impl SandboxBackend for Backend {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+        async fn create(&self, _spec: SandboxSpec) -> SandboxResult<SandboxHandle> {
+            unreachable!()
+        }
+        async fn open_io(&self, _id: &SandboxId) -> SandboxResult<SandboxIo> {
+            unreachable!()
+        }
+        async fn status(&self, _id: &SandboxId) -> SandboxResult<SandboxStatus> {
+            unreachable!()
+        }
+        async fn observe(&self, _id: &SandboxId) -> SandboxResult<ObservedSandbox> {
+            unreachable!()
+        }
+        async fn list_observed(&self) -> SandboxResult<Vec<ObservedSandbox>> {
+            unreachable!()
+        }
+        async fn stop(&self, _id: &SandboxId) -> SandboxResult<()> {
+            unreachable!()
+        }
+        async fn pause(&self, _id: &SandboxId) -> SandboxResult<()> {
+            unreachable!()
+        }
+        async fn resume(&self, _id: &SandboxId) -> SandboxResult<()> {
+            unreachable!()
+        }
+        async fn create_github_pull_request(
+            &self,
+            id: &SandboxId,
+            owner: &str,
+            repo: &str,
+            payload: serde_json::Value,
+        ) -> SandboxResult<ProxyHttpsResponse> {
+            self.calls.lock().unwrap().push((
+                id.as_str().to_owned(),
+                owner.to_owned(),
+                repo.to_owned(),
+                payload,
+            ));
+            Ok(ProxyHttpsResponse {
+                status: 201,
+                body: b"{}".to_vec(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn create_github_pull_request_passes_through_to_the_backend() {
+        let backend = Arc::new(Backend::default());
+        let manager = SandboxManager::new(backend.clone());
+
+        let response = manager
+            .create_github_pull_request(
+                &SandboxId::new("sbx-1"),
+                "acme",
+                "widgets",
+                json!({"title": "Fix"}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, 201);
+        assert_eq!(
+            *backend.calls.lock().unwrap(),
+            vec![(
+                "sbx-1".to_owned(),
+                "acme".to_owned(),
+                "widgets".to_owned(),
+                json!({"title": "Fix"})
+            )]
+        );
+    }
 }

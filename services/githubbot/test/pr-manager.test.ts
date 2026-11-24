@@ -96,6 +96,33 @@ describe("evaluateCi", () => {
     expect(result.failingNames.sort()).toEqual(["deploy-preview", "e2e", "lint"]);
   });
 
+  test("carries the first failing check's link, and a failing status's target url", () => {
+    const failing: CiCheck[] = [
+      { name: "build", status: "completed", conclusion: "success", url: "https://ci.example.test/ok" },
+      { name: "lint", status: "completed", conclusion: "failure", url: "https://ci.example.test/lint" },
+      { name: "e2e", status: "completed", conclusion: "failure", url: "https://ci.example.test/e2e" },
+    ];
+    expect(evaluateCi(failing, []).firstFailingUrl).toBe("https://ci.example.test/lint");
+    expect(
+      evaluateCi(
+        [{ name: "build", status: "completed", conclusion: "success" }],
+        [{ state: "failure", context: "deploy", url: "https://ci.example.test/deploy" }],
+      ),
+    ).toMatchObject({ failingNames: ["deploy"], firstFailingUrl: "https://ci.example.test/deploy" });
+  });
+
+  test("has no link when the first failure has none, and never borrows a later one", () => {
+    const result = evaluateCi(
+      [
+        { name: "lint", status: "completed", conclusion: "failure" },
+        { name: "e2e", status: "completed", conclusion: "failure", url: "https://ci.example.test/e2e" },
+      ],
+      [],
+    );
+    expect(result.failingNames[0]).toBe("lint");
+    expect(result.firstFailingUrl).toBeUndefined();
+  });
+
   test("pending legacy status keeps it unsettled", () => {
     const result = evaluateCi(
       [{ name: "build", status: "completed", conclusion: "success" }],
@@ -627,7 +654,15 @@ describe("PR management webhooks", () => {
 
     // Re-assigning an already-green PR merges too.
     mergeCalls = 0;
-    const reassigned = { ...ctx, state: makeState() } as unknown as PrManagerContext;
+    const reassigned = {
+      ...ctx,
+      options: {
+        ...ctx.options,
+        // Unbound: the binding lookup must not reach a real network.
+        fetch: () => Promise.resolve(new Response("{}", { status: 404 })),
+      },
+      state: makeState(),
+    } as unknown as PrManagerContext;
     await reassigned.state.set("centaur-githubbot:ci-settled:base/repo#7:abc123", "1");
     await handlePullRequestEvent(
       reassigned,
@@ -1471,5 +1506,403 @@ describe("management turn reaction ack", () => {
       content: "EYES",
     });
     await drainBackgroundWork(5_000);
+  });
+});
+
+describe("PR session bindings", () => {
+  const redCheckRun = JSON.stringify({
+    repository: { full_name: "base/repo" },
+    check_run: { head_sha: "abc123", pull_requests: [{ number: 7 }] },
+  });
+  const PR_URL = "https://github.com/base/repo/pull/7";
+  const FAILURE_URL = "https://ci.example.test/runs/1";
+
+  type Binding = { managed: boolean; closed: boolean };
+  type Call = { body: unknown; method: string; path: string };
+
+  function bindingJson(binding: Binding, headSha = "abc123") {
+    return {
+      repository: "base/repo",
+      number: 7,
+      thread_key: "slack:T0:C0:1700000000.000100",
+      head_sha: headSha,
+      ...binding,
+    };
+  }
+
+  /** In-memory api-rs: records every call, and any session (agent turn) call. */
+  function makeApi(input: { binding: Binding | null; lookupStatus?: number }) {
+    const calls: Call[] = [];
+    const sessionCalls: string[] = [];
+    const fetch = async (url: string | URL | Request, init?: RequestInit) => {
+      const path = new URL(String(url)).pathname;
+      const method = init?.method ?? "GET";
+      if (path.startsWith("/api/session/")) {
+        sessionCalls.push(path);
+        return new Response("no", { status: 400 });
+      }
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      calls.push({ body, method, path });
+      if (method === "GET") {
+        if (input.lookupStatus) return new Response("x", { status: input.lookupStatus });
+        if (!input.binding) return new Response("not found", { status: 404 });
+        return Response.json(bindingJson(input.binding));
+      }
+      if (path.endsWith("/ci-failures")) return Response.json({ notice: "queued" });
+      return Response.json(bindingJson(input.binding ?? { managed: false, closed: false }));
+    };
+    const posts = (suffix: string) =>
+      calls.filter((c) => c.method === "POST" && c.path.endsWith(suffix));
+    return { calls, fetch, posts, sessionCalls };
+  }
+
+  function makeCtx(input: {
+    api: ReturnType<typeof makeApi>;
+    assignees?: { login: string }[];
+    checkNode?: Record<string, unknown>;
+    // Head the PR reports on its Nth fetch (the last entry repeats).
+    heads?: string[];
+    prState?: string;
+    state?: ReturnType<typeof makeState>;
+    settled?: boolean;
+  }) {
+    const heads = input.heads ?? ["abc123"];
+    let fetches = 0;
+    const node = input.checkNode ?? {
+      __typename: "CheckRun",
+      name: "build",
+      status: input.settled === false ? "IN_PROGRESS" : "COMPLETED",
+      conclusion: input.settled === false ? null : "FAILURE",
+      detailsUrl: FAILURE_URL,
+      permalink: "https://github.com/base/repo/runs/1",
+    };
+    const comments: string[] = [];
+    const ctx = {
+      octokit: {
+        graphql: async () => ({
+          repository: {
+            object: {
+              statusCheckRollup: {
+                state: input.settled === false ? "PENDING" : "FAILURE",
+                contexts: {
+                  nodes: [node],
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                },
+              },
+            },
+          },
+        }),
+        rest: {
+          repos: {
+            getCommit: async () => ({ data: { author: { login: "centaur-bot" } } }),
+          },
+          pulls: {
+            get: async () => {
+              const head = heads[Math.min(fetches, heads.length - 1)];
+              fetches += 1;
+              return {
+                data: {
+                  ...prPayload({
+                    assignees: input.assignees,
+                    headRepoFullName: "base/repo",
+                    headSha: head,
+                  }),
+                  html_url: PR_URL,
+                  state: input.prState ?? "open",
+                },
+              };
+            },
+          },
+          issues: {
+            createComment: async (c: { body: string }) => {
+              comments.push(c.body);
+              return { data: {} };
+            },
+          },
+        },
+      },
+      options: {
+        apiUrl: "http://localhost",
+        ciFixMaxAttempts: 3,
+        escalationHandle: "maintainer",
+        logger: quietLogger,
+        fetch: input.api.fetch,
+      },
+      state: input.state ?? makeState(),
+      userName: "centaur-bot",
+    } as unknown as PrManagerContext;
+    return { comments, ctx };
+  }
+
+  const PR_KEY = "centaur-githubbot:pr:base/repo#7";
+
+  describe("failed CI", () => {
+    test("an unbound red PR still gets the fix turn", async () => {
+      const api = makeApi({ binding: null });
+      const state = makeState();
+      const { ctx } = makeCtx({ api, state });
+      await handleCiEvent(ctx, "check_run", redCheckRun);
+      await drainBackgroundWork(2000);
+      expect(api.sessionCalls.length).toBeGreaterThan(0);
+      expect(await state.get(PR_KEY)).toMatchObject({ consecutiveCiFixes: 1 });
+      expect(api.posts("/ci-failures")).toHaveLength(0);
+    });
+
+    test("a bound, managed red PR reports once, with the failing check and its link", async () => {
+      const api = makeApi({ binding: { managed: true, closed: false } });
+      const state = makeState();
+      const { ctx, comments } = makeCtx({ api, state });
+      await handleCiEvent(ctx, "check_run", redCheckRun);
+      await drainBackgroundWork(2000);
+      const reports = api.posts("/api/pr-bindings/base/repo/7/ci-failures");
+      expect(reports.map((r) => r.body)).toEqual([
+        {
+          head_sha: "abc123",
+          current_head_sha: "abc123",
+          open: true,
+          assigned: true,
+          check_name: "build",
+          details_url: FAILURE_URL,
+          html_url: PR_URL,
+        },
+      ]);
+      // No agent turn, no escalation, and the fix counter is untouched.
+      expect(api.sessionCalls).toEqual([]);
+      expect(comments).toEqual([]);
+      expect(await state.get(PR_KEY)).toBeUndefined();
+    });
+
+    test("falls back to the check's permalink, and to a status target url", async () => {
+      for (const [node, expected] of [
+        [
+          { __typename: "CheckRun", name: "build", status: "COMPLETED", conclusion: "FAILURE", permalink: "https://github.com/base/repo/runs/9" },
+          { name: "build", url: "https://github.com/base/repo/runs/9" },
+        ],
+        [
+          { __typename: "StatusContext", context: "deploy", state: "FAILURE", targetUrl: "https://ci.example.test/deploy/3" },
+          { name: "deploy", url: "https://ci.example.test/deploy/3" },
+        ],
+      ] as const) {
+        const api = makeApi({ binding: { managed: true, closed: false } });
+        const { ctx } = makeCtx({ api, checkNode: { ...node } });
+        await handleCiEvent(ctx, "check_run", redCheckRun);
+        expect(api.posts("/ci-failures")[0]?.body).toMatchObject({
+          check_name: expected.name,
+          details_url: expected.url,
+        });
+      }
+    });
+
+    test("omits the link when GitHub gives none", async () => {
+      const api = makeApi({ binding: { managed: true, closed: false } });
+      const { ctx } = makeCtx({
+        api,
+        checkNode: { __typename: "CheckRun", name: "build", status: "COMPLETED", conclusion: "FAILURE" },
+      });
+      await handleCiEvent(ctx, "check_run", redCheckRun);
+      const body = api.posts("/ci-failures")[0]?.body as Record<string, unknown>;
+      expect(body.check_name).toBe("build");
+      expect("details_url" in body).toBe(false);
+    });
+
+    test("a repeat delivery for the same head does not report twice", async () => {
+      const api = makeApi({ binding: { managed: true, closed: false } });
+      const { ctx } = makeCtx({ api });
+      await handleCiEvent(ctx, "check_run", redCheckRun);
+      await handleCiEvent(ctx, "check_run", redCheckRun);
+      expect(api.posts("/ci-failures")).toHaveLength(1);
+    });
+
+    test("a stale head is not reported, whether stale at the event or by report time", async () => {
+      const api = makeApi({ binding: { managed: true, closed: false } });
+      // The failing head is no longer the PR's head.
+      await handleCiEvent(makeCtx({ api, heads: ["def456"] }).ctx, "check_run", redCheckRun);
+      // The head moves between the first read and the report.
+      await handleCiEvent(makeCtx({ api, heads: ["abc123", "def456"] }).ctx, "check_run", redCheckRun);
+      expect(api.posts("/ci-failures")).toHaveLength(0);
+      expect(api.sessionCalls).toEqual([]);
+    });
+
+    test("a closed binding, or one not managed, is not reported", async () => {
+      for (const binding of [
+        { managed: true, closed: true },
+        { managed: false, closed: false },
+        { managed: false, closed: true },
+      ]) {
+        const api = makeApi({ binding });
+        const state = makeState();
+        const { ctx } = makeCtx({ api, state });
+        await handleCiEvent(ctx, "check_run", redCheckRun);
+        await drainBackgroundWork(2000);
+        expect(api.posts("/ci-failures")).toHaveLength(0);
+        // Never falls back to the unbound fix turn either.
+        expect(api.sessionCalls).toEqual([]);
+        expect(await state.get(PR_KEY)).toBeUndefined();
+      }
+    });
+
+    test("passes the fresh open and assigned facts through for api-rs to judge", async () => {
+      const api = makeApi({ binding: { managed: true, closed: false } });
+      const { ctx } = makeCtx({ api, prState: "closed" });
+      await handleCiEvent(ctx, "check_run", redCheckRun);
+      expect(api.posts("/ci-failures")[0]?.body).toMatchObject({
+        open: false,
+        assigned: true,
+      });
+    });
+
+    test("never escalates a bound PR, even at the attempt cap", async () => {
+      const api = makeApi({ binding: { managed: true, closed: false } });
+      const state = makeState();
+      await state.set(PR_KEY, { consecutiveCiFixes: 3 });
+      const { ctx, comments } = makeCtx({ api, state });
+      await handleCiEvent(ctx, "check_run", redCheckRun);
+      expect(comments).toEqual([]);
+      expect(api.posts("/ci-failures")).toHaveLength(1);
+      expect(await state.get(PR_KEY)).toEqual({ consecutiveCiFixes: 3 });
+    });
+
+    test("an unreachable api-rs runs no turn, and a later delivery retries the report", async () => {
+      const failing = makeApi({ binding: null, lookupStatus: 503 });
+      const state = makeState();
+      await handleCiEvent(makeCtx({ api: failing, state }).ctx, "check_run", redCheckRun);
+      await drainBackgroundWork(2000);
+      expect(failing.sessionCalls).toEqual([]);
+      expect(await state.get(PR_KEY)).toBeUndefined();
+
+      const recovered = makeApi({ binding: { managed: true, closed: false } });
+      await handleCiEvent(makeCtx({ api: recovered, state }).ctx, "check_run", redCheckRun);
+      expect(recovered.posts("/ci-failures")).toHaveLength(1);
+    });
+
+    test("a failed report releases the head's claim so a later delivery retries", async () => {
+      const api = makeApi({ binding: { managed: true, closed: false } });
+      const state = makeState();
+      const realFetch = api.fetch;
+      let failReports = true;
+      const flaky = {
+        ...api,
+        fetch: async (url: string | URL | Request, init?: RequestInit) =>
+          failReports && String(url).endsWith("/ci-failures")
+            ? new Response("no", { status: 503 })
+            : realFetch(url, init),
+      };
+      await handleCiEvent(makeCtx({ api: flaky, state }).ctx, "check_run", redCheckRun);
+      failReports = false;
+      await handleCiEvent(makeCtx({ api: flaky, state }).ctx, "check_run", redCheckRun);
+      expect(api.posts("/ci-failures")).toHaveLength(1);
+    });
+  });
+
+  describe("lifecycle state", () => {
+    function prEvent(
+      action: string,
+      extra: Record<string, unknown> = {},
+      head = "old000",
+    ) {
+      return JSON.stringify({
+        action,
+        repository: { full_name: "base/repo" },
+        pull_request: { number: 7, head: { sha: head } },
+        ...extra,
+      });
+    }
+
+    async function run(
+      binding: Binding | null,
+      body: string,
+      opts: { assignees?: { login: string }[]; heads?: string[] } = {},
+    ) {
+      const api = makeApi({ binding });
+      const { ctx } = makeCtx({ api, settled: false, ...opts });
+      await handlePullRequestEvent(ctx, body);
+      await drainBackgroundWork(2000);
+      return api.posts("/api/pr-bindings/base/repo/7/state").map((c) => c.body);
+    }
+
+    const bound = { managed: false, closed: false };
+
+    test("explicitly assigning the bot sets managed, at the PR's current head", async () => {
+      const updates = await run(
+        bound,
+        prEvent("assigned", { assignee: { login: "Centaur-Bot" } }),
+        { heads: ["fresh11"] },
+      );
+      expect(updates).toEqual([{ managed: true, head_sha: "fresh11" }]);
+    });
+
+    test("assigning someone else does not, even with the bot already assigned", async () => {
+      const updates = await run(
+        bound,
+        prEvent("assigned", { assignee: { login: "a-human" } }),
+        { assignees: [{ login: "centaur-bot" }, { login: "a-human" }] },
+      );
+      expect(updates).toEqual([]);
+    });
+
+    test("unassigning the bot clears managed; unassigning someone else does not", async () => {
+      expect(
+        await run({ managed: true, closed: false }, prEvent("unassigned", { assignee: { login: "centaur-bot" } }), {
+          assignees: [],
+        }),
+      ).toEqual([{ managed: false }]);
+      expect(
+        await run({ managed: true, closed: false }, prEvent("unassigned", { assignee: { login: "a-human" } })),
+      ).toEqual([]);
+    });
+
+    test("closed, reopened and synchronize record closure and the new head", async () => {
+      expect(await run(bound, prEvent("closed"))).toEqual([{ closed: true }]);
+      expect(await run(bound, prEvent("reopened"))).toEqual([{ closed: false }]);
+      expect(await run(bound, prEvent("synchronize", {}, "new789"))).toEqual([
+        { head_sha: "new789" },
+      ]);
+    });
+
+    test("an unbound PR records nothing and keeps its existing handling", async () => {
+      for (const body of [
+        prEvent("assigned", { assignee: { login: "centaur-bot" } }),
+        prEvent("unassigned", { assignee: { login: "centaur-bot" } }),
+        prEvent("closed"),
+        prEvent("reopened"),
+        prEvent("synchronize"),
+      ]) {
+        expect(await run(null, body)).toEqual([]);
+      }
+    });
+
+    test("assigning the bot to an unbound red PR still takes it over with a fix turn", async () => {
+      const api = makeApi({ binding: null });
+      const { ctx } = makeCtx({ api });
+      await handlePullRequestEvent(ctx, prEvent("assigned", { assignee: { login: "centaur-bot" } }, "abc123"));
+      await drainBackgroundWork(2000);
+      expect(api.sessionCalls.length).toBeGreaterThan(0);
+    });
+
+    test("assigning the bot to a bound red PR reports it instead of running a turn", async () => {
+      const api = makeApi({ binding: bound });
+      const { ctx } = makeCtx({ api });
+      await handlePullRequestEvent(ctx, prEvent("assigned", { assignee: { login: "centaur-bot" } }, "abc123"));
+      await drainBackgroundWork(2000);
+      expect(api.sessionCalls).toEqual([]);
+      // The mock binding still reads unmanaged, so api-rs's own state decides;
+      // githubbot never ran a turn and never touched the fix counter.
+      expect(api.posts("/state")[0]?.body).toMatchObject({ managed: true });
+    });
+
+    test("a state-update failure does not break the existing handling", async () => {
+      const api = makeApi({ binding: bound });
+      const failing = {
+        ...api,
+        fetch: async (url: string | URL | Request, init?: RequestInit) =>
+          String(url).endsWith("/state")
+            ? new Response("no", { status: 500 })
+            : api.fetch(url, init),
+      };
+      const { ctx } = makeCtx({ api: failing, settled: false });
+      await expect(
+        handlePullRequestEvent(ctx, prEvent("assigned", { assignee: { login: "centaur-bot" } })),
+      ).resolves.toBeUndefined();
+    });
   });
 });

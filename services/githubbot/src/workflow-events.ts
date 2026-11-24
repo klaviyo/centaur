@@ -75,13 +75,21 @@ export function isCentaurSkipCheck(name: string | null | undefined): boolean {
   return (name ?? "").toLowerCase().includes(CENTAUR_SKIP_MARKER);
 }
 
-export type CiCheck = { status: string; conclusion: string | null; name: string };
-export type CiStatus = { state: string; context: string };
+export type CiCheck = {
+  status: string;
+  conclusion: string | null;
+  name: string;
+  /** Where the check's own page or log lives (details or html URL). */
+  url?: string | null;
+};
+export type CiStatus = { state: string; context: string; url?: string | null };
 
 export type CiEvaluation = {
   settled: boolean;
   failed: boolean;
   failingNames: string[];
+  /** Link to the failure behind `failingNames[0]`, when GitHub gave one. */
+  firstFailingUrl?: string;
 };
 
 export function evaluateCi(
@@ -105,10 +113,12 @@ export function evaluateCi(
     ...failingChecks.map((c) => c.name),
     ...failingStatuses.map((s) => s.context),
   ];
+  const firstFailingUrl = (failingChecks[0] ?? failingStatuses[0])?.url;
   return {
     settled: !anyCheckPending && !anyStatusPending,
     failed: failingNames.length > 0,
     failingNames,
+    ...(firstFailingUrl ? { firstFailingUrl } : {}),
   };
 }
 
@@ -128,6 +138,8 @@ const CI_ROLLUP_QUERY = `query($owner: String!, $repo: String!, $sha: GitObjectI
                 status
                 conclusion
                 startedAt
+                detailsUrl
+                permalink
                 checkSuite {
                   app { slug }
                   workflowRun {
@@ -136,7 +148,7 @@ const CI_ROLLUP_QUERY = `query($owner: String!, $repo: String!, $sha: GitObjectI
                   }
                 }
               }
-              ... on StatusContext { context state createdAt }
+              ... on StatusContext { context state createdAt targetUrl }
             }
             pageInfo { hasNextPage endCursor }
             checkRunCountsByState { state count }
@@ -158,6 +170,9 @@ type CiRollupContext = {
     } | null;
   } | null;
   createdAt?: string | null;
+  detailsUrl?: string | null;
+  permalink?: string | null;
+  targetUrl?: string | null;
   name?: string;
   status?: string;
   conclusion?: string | null;
@@ -268,6 +283,7 @@ export async function fetchCiEvaluation(
     // OR-ing it in would undo the filter. A readable detail set is authoritative.
     failed: detail ? detail.failed : rollupState === "FAILURE" || rollupState === "ERROR",
     failingNames: detail?.failingNames ?? [],
+    ...(detail?.firstFailingUrl ? { firstFailingUrl: detail.firstFailingUrl } : {}),
   };
 }
 
@@ -324,14 +340,20 @@ async function evaluateCiViaActions(
         status: job.status.toLowerCase(),
         conclusion: job.conclusion?.toLowerCase() ?? null,
         name: job.name,
+        url: job.htmlUrl,
       })),
-    statuses.map((node) => ({ state: node.state.toLowerCase(), context: node.context })),
+    statuses.map((node) => ({
+      state: node.state.toLowerCase(),
+      context: node.context,
+      url: node.targetUrl,
+    })),
   );
 }
 
 type ActionsCiJob = {
   conclusion: string | null;
   event: string;
+  htmlUrl: string | null;
   name: string;
   runAttempt: number;
   runId: number;
@@ -374,6 +396,7 @@ async function fetchActionsJobs(
         ...response.data.jobs.map((job) => ({
           conclusion: job.conclusion ?? null,
           event: run.event,
+          htmlUrl: job.html_url ?? null,
           name: job.name,
           runAttempt: job.run_attempt ?? run.run_attempt ?? 0,
           runId: run.id,
@@ -411,10 +434,12 @@ function evaluateCiRollupContexts(nodes: CiRollupContext[]): CiEvaluation {
       status: node.status.toLowerCase(),
       conclusion: node.conclusion?.toLowerCase() ?? null,
       name: node.name,
+      url: node.detailsUrl ?? node.permalink,
     }));
   const statuses = latestCiStatuses(nodes).map((node) => ({
     state: node.state.toLowerCase(),
     context: node.context,
+    url: node.targetUrl,
   }));
   return evaluateCi(checks, statuses);
 }

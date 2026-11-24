@@ -15,7 +15,9 @@ use absurd::{
 };
 use centaur_iron_control::{IronControlClient, IronControlError, PrincipalInput, slugify};
 use centaur_sandbox_core::SandboxSpec;
-use centaur_session_core::{HarnessType, MessageRole, SessionMessageInput, ThreadKey};
+use centaur_session_core::{
+    ChatDestination, HarnessType, MessageRole, SessionMessageInput, ThreadKey,
+};
 use centaur_session_runtime::{
     ExecuteSessionInput, HarnessConflictPolicy, SESSION_OUTPUT_LINE_EVENT, SandboxRuntime,
     SessionRuntime,
@@ -2881,6 +2883,20 @@ async fn run_centaur_workflow_inner(
                 }),
             })
         }
+        "pr_ci_notice" => {
+            let (steps, output) =
+                run_pr_ci_notice(&ctx, session_runtime.store(), &input.input, |message| {
+                    send_slack_request("chat.postMessage", message)
+                })
+                .await?;
+            Ok(WorkflowResult {
+                workflow_name: input.workflow_name,
+                run_id: ctx.run_id().to_owned(),
+                task_id: ctx.task_id().to_owned(),
+                steps,
+                output,
+            })
+        }
         _ => {
             let workflow_name = input.workflow_name.clone();
             let output = run_python_workflow_host(
@@ -4280,6 +4296,150 @@ async fn post_tool_result_to_slack(
     )
     .await?;
     Ok(slack_post_result_from_response(channel, response))
+}
+
+/// Input of the built-in `pr_ci_notice` workflow. It names the pull request
+/// and the failing check, never where to post: the destination comes from the
+/// stored binding.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PrCiNoticeInput {
+    pub repository: String,
+    pub number: i64,
+    pub head_sha: String,
+    pub check_name: String,
+    #[serde(default)]
+    pub details_url: Option<String>,
+    pub html_url: String,
+}
+
+/// The `pr_ci_notice` workflow: one failed-CI notice in the Slack thread a
+/// pull request is bound to.
+///
+/// Step `recheck` reloads the binding, because the request that spawned this
+/// run may be stale by the time it executes: the PR may have closed, been
+/// unassigned, or moved to a newer head. Only a binding that is still managed,
+/// open and at this head proceeds to step `slack:notice`, which posts into the
+/// thread the binding names. A skip is a completed run, never a retry.
+async fn run_pr_ci_notice<P, Fut>(
+    ctx: &TaskContext,
+    store: &PgSessionStore,
+    input: &Value,
+    post: P,
+) -> absurd::Result<(Vec<String>, Value)>
+where
+    P: Fn(Value) -> Fut + Sync,
+    Fut: Future<Output = Result<Value, WorkflowRuntimeError>> + Send,
+{
+    let input: PrCiNoticeInput =
+        serde_json::from_value(input.clone()).map_err(|error| absurd_error(error.into()))?;
+    let recheck = ctx
+        .step("recheck", || async {
+            pr_ci_notice_recheck(store, &input)
+                .await
+                .map_err(absurd_error)
+        })
+        .await?;
+    let Some(thread_key) = recheck.get("thread_key").and_then(Value::as_str) else {
+        return Ok((vec!["recheck".to_owned()], recheck));
+    };
+    let message = pr_ci_notice_message(thread_key, &input, ctx.task_id()).map_err(absurd_error)?;
+    let slack = ctx
+        .step("slack:notice", || async {
+            let channel = message["channel"].as_str().unwrap_or_default().to_owned();
+            let response = post(message.clone()).await.map_err(absurd_error)?;
+            Ok(slack_post_result_from_response(&channel, response))
+        })
+        .await?;
+    Ok((
+        vec!["recheck".to_owned(), "slack:notice".to_owned()],
+        json!({ "thread_key": thread_key, "slack": slack }),
+    ))
+}
+
+/// Output of the `recheck` step: `{"thread_key"}` to proceed, or
+/// `{"skipped": reason}`.
+async fn pr_ci_notice_recheck(
+    store: &PgSessionStore,
+    input: &PrCiNoticeInput,
+) -> Result<Value, WorkflowRuntimeError> {
+    let skipped = |reason: &str| Ok(json!({ "skipped": reason }));
+    let Some(binding) = store.pr_binding(&input.repository, input.number).await? else {
+        return skipped("unbound");
+    };
+    if binding.closed {
+        return skipped("closed");
+    }
+    if !binding.managed {
+        return skipped("not_managed");
+    }
+    if binding.head_sha != input.head_sha {
+        return skipped("stale_head");
+    }
+    // Only a Slack thread outside a DM is ever a binding's destination.
+    match binding.thread_key.chat_destination() {
+        Some(ChatDestination::Slack { channel_id, .. }) if !channel_id.starts_with('D') => {
+            Ok(json!({ "thread_key": binding.thread_key.as_str() }))
+        }
+        _ => skipped("not_slack_thread"),
+    }
+}
+
+/// The `chat.postMessage` payload for a notice in the thread `thread_key`. The
+/// channel and `thread_ts` come only from the bound thread key; the text only
+/// from the check's own fields, escaped for Slack mrkdwn.
+fn pr_ci_notice_message(
+    thread_key: &str,
+    input: &PrCiNoticeInput,
+    client_msg_id: &str,
+) -> Result<Value, WorkflowRuntimeError> {
+    let Some(ChatDestination::Slack {
+        channel_id,
+        thread_ts,
+    }) = ThreadKey::parse(thread_key)?.chat_destination()
+    else {
+        return Err(WorkflowRuntimeError::BadRequest(
+            "PR binding thread is not a Slack thread".to_owned(),
+        ));
+    };
+    let sha7: String = input.head_sha.chars().take(7).collect();
+    let pull_request = slack_link(
+        Some(&input.html_url),
+        &format!("{}#{}", input.repository, input.number),
+    );
+    let check = slack_link(input.details_url.as_deref(), &input.check_name);
+    Ok(json!({
+        "channel": channel_id,
+        "thread_ts": thread_ts,
+        "text": format!(
+            "CI failed on {pull_request} at `{sha7}`: {check}\nReply in this thread if you'd like me to fix it."
+        ),
+        "unfurl_links": false,
+        "unfurl_media": false,
+        "client_msg_id": client_msg_id,
+    }))
+}
+
+/// `<url|label>` for an https `url`, otherwise just the escaped label. A URL
+/// that could break out of the link markup is never embedded.
+fn slack_link(url: Option<&str>, label: &str) -> String {
+    let label = escape_slack_mrkdwn(label);
+    match url {
+        Some(url)
+            if url.starts_with("https://")
+                && !url.chars().any(|c| {
+                    c.is_whitespace() || c.is_control() || matches!(c, '<' | '>' | '|')
+                }) =>
+        {
+            format!("<{url}|{label}>")
+        }
+        _ => label,
+    }
+}
+
+fn escape_slack_mrkdwn(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 async fn post_python_slack_message(
@@ -5920,5 +6080,377 @@ mod tests {
 
         set_execution_persona_metadata(&mut metadata, None);
         assert!(metadata.get("persona").is_none());
+    }
+}
+
+#[cfg(test)]
+mod pr_ci_notice_tests {
+    use std::{collections::BTreeMap, sync::Arc};
+
+    use absurd::{Client, ClientOptions, SpawnOptions, TaskResultSnapshot, WorkBatchOptions};
+    use centaur_session_sqlx::{NewPrBinding, PrBindingStateUpdate, TextSearchBackend};
+    use tokio::sync::Mutex;
+
+    use super::*;
+
+    fn notice_input(head_sha: &str) -> PrCiNoticeInput {
+        PrCiNoticeInput {
+            repository: "acme/widgets".to_owned(),
+            number: 7,
+            head_sha: head_sha.to_owned(),
+            check_name: "unit tests".to_owned(),
+            details_url: Some("https://github.com/acme/widgets/actions/runs/1".to_owned()),
+            html_url: "https://github.com/acme/widgets/pull/7".to_owned(),
+        }
+    }
+
+    #[test]
+    fn the_notice_names_the_pr_the_failing_check_and_the_short_head() {
+        let message = pr_ci_notice_message(
+            "slack:T0TEST:C0TEST:1700000000.000100",
+            &notice_input("abcdef1234567890"),
+            "task-1",
+        )
+        .unwrap();
+        assert_eq!(
+            message,
+            json!({
+                "channel": "C0TEST",
+                "thread_ts": "1700000000.000100",
+                "text": "CI failed on <https://github.com/acme/widgets/pull/7|acme/widgets#7> at `abcdef1`: <https://github.com/acme/widgets/actions/runs/1|unit tests>\nReply in this thread if you'd like me to fix it.",
+                "unfurl_links": false,
+                "unfurl_media": false,
+                "client_msg_id": "task-1",
+            })
+        );
+    }
+
+    #[test]
+    fn the_destination_comes_only_from_the_bound_thread_key() {
+        // Both Slack key shapes name their own channel and thread; nothing in
+        // the input can redirect the post.
+        for (thread_key, channel, thread_ts) in [
+            ("slack:T0TEST:C0ONE:1.000100", "C0ONE", "1.000100"),
+            ("slack:G0TWO:2.000200", "G0TWO", "2.000200"),
+        ] {
+            let message =
+                pr_ci_notice_message(thread_key, &notice_input("abcdef1"), "task-1").unwrap();
+            assert_eq!(message["channel"], channel);
+            assert_eq!(message["thread_ts"], thread_ts);
+        }
+        for thread_key in ["github:acme/widgets:7", "discord:1:2", "cli:test"] {
+            assert!(
+                pr_ci_notice_message(thread_key, &notice_input("abcdef1"), "task-1").is_err(),
+                "{thread_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_notice_links_only_safe_urls_and_escapes_the_check_name() {
+        let mut input = notice_input("abc");
+        input.details_url = None;
+        input.check_name = "build <all> & test".to_owned();
+        let message = pr_ci_notice_message("slack:T0TEST:C0TEST:1.1", &input, "task-1").unwrap();
+        assert_eq!(
+            message["text"],
+            "CI failed on <https://github.com/acme/widgets/pull/7|acme/widgets#7> at `abc`: build &lt;all&gt; &amp; test\nReply in this thread if you'd like me to fix it."
+        );
+
+        // A URL that could close the link markup, or a non-https one, is
+        // dropped to plain text rather than embedded.
+        for url in [
+            "https://x.example/a|b",
+            "https://x.example/a>b",
+            "https://x.example/a b",
+            "javascript:alert(1)",
+            "http://x.example/",
+        ] {
+            input.details_url = Some(url.to_owned());
+            let message =
+                pr_ci_notice_message("slack:T0TEST:C0TEST:1.1", &input, "task-1").unwrap();
+            let text = message["text"].as_str().unwrap();
+            assert!(!text.contains(url), "{url}: {text}");
+            assert!(
+                text.contains("build &lt;all&gt; &amp; test"),
+                "{url}: {text}"
+            );
+        }
+    }
+
+    struct Fixture {
+        store: PgSessionStore,
+        client: Client,
+        posts: Arc<Mutex<Vec<Value>>>,
+        repository: String,
+    }
+
+    impl Fixture {
+        async fn new() -> Option<Self> {
+            let Ok(url) = std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL") else {
+                eprintln!("skipping: SESSION_RUNTIME_TEST_DATABASE_URL not set");
+                return None;
+            };
+            let store = PgSessionStore::connect(&url).await.unwrap();
+            store
+                .run_migrations(TextSearchBackend::Postgres)
+                .await
+                .unwrap();
+            let client = Client::from_pool_with_options(
+                store.pool().clone(),
+                ClientOptions {
+                    queue_name: format!("pr_notice_{}", uuid::Uuid::new_v4().simple()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            client.create_queue(None, Default::default()).await.unwrap();
+            let posts = Arc::new(Mutex::new(Vec::<Value>::new()));
+            client
+                .register_task("pr_ci_notice_test", {
+                    let store = store.clone();
+                    let posts = posts.clone();
+                    move |input: Value, ctx| {
+                        let store = store.clone();
+                        let posts = posts.clone();
+                        async move {
+                            let (steps, output) = run_pr_ci_notice(&ctx, &store, &input, |message| {
+                                let posts = posts.clone();
+                                async move {
+                                    posts.lock().await.push(message);
+                                    Ok(json!({"ok": true, "channel": "C0TEST", "ts": "1700000001.000200"}))
+                                }
+                            })
+                            .await?;
+                            Ok(json!({"steps": steps, "output": output}))
+                        }
+                    }
+                })
+                .unwrap();
+            Some(Self {
+                store,
+                client,
+                posts,
+                repository: format!("acme/widgets-{}", uuid::Uuid::new_v4().simple()),
+            })
+        }
+
+        async fn bind(&self, thread_key: &str, managed: bool) {
+            let thread_key = ThreadKey::parse(thread_key).unwrap();
+            self.store
+                .create_or_get_session(
+                    &thread_key,
+                    &HarnessType::Codex,
+                    None,
+                    json!({}),
+                    BTreeMap::new(),
+                )
+                .await
+                .unwrap();
+            self.store
+                .insert_pr_binding(&NewPrBinding {
+                    repository: self.repository.clone(),
+                    number: 7,
+                    thread_key,
+                    pr_id: 1,
+                    pr_node_id: format!("PR_{}", uuid::Uuid::new_v4().simple()),
+                    author_github_id: 90_210_001,
+                    author_login: "ada".to_owned(),
+                    sandbox_id: "sbx-1".to_owned(),
+                    head_ref: "fix".to_owned(),
+                    base_ref: "main".to_owned(),
+                    head_sha: "abcdef1".to_owned(),
+                })
+                .await
+                .unwrap();
+            if managed {
+                self.update(PrBindingStateUpdate {
+                    managed: Some(true),
+                    ..Default::default()
+                })
+                .await;
+            }
+        }
+
+        async fn update(&self, update: PrBindingStateUpdate) {
+            self.store
+                .update_pr_binding_state(&self.repository, 7, &update)
+                .await
+                .unwrap();
+        }
+
+        /// Spawns the notice for `head_sha`, lets the worker run it, and
+        /// returns its task id and result.
+        async fn run(&self, head_sha: &str) -> (String, Value) {
+            let mut input = serde_json::to_value(notice_input(head_sha)).unwrap();
+            input["repository"] = json!(self.repository);
+            let spawn = self
+                .client
+                .spawn(
+                    "pr_ci_notice_test",
+                    &input,
+                    SpawnOptions {
+                        idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
+                        max_attempts: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            self.work(&spawn.task_id).await
+        }
+
+        async fn work(&self, task_id: &str) -> (String, Value) {
+            self.client
+                .work_batch(WorkBatchOptions::default())
+                .await
+                .unwrap();
+            let outcome = self
+                .client
+                .fetch_task_result(task_id, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(outcome, TaskResultSnapshot::Completed { .. }),
+                "{outcome:?}"
+            );
+            (
+                task_id.to_owned(),
+                outcome.result::<Value>().unwrap().unwrap(),
+            )
+        }
+
+        async fn cleanup(self) {
+            self.client.drop_queue(None).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_managed_open_bound_pr_at_the_failing_head_gets_one_notice_in_its_thread() {
+        let Some(f) = Fixture::new().await else {
+            return;
+        };
+        f.bind("slack:T0TEST:C0TEST:1700000000.000100", true).await;
+
+        let (task_id, result) = f.run("abcdef1").await;
+
+        assert_eq!(result["steps"], json!(["recheck", "slack:notice"]));
+        assert_eq!(
+            result["output"]["thread_key"],
+            "slack:T0TEST:C0TEST:1700000000.000100"
+        );
+        assert_eq!(result["output"]["slack"]["ts"], "1700000001.000200");
+        let posts = f.posts.lock().await.clone();
+        assert_eq!(posts.len(), 1, "{posts:?}");
+        assert_eq!(posts[0]["channel"], "C0TEST");
+        assert_eq!(posts[0]["thread_ts"], "1700000000.000100");
+        assert_eq!(posts[0]["client_msg_id"], task_id);
+        assert_eq!(posts[0]["unfurl_links"], false);
+        assert_eq!(posts[0]["unfurl_media"], false);
+        assert!(
+            posts[0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("CI failed on <https://github.com/acme/widgets/pull/7|"),
+            "{}",
+            posts[0]["text"]
+        );
+        f.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn the_notice_rechecks_the_binding_when_it_runs_and_skips_stale_work() {
+        let Some(f) = Fixture::new().await else {
+            return;
+        };
+        f.bind("slack:T0TEST:C0TEST:1700000000.000100", true).await;
+
+        // A newer head than the one that failed.
+        f.update(PrBindingStateUpdate {
+            head_sha: Some("fedcba9".to_owned()),
+            ..Default::default()
+        })
+        .await;
+        let (_, result) = f.run("abcdef1").await;
+        assert_eq!(result["steps"], json!(["recheck"]));
+        assert_eq!(result["output"], json!({"skipped": "stale_head"}));
+
+        // Unassigned (no longer managed).
+        f.update(PrBindingStateUpdate {
+            managed: Some(false),
+            head_sha: Some("abcdef1".to_owned()),
+            ..Default::default()
+        })
+        .await;
+        let (_, result) = f.run("abcdef1").await;
+        assert_eq!(result["output"], json!({"skipped": "not_managed"}));
+
+        // Closed after the run was queued but before it executed.
+        f.update(PrBindingStateUpdate {
+            managed: Some(true),
+            ..Default::default()
+        })
+        .await;
+        let mut input = serde_json::to_value(notice_input("abcdef1")).unwrap();
+        input["repository"] = json!(f.repository);
+        let spawn = f
+            .client
+            .spawn(
+                "pr_ci_notice_test",
+                &input,
+                SpawnOptions {
+                    idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
+                    max_attempts: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        f.update(PrBindingStateUpdate {
+            closed: Some(true),
+            ..Default::default()
+        })
+        .await;
+        let (_, result) = f.work(&spawn.task_id).await;
+        assert_eq!(result["output"], json!({"skipped": "closed"}));
+
+        assert!(f.posts.lock().await.is_empty());
+        f.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn an_unbound_pr_and_a_non_slack_or_dm_thread_get_no_notice() {
+        let Some(f) = Fixture::new().await else {
+            return;
+        };
+        // Nothing bound yet.
+        let (_, result) = f.run("abcdef1").await;
+        assert_eq!(result["output"], json!({"skipped": "unbound"}));
+
+        // A binding whose thread is a DM is never posted into.
+        f.bind("slack:T0TEST:D0TEST:1700000000.000100", true).await;
+        let (_, result) = f.run("abcdef1").await;
+        assert_eq!(result["output"], json!({"skipped": "not_slack_thread"}));
+
+        assert!(f.posts.lock().await.is_empty());
+        f.cleanup().await;
+    }
+
+    #[test]
+    fn the_workflow_takes_only_the_documented_input() {
+        let input: PrCiNoticeInput = serde_json::from_value(json!({
+            "repository": "acme/widgets",
+            "number": 7,
+            "head_sha": "abcdef1",
+            "check_name": "unit tests",
+            "html_url": "https://github.com/acme/widgets/pull/7",
+        }))
+        .unwrap();
+        assert_eq!(input.details_url, None);
+        assert!(
+            serde_json::from_value::<PrCiNoticeInput>(json!({"repository": "acme/widgets"}))
+                .is_err()
+        );
     }
 }

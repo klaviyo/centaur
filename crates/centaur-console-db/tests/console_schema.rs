@@ -10,7 +10,8 @@ use active_record_encryption::ActiveRecordEncryption;
 use centaur_console_db::{
     ApiClient, ApiClientPrincipal, REDACTED, SecretValues, SlackChannelPermission, Subject,
     api_client_principals, build_config, find_api_client, find_direct_slack_channel_permission,
-    find_principal, find_principal_by_foreign_id, find_user_id_by_email, models::Config,
+    find_principal, find_principal_by_foreign_id, find_user_id_by_email, github_user_id,
+    models::Config,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -135,6 +136,66 @@ impl Fixture {
         .fetch_one(&self.pool)
         .await
         .unwrap()
+    }
+
+    /// A brokered token for `provider` account `subject`, wrapped in a static
+    /// secret that injects `Authorization` on `host`, and granted to
+    /// `principal` at `priority`. Returns the static secret's id.
+    async fn brokered_token(
+        &self,
+        principal: i64,
+        label: &str,
+        provider: &str,
+        subject: Option<&str>,
+        host: &str,
+        priority: i32,
+    ) -> i64 {
+        let app: i64 = sqlx::query_scalar(
+            "INSERT INTO oauth_apps (slug, provider, client_id, created_by_id, created_at, updated_at) \
+             VALUES ($1, $2, 'client', $3, now(), now()) RETURNING id",
+        )
+        .bind(self.name(label))
+        .bind(provider)
+        .bind(self.admin)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        let broker: i64 = sqlx::query_scalar(
+            "INSERT INTO broker_credentials (foreign_id, token_endpoint, access_token, oauth_app_id, provider_subject, created_by_id, created_at, updated_at) \
+             VALUES ($1, 'https://idp.example/token', $2, $3, $4, $5, now(), now()) RETURNING id",
+        )
+        .bind(self.name(label))
+        .bind(ENCRYPTED)
+        .bind(app)
+        .bind(subject)
+        .bind(self.admin)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        let secret = self
+            .static_secret(label, json!({ "header": "Authorization" }), None)
+            .await;
+        self.source(
+            "static_secret_id",
+            secret,
+            "token_broker",
+            None,
+            Some(broker),
+        )
+        .await;
+        self.rule("static_secret_id", secret, host).await;
+        sqlx::query(
+            "INSERT INTO grants (principal_id, static_secret_id, priority, created_by_id, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, now(), now())",
+        )
+        .bind(principal)
+        .bind(secret)
+        .bind(priority)
+        .bind(self.admin)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+        secret
     }
 
     async fn source(
@@ -458,4 +519,136 @@ async fn reads_api_clients_and_their_principals() {
             },
         ]
     );
+}
+
+async fn github_account(fixture: &Fixture, principal: i64) -> Option<String> {
+    let encryption = ActiveRecordEncryption::new(PRIMARY_KEY, SALT);
+    github_user_id(
+        &fixture.pool,
+        SecretValues::Live(&encryption),
+        principal,
+        None,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn names_the_github_account_behind_the_token_injected_for_the_api_host() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let principal = fixture.principal("principal").await;
+    assert_eq!(github_account(&fixture, principal).await, None);
+
+    fixture
+        .brokered_token(
+            principal,
+            "github",
+            "github",
+            Some("90210001"),
+            "api.github.com",
+            100,
+        )
+        .await;
+    assert_eq!(
+        github_account(&fixture, principal).await.as_deref(),
+        Some("90210001")
+    );
+
+    // A weaker competing grant is withheld by the proxy, so it neither
+    // changes the answer nor makes it ambiguous.
+    fixture
+        .brokered_token(
+            principal,
+            "weaker",
+            "github",
+            Some("90210002"),
+            "api.github.com",
+            0,
+        )
+        .await;
+    assert_eq!(
+        github_account(&fixture, principal).await.as_deref(),
+        Some("90210001")
+    );
+
+    // An equal-strength competitor leaves two credentials writing the header.
+    fixture
+        .brokered_token(
+            principal,
+            "equal",
+            "github",
+            Some("90210003"),
+            "api.github.com",
+            100,
+        )
+        .await;
+    assert_eq!(github_account(&fixture, principal).await, None);
+}
+
+#[tokio::test]
+async fn only_a_github_app_with_a_subject_names_an_account() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let other_provider = fixture.principal("other-provider").await;
+    fixture
+        .brokered_token(
+            other_provider,
+            "slack",
+            "slack",
+            Some("90210001"),
+            "api.github.com",
+            100,
+        )
+        .await;
+    assert_eq!(github_account(&fixture, other_provider).await, None);
+
+    let no_subject = fixture.principal("no-subject").await;
+    fixture
+        .brokered_token(
+            no_subject,
+            "github-no-subject",
+            "github",
+            None,
+            "api.github.com",
+            100,
+        )
+        .await;
+    assert_eq!(github_account(&fixture, no_subject).await, None);
+
+    let other_host = fixture.principal("other-host").await;
+    fixture
+        .brokered_token(
+            other_host,
+            "github-other-host",
+            "github",
+            Some("90210001"),
+            "github.com",
+            100,
+        )
+        .await;
+    assert_eq!(github_account(&fixture, other_host).await, None);
+
+    // A static token stored in Console, not brokered from an OAuth account,
+    // proves no human identity.
+    let shared = fixture.principal("shared").await;
+    let secret = fixture
+        .static_secret("shared", json!({ "header": "Authorization" }), None)
+        .await;
+    fixture
+        .source(
+            "static_secret_id",
+            secret,
+            "control_plane",
+            Some(ENCRYPTED),
+            None,
+        )
+        .await;
+    fixture
+        .rule("static_secret_id", secret, "api.github.com")
+        .await;
+    fixture.grant(shared, "static_secret_id", secret).await;
+    assert_eq!(github_account(&fixture, shared).await, None);
 }

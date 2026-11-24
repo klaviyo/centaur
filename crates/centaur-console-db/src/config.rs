@@ -6,7 +6,7 @@ use sqlx::PgPool;
 
 use crate::{
     Error, Result,
-    conflicts::suppress,
+    conflicts::{suppress, writes_header_on_host},
     credentials::load_credentials,
     models::{
         Config, Credential, CredentialData, CredentialKind, PostgresSetting, RequestRule,
@@ -60,22 +60,8 @@ pub async fn build_config(
     subject: &Subject<'_>,
     requester_id: Option<i64>,
 ) -> Result<Config> {
-    let loaded = load_credentials(pool, subject.principal_id, requester_id).await?;
-    let mut credentials = Vec::with_capacity(loaded.len());
-    for credential in loaded {
-        let deliverable = if credential.kind == CredentialKind::Static {
-            match credential.sources.first() {
-                Some(source) => source_value(source, values)?.is_some(),
-                None => false,
-            }
-        } else {
-            true
-        };
-        if deliverable {
-            credentials.push(credential);
-        }
-    }
-    suppress(&mut credentials);
+    let credentials =
+        effective_credentials(pool, values, subject.principal_id, requester_id).await?;
 
     let mut config = Config::default();
     for credential in credentials
@@ -120,6 +106,79 @@ pub async fn build_config(
     }
     append_postgres(subject, &credentials, values, &mut config)?;
     Ok(config)
+}
+
+/// The credentials a proxy built for `principal_id` (and `requester_id`)
+/// delivers: those with something to deliver, minus every one a stronger grant
+/// would overwrite.
+async fn effective_credentials(
+    pool: &PgPool,
+    values: SecretValues<'_>,
+    principal_id: i64,
+    requester_id: Option<i64>,
+) -> Result<Vec<Credential>> {
+    let loaded = load_credentials(pool, principal_id, requester_id).await?;
+    let mut credentials = Vec::with_capacity(loaded.len());
+    for credential in loaded {
+        let deliverable = if credential.kind == CredentialKind::Static {
+            match credential.sources.first() {
+                Some(source) => source_value(source, values)?.is_some(),
+                None => false,
+            }
+        } else {
+            true
+        };
+        if deliverable {
+            credentials.push(credential);
+        }
+    }
+    suppress(&mut credentials);
+    Ok(credentials)
+}
+
+/// The host whose `Authorization` header carries a person's GitHub token.
+const GITHUB_API_HOST: &str = "api.github.com";
+
+/// The GitHub account id (`broker_credentials.provider_subject`) of the human
+/// whose OAuth token the proxy built for `principal_id` and `requester_id`
+/// would inject as `Authorization` on `api.github.com`, or `None`.
+///
+/// This is the identity a pull request created through that proxy is
+/// authored as, so callers may compare it with the author GitHub reports.
+/// It is `Some` only when exactly one delivered credential writes that header
+/// on that host and it is a static secret fed by a token-broker credential of
+/// a `github` OAuth app. Any other shape (no credential, a shared or
+/// non-OAuth token, a competing credential, a missing subject) is `None`,
+/// never a guess.
+pub async fn github_user_id(
+    pool: &PgPool,
+    values: SecretValues<'_>,
+    principal_id: i64,
+    requester_id: Option<i64>,
+) -> Result<Option<String>> {
+    let credentials = effective_credentials(pool, values, principal_id, requester_id).await?;
+    Ok(github_user_id_of(&credentials))
+}
+
+fn github_user_id_of(credentials: &[Credential]) -> Option<String> {
+    let mut serving = credentials
+        .iter()
+        .filter(|credential| writes_header_on_host(credential, "authorization", GITHUB_API_HOST));
+    let credential = serving.next()?;
+    if serving.next().is_some() || credential.kind != CredentialKind::Static {
+        return None;
+    }
+    // A static credential delivers its first source, as `build_config` does.
+    let source = credential.sources.first()?;
+    if source.source_type != "token_broker" || source.broker_provider.as_deref() != Some("github") {
+        return None;
+    }
+    source
+        .broker_provider_subject
+        .as_deref()
+        .map(str::trim)
+        .filter(|subject| !subject.is_empty())
+        .map(str::to_owned)
 }
 
 pub(crate) fn source_value(
@@ -444,8 +503,155 @@ fn mismatched_data(credential: &Credential) -> Error {
 mod tests {
     use serde_json::json;
 
-    use super::{Subject, postgres_settings, proxy_rules};
-    use crate::models::{PostgresSetting, RequestRule};
+    use super::{Subject, github_user_id_of, postgres_settings, proxy_rules};
+    use crate::{
+        conflicts::suppress,
+        models::{
+            Credential, CredentialData, CredentialKind, PostgresSetting, RequestRule, SecretSource,
+            StaticData,
+        },
+    };
+
+    fn rule(host: &str) -> RequestRule {
+        RequestRule {
+            host: Some(host.to_owned()),
+            cidr: None,
+            http_methods: vec![],
+            paths: vec![],
+        }
+    }
+
+    fn source(source_type: &str, provider: Option<&str>, subject: Option<&str>) -> SecretSource {
+        SecretSource {
+            source_type: source_type.to_owned(),
+            config: serde_json::Map::new(),
+            secret: None,
+            broker_access_token: Some("token".to_owned()),
+            broker_provider: provider.map(str::to_owned),
+            broker_provider_subject: subject.map(str::to_owned),
+            role: None,
+            role_kind: None,
+        }
+    }
+
+    fn github_token(id: i64, priority: i32, host: &str) -> Credential {
+        Credential {
+            kind: CredentialKind::Static,
+            id,
+            priority,
+            data: CredentialData::Static(StaticData {
+                inject_config: Some(json!({"header": "Authorization"})),
+                replace_config: None,
+            }),
+            sources: vec![source("token_broker", Some("github"), Some("90210001"))],
+            rules: vec![rule(host)],
+        }
+    }
+
+    #[test]
+    fn a_brokered_github_token_on_the_api_host_names_its_account() {
+        assert_eq!(
+            github_user_id_of(&[github_token(1, 100, "api.github.com")]),
+            Some("90210001".to_owned())
+        );
+        // A wildcard rule serves the host too.
+        assert_eq!(
+            github_user_id_of(&[github_token(1, 100, "*.github.com")]),
+            Some("90210001".to_owned())
+        );
+        // So does a placeholder-replacing credential, which is how the
+        // sandbox's `Authorization: Bearer GITHUB_TOKEN` is rewritten.
+        let mut replacing = github_token(1, 100, "api.github.com");
+        replacing.data = CredentialData::Static(StaticData {
+            inject_config: None,
+            replace_config: Some(
+                json!({"proxy_value": "GITHUB_TOKEN", "match_headers": ["Authorization"]}),
+            ),
+        });
+        assert_eq!(github_user_id_of(&[replacing]), Some("90210001".to_owned()));
+    }
+
+    #[test]
+    fn only_an_unambiguous_brokered_github_credential_names_an_account() {
+        let mut shared = github_token(1, 100, "api.github.com");
+        shared.sources = vec![source("control_plane", None, None)];
+        let mut other_provider = github_token(2, 100, "api.github.com");
+        other_provider.sources = vec![source("token_broker", Some("slack"), Some("U1"))];
+        let mut no_provider = github_token(3, 100, "api.github.com");
+        no_provider.sources = vec![source("token_broker", None, Some("90210001"))];
+        let mut no_subject = github_token(4, 100, "api.github.com");
+        no_subject.sources = vec![source("token_broker", Some("github"), None)];
+        let mut blank_subject = github_token(5, 100, "api.github.com");
+        blank_subject.sources = vec![source("token_broker", Some("github"), Some(" "))];
+        let mut other_header = github_token(6, 100, "api.github.com");
+        other_header.data = CredentialData::Static(StaticData {
+            inject_config: Some(json!({"header": "X-Api-Key"})),
+            replace_config: None,
+        });
+        let other_host = github_token(7, 100, "github.com");
+        let mut cidr_only = github_token(8, 100, "api.github.com");
+        cidr_only.rules = vec![RequestRule {
+            host: None,
+            cidr: Some("140.82.112.0/20".to_owned()),
+            http_methods: vec![],
+            paths: vec![],
+        }];
+        for credential in [
+            shared,
+            other_provider,
+            no_provider,
+            no_subject,
+            blank_subject,
+            other_header,
+            other_host,
+            cidr_only,
+        ] {
+            let id = credential.id;
+            assert_eq!(github_user_id_of(&[credential]), None, "credential {id}");
+        }
+        assert_eq!(github_user_id_of(&[]), None);
+    }
+
+    #[test]
+    fn competing_credentials_make_the_account_ambiguous_unless_suppressed() {
+        // Two equal-priority grants both write Authorization on the host.
+        let mut second = github_token(2, 100, "api.github.com");
+        second.sources = vec![source("token_broker", Some("github"), Some("90210002"))];
+        let mut credentials = vec![github_token(1, 100, "api.github.com"), second];
+        suppress(&mut credentials);
+        assert_eq!(github_user_id_of(&credentials), None);
+
+        // A stronger grant withholds the weaker one, so the stronger one is
+        // the credential the proxy would use.
+        let mut weaker = github_token(3, 0, "api.github.com");
+        weaker.sources = vec![source("token_broker", Some("github"), Some("90210003"))];
+        let mut credentials = vec![weaker, github_token(1, 100, "api.github.com")];
+        suppress(&mut credentials);
+        assert_eq!(github_user_id_of(&credentials), Some("90210001".to_owned()));
+
+        // A non-static credential writing the same header on the host also
+        // makes the answer unknowable here.
+        let mut credentials = vec![
+            github_token(1, 100, "api.github.com"),
+            Credential {
+                kind: CredentialKind::OauthToken,
+                id: 9,
+                priority: 100,
+                data: CredentialData::OauthToken(crate::models::OauthTokenData {
+                    grant: "refresh_token".to_owned(),
+                    token_endpoint: "https://idp.example/token".to_owned(),
+                    audience: None,
+                    scopes: vec![],
+                    header: None,
+                    value_prefix: None,
+                }),
+                sources: vec![],
+                rules: vec![rule("api.github.com")],
+            },
+        ];
+        suppress(&mut credentials);
+        assert_eq!(github_user_id_of(&credentials), None);
+    }
 
     #[test]
     fn postgres_principal_labels_stringify_scalars_and_missing_values() {

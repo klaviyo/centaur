@@ -199,12 +199,6 @@ export type SlackbotV2Options = {
   maxDurationMs?: number
   postgresUrl?: string
   recoverRenderObligationsOnStart?: boolean
-  /**
-   * How often to poll for finished PR follow-up executions (GitHub work api-rs
-   * dispatched into a Slack session) and post their brief update. Default
-   * 30000ms; 0 disables. Off whenever recoverRenderObligationsOnStart is false.
-   */
-  prFollowupSweepIntervalMs?: number
   /** Maximum Slack message age eligible for startup render recovery. */
   renderRecoveryMaxObligationAgeMs?: number
   /** Per-thread deadline for one recovery attempt during the startup scan. */
@@ -356,8 +350,6 @@ export type SlackbotV2ThreadState = {
   /** Last thread-level model provider selected by Slack flags. Null clears persisted state. */
   provider?: string | null
   renderObligation?: SlackbotV2RenderObligation | null
-  /** PR follow-up executions whose one brief update was already handled. */
-  prFollowupUpdates?: string[]
   /**
    * When a user last stopped this thread (ms). An execution still being
    * handed off for a message sent before then must not run.

@@ -28,7 +28,7 @@ pub const CODEMODE_FINGERPRINT_LABEL: &str = "centaur.ai/codemode-fingerprint";
 /// The Kubernetes readiness probe and the session runtime share this constant.
 pub const CODEMODE_PORT: u16 = 8790;
 
-pub use backend::SandboxBackend;
+pub use backend::{GITHUB_API_HOST, ProxyHttpsResponse, SandboxBackend, github_pull_requests_path};
 pub use error::{BoxedError, SandboxError, SandboxResult};
 pub use io::{SandboxIo, SandboxIoGuard, SandboxIoParts, SandboxRead, SandboxWrite};
 pub use lifecycle::{ObservedSandbox, SandboxHandle, SandboxId, SandboxStatus};

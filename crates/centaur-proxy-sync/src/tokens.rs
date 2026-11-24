@@ -4,7 +4,10 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::Serialize;
 use serde_json::json;
 
-use centaur_console_db::{models::Config, oid, slack_channels};
+use centaur_console_db::{
+    SecretValues, SlackChannels as ConsoleSlackChannels, github_user_id, models::Config, oid,
+    slack_channels,
+};
 
 use crate::{
     ApiError,
@@ -20,6 +23,16 @@ struct ApiJwtClaims {
     sub: String,
     capabilities: Capabilities,
     slack: SlackChannels,
+    /// The sandbox this proxy serves (the proxy's name). The proxy mints it
+    /// from its own record, so a sandbox cannot present another's id; api-rs
+    /// compares it with the session that owns that sandbox.
+    sandbox_id: String,
+    /// The GitHub account id of the human whose OAuth token this proxy would
+    /// inject for `api.github.com`, set only when that is unambiguous (see
+    /// [`centaur_console_db::github_user_id`]). api-rs compares it with the
+    /// author GitHub reports for a pull request created with that token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    github_user_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -79,9 +92,33 @@ pub(crate) async fn append_api_jwt(
         return Ok(());
     }
     let channels = slack_channels(&state.pool, principal_id).await?;
+    let github_user_id = github_user_id(
+        &state.pool,
+        SecretValues::Live(&state.encryption),
+        principal_id,
+        proxy.requester_principal_id,
+    )
+    .await?;
     let principal_oid = oid("prn", principal_id);
     let iat = window_start(&principal_oid, now, 900);
-    let claims = ApiJwtClaims {
+    let claims = api_jwt_claims(proxy, principal_oid, iat, channels, github_user_id);
+    let token = jwt(&claims, secret)?;
+    config.secrets.push(json!({
+        "source": { "type": "control_plane", "value": token },
+        "inject": { "header": "Authorization", "formatter": "Bearer {{ .Value }}" },
+        "rules": state.api_hosts.iter().map(|host| json!({ "host": host })).collect::<Vec<_>>()
+    }));
+    Ok(())
+}
+
+fn api_jwt_claims(
+    proxy: &ProxyRecord,
+    principal_oid: String,
+    iat: i64,
+    channels: ConsoleSlackChannels,
+    github_user_id: Option<String>,
+) -> ApiJwtClaims {
+    ApiJwtClaims {
         iss: "centaur-console",
         aud: "centaur-api",
         iat,
@@ -106,14 +143,9 @@ pub(crate) async fn append_api_jwt(
             download_channels: channels.download,
             history_channels: channels.history,
         },
-    };
-    let token = jwt(&claims, secret)?;
-    config.secrets.push(json!({
-        "source": { "type": "control_plane", "value": token },
-        "inject": { "header": "Authorization", "formatter": "Bearer {{ .Value }}" },
-        "rules": state.api_hosts.iter().map(|host| json!({ "host": host })).collect::<Vec<_>>()
-    }));
-    Ok(())
+        sandbox_id: proxy.name.clone(),
+        github_user_id,
+    }
 }
 
 pub(crate) fn append_sandbox_jwt(
@@ -175,7 +207,66 @@ fn env_default(name: &str, default: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::window_start;
+    use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+    use serde_json::{Value, json};
+
+    use super::{ConsoleSlackChannels, api_jwt_claims, jwt, window_start};
+    use crate::models::ProxyRecord;
+
+    fn proxy(name: &str) -> ProxyRecord {
+        ProxyRecord {
+            id: 7,
+            name: name.to_owned(),
+            labels: json!({}),
+            principal_id: Some(11),
+            requester_principal_id: None,
+            principal_assigned_at: None,
+            requester_principal_assigned_at: None,
+            principal_cache_version: None,
+            principal: Some(json!({"sandbox_sessions_read_enabled": true})),
+            console_user_email: None,
+            console_user_id: None,
+            slack_history_channel_ids: json!([]),
+            has_owner_only_grant: false,
+        }
+    }
+
+    fn decoded(proxy: &ProxyRecord, github_user_id: Option<&str>) -> Value {
+        let claims = api_jwt_claims(
+            proxy,
+            "prn_test".to_owned(),
+            1_700_000_000,
+            ConsoleSlackChannels::default(),
+            github_user_id.map(str::to_owned),
+        );
+        let token = jwt(&claims, "test-secret").unwrap();
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_audience(&["centaur-api"]);
+        validation.validate_exp = false;
+        decode::<Value>(
+            &token,
+            &DecodingKey::from_secret(b"test-secret"),
+            &validation,
+        )
+        .unwrap()
+        .claims
+    }
+
+    #[test]
+    fn api_jwt_names_the_proxys_own_sandbox() {
+        let claims = decoded(&proxy("sandbox-abc"), None);
+        assert_eq!(claims["sandbox_id"], "sandbox-abc");
+        assert_eq!(claims["sub"], "prn_test");
+        assert_eq!(claims["capabilities"]["sessions_read"], true);
+    }
+
+    #[test]
+    fn api_jwt_carries_the_github_account_only_when_known() {
+        let claims = decoded(&proxy("sandbox-abc"), Some("90210001"));
+        assert_eq!(claims["github_user_id"], "90210001");
+        let claims = decoded(&proxy("sandbox-abc"), None);
+        assert!(claims.get("github_user_id").is_none());
+    }
 
     #[test]
     fn windowed_tokens_are_stable_within_a_window() {

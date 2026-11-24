@@ -12,8 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use centaur_iron_control::IronControlClient;
 use centaur_sandbox_core::{
-    MountKind, ObservedSandbox, ResourceRequirements, SandboxBackend, SandboxError, SandboxHandle,
-    SandboxId, SandboxIo, SandboxResult, SandboxSpec, SandboxStatus,
+    MountKind, ObservedSandbox, ProxyHttpsResponse, ResourceRequirements, SandboxBackend,
+    SandboxError, SandboxHandle, SandboxId, SandboxIo, SandboxResult, SandboxSpec, SandboxStatus,
 };
 use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -836,6 +836,17 @@ impl SandboxBackend for AgentSandboxBackend {
         labels: &BTreeMap<String, String>,
     ) -> SandboxResult<()> {
         self.ensure_proxy_resources_for_principal(id, principal_id, requester_principal_id, labels)
+            .await
+    }
+
+    async fn create_github_pull_request(
+        &self,
+        id: &SandboxId,
+        owner: &str,
+        repo: &str,
+        payload: Value,
+    ) -> SandboxResult<ProxyHttpsResponse> {
+        self.create_github_pull_request_through_proxy(id, owner, repo, &payload)
             .await
     }
 

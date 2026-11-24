@@ -2,7 +2,7 @@
 
 Public API:
     secret(key)       — resolve a secret via the pluggable backend
-    register_pull_request(repository, number) — bind a PR this session opened
+    create_pull_request(repository, head, base, title) — open a PR bound to this session
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 from centaur_sdk.tool_sdk import (
     ToolContext,
     company_context_database_url,
+    create_pull_request,
     current_chat_destination,
     current_discord_thread,
     current_github_thread,
@@ -18,7 +19,6 @@ from centaur_sdk.tool_sdk import (
     current_slack_thread,
     current_thread_key,
     get_tool_context,
-    register_pull_request,
     reset_tool_context,
     sandbox_context,
     sandbox_thread_key,
@@ -31,6 +31,7 @@ from centaur_sdk.tool_sdk import (
 __all__ = [
     "ToolContext",
     "company_context_database_url",
+    "create_pull_request",
     "current_chat_destination",
     "current_discord_thread",
     "current_github_thread",
@@ -39,7 +40,6 @@ __all__ = [
     "current_slack_thread",
     "current_thread_key",
     "get_tool_context",
-    "register_pull_request",
     "reset_tool_context",
     "sandbox_context",
     "sandbox_thread_key",

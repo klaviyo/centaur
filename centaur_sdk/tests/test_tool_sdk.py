@@ -535,7 +535,15 @@ def test_company_context_database_url_ignores_unresolved_placeholder():
     assert company_context_database_url("CENTAUR_POSTGRES_DSN") == ""
 
 
-def _capture_binding_request(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+_CREATED = (
+    b'{"pull_request":{"number":42,"html_url":"https://github.com/acme/widgets/pull/42",'
+    b'"node_id":"PR_placeholder"},"bound":true}'
+)
+
+
+def _capture_pr_request(
+    monkeypatch: pytest.MonkeyPatch, response: bytes = _CREATED
+) -> dict[str, object]:
     requested: dict[str, object] = {}
 
     class FakeResponse:
@@ -546,7 +554,7 @@ def _capture_binding_request(monkeypatch: pytest.MonkeyPatch) -> dict[str, objec
             return False
 
         def read(self) -> bytes:
-            return b'{"repository":"acme/widgets","number":42,"state":"registered"}'
+            return response
 
     def fake_urlopen(request, timeout):
         requested["url"] = request.full_url
@@ -560,65 +568,174 @@ def _capture_binding_request(monkeypatch: pytest.MonkeyPatch) -> dict[str, objec
     return requested
 
 
-def test_register_pull_request_posts_binding_for_current_thread(
+def test_create_pull_request_posts_to_the_current_session(
     monkeypatch: pytest.MonkeyPatch,
 ):
     import json
 
-    from centaur_sdk import register_pull_request
+    from centaur_sdk import create_pull_request
 
-    requested = _capture_binding_request(monkeypatch)
+    requested = _capture_pr_request(monkeypatch)
     token = set_tool_context(
         ToolContext(
             name="fake-tool",
-            thread_key="slack:C123:123.456",
+            thread_key="slack:T1:C123:123.456",
             secrets={"CENTAUR_API_URL": "http://api:8000/"},
         )
     )
     try:
-        binding = register_pull_request("Acme/Widgets", 42)
+        result = create_pull_request(
+            "acme/widgets", "feature", "main", "Add widgets", body="Details", draft=True
+        )
     finally:
         reset_tool_context(token)
 
-    assert binding["state"] == "registered"
+    assert result["bound"] is True
+    assert result["pull_request"]["number"] == 42
     assert requested["method"] == "POST"
-    assert requested["url"] == "http://api:8000/api/session/slack%3AC123%3A123.456/pr-bindings"
-    assert json.loads(requested["body"]) == {"repository": "acme/widgets", "number": 42}
-    assert requested["timeout"] == 30
-    # The principal token is injected by the proxy, never by the sandbox.
+    assert (
+        requested["url"] == "http://api:8000/api/session/slack%3AT1%3AC123%3A123.456/pull-requests"
+    )
+    assert json.loads(requested["body"]) == {
+        "repository": "acme/widgets",
+        "head": "feature",
+        "base": "main",
+        "title": "Add widgets",
+        "body": "Details",
+        "draft": True,
+    }
+    # The api token is injected by the proxy, never by the sandbox.
     assert requested["authorization"] is None
 
 
-@pytest.mark.parametrize(
-    ("repository", "number"),
-    [("widgets", 1), ("acme/widgets/extra", 1), ("acme/widgets", 0), ("acme/widgets", True)],
-)
-def test_register_pull_request_rejects_malformed_input(
-    monkeypatch: pytest.MonkeyPatch, repository: str, number: int
+def test_create_pull_request_defaults_to_a_non_draft_with_no_body(
+    monkeypatch: pytest.MonkeyPatch,
 ):
-    from centaur_sdk import register_pull_request
+    import json
 
-    requested = _capture_binding_request(monkeypatch)
-    token = set_tool_context(ToolContext(name="fake-tool", thread_key="slack:C1:1.2"))
+    from centaur_sdk import create_pull_request
+
+    requested = _capture_pr_request(monkeypatch)
+    token = set_tool_context(
+        ToolContext(
+            name="fake-tool",
+            thread_key="slack:T1:C1:1.2",
+            secrets={"CENTAUR_API_URL": "http://api:8000"},
+        )
+    )
+    try:
+        create_pull_request("acme/widgets", "feature", "main", "Add widgets")
+    finally:
+        reset_tool_context(token)
+    assert json.loads(requested["body"])["body"] == ""
+    assert json.loads(requested["body"])["draft"] is False
+
+
+def test_create_pull_request_returns_an_unbound_result_as_is(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from centaur_sdk import create_pull_request
+
+    _capture_pr_request(
+        monkeypatch,
+        b'{"pull_request":{"number":7,"html_url":"u","node_id":"n"},'
+        b'"bound":false,"reason":"author_mismatch"}',
+    )
+    token = set_tool_context(
+        ToolContext(
+            name="fake-tool",
+            thread_key="slack:T1:C1:1.2",
+            secrets={"CENTAUR_API_URL": "http://api:8000"},
+        )
+    )
+    try:
+        result = create_pull_request("acme/widgets", "feature", "main", "t")
+    finally:
+        reset_tool_context(token)
+    assert result["bound"] is False
+    assert result["reason"] == "author_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("repository", "head", "base", "title", "body", "draft"),
+    [
+        ("widgets", "f", "main", "t", "", False),
+        ("acme/widgets/extra", "f", "main", "t", "", False),
+        ("acme/widgets", " ", "main", "t", "", False),
+        ("acme/widgets", "f", "", "t", "", False),
+        ("acme/widgets", "f", "main", "  ", "", False),
+        ("acme/widgets", "f", "main", "t", None, False),
+        ("acme/widgets", "f", "main", "t", "", "yes"),
+    ],
+)
+def test_create_pull_request_rejects_malformed_input(
+    monkeypatch: pytest.MonkeyPatch, repository, head, base, title, body, draft
+):
+    from centaur_sdk import create_pull_request
+
+    requested = _capture_pr_request(monkeypatch)
+    token = set_tool_context(
+        ToolContext(
+            name="fake-tool",
+            thread_key="slack:T1:C1:1.2",
+            secrets={"CENTAUR_API_URL": "http://api:8000"},
+        )
+    )
     try:
         with pytest.raises(ValueError):
-            register_pull_request(repository, number)
+            create_pull_request(repository, head, base, title, body, draft)
     finally:
         reset_tool_context(token)
     assert requested == {}
 
 
-def test_register_pull_request_cli_prints_binding(
+def test_create_pull_request_cli_prints_result(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ):
     from centaur_sdk import pull_requests
 
-    requested = _capture_binding_request(monkeypatch)
-    monkeypatch.setenv("CENTAUR_THREAD_KEY", "slack:C123:123.456")
+    requested = _capture_pr_request(monkeypatch)
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "slack:T1:C123:123.456")
     monkeypatch.setattr(
         registry, "_backend", MappingBackend({"CENTAUR_API_URL": "http://api:8000"})
     )
 
-    assert pull_requests.main(["register", "acme/widgets", "42"]) == 0
-    assert '"state":"registered"' in capsys.readouterr().out
-    assert str(requested["url"]).endswith("/api/session/slack%3AC123%3A123.456/pr-bindings")
+    exit_code = pull_requests.main(
+        ["create", "acme/widgets", "--head", "feature", "--base", "main", "--title", "T"]
+    )
+    assert exit_code == 0
+    assert '"bound":true' in capsys.readouterr().out
+    assert str(requested["url"]).endswith("/pull-requests")
+
+
+def test_create_pull_request_cli_reports_http_errors(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    import io
+    import urllib.error
+
+    from centaur_sdk import pull_requests
+
+    def refuse(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            409,
+            "Conflict",
+            {},
+            io.BytesIO(b'{"error":{"code":"github_oauth_required"}}'),
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", refuse)
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "slack:T1:C123:123.456")
+    monkeypatch.setattr(
+        registry, "_backend", MappingBackend({"CENTAUR_API_URL": "http://api:8000"})
+    )
+
+    exit_code = pull_requests.main(
+        ["create", "acme/widgets", "--head", "feature", "--base", "main", "--title", "T"]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "HTTP 409" in captured.err
+    assert "github_oauth_required" in captured.err
+    assert captured.out == ""

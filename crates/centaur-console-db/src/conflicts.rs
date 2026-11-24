@@ -35,6 +35,16 @@ pub(crate) fn suppress(credentials: &mut Vec<Credential>) {
     });
 }
 
+/// Whether `credential` writes `header` on requests to `host`, by the same
+/// claim rules [`suppress`] uses. Only host rules count: a CIDR rule never
+/// matches a hostname.
+pub(crate) fn writes_header_on_host(credential: &Credential, header: &str, host: &str) -> bool {
+    let target = format!("header:{}", header.to_lowercase());
+    claims(credential).iter().any(|(scope, claimed)| {
+        *claimed == target && matches!(scope, Scope::Host(pattern) if hosts_overlap(pattern, host))
+    })
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum Scope {
     Host(String),
