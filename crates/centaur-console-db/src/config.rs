@@ -280,7 +280,8 @@ const GITHUB_API_HOST: &str = "api.github.com";
 ///   grant happens to deliver.
 ///
 /// Any other shape (no credential, a non-OAuth token, a competing credential,
-/// a missing or non-numeric subject) is `None`, never a guess.
+/// a missing, non-numeric or over-long (more than 20 digits) subject) is
+/// `None`, never a guess.
 #[cfg(test)]
 fn github_user_id_of(credentials: &[Credential]) -> Option<String> {
     attested_github_credential(credentials).map(|(_, account)| account.to_owned())
@@ -333,7 +334,11 @@ fn attested_github_credential(credentials: &[Credential]) -> Option<(&Credential
         .broker_provider_subject
         .as_deref()
         .map(str::trim)
-        .filter(|subject| !subject.is_empty() && subject.bytes().all(|b| b.is_ascii_digit()))?;
+        .filter(|subject| {
+            // At most 20 digits, the longest a placeholder can carry, so the
+            // guard's derivation can never fail the config build.
+            (1..=20).contains(&subject.len()) && subject.bytes().all(|b| b.is_ascii_digit())
+        })?;
     Some((credential, account))
 }
 
@@ -1048,6 +1053,9 @@ mod tests {
         unknown_owner_only.sources[0].broker_owner_only = None;
         let mut non_numeric = github_token(16, 100, "api.github.com");
         non_numeric.sources[0].broker_provider_subject = Some("ada-lovelace".to_owned());
+        // More digits than any GitHub id (or the guard's placeholder) holds.
+        let mut too_long = github_token(17, 100, "api.github.com");
+        too_long.sources[0].broker_provider_subject = Some("1".repeat(21));
         let mut no_subject = github_token(4, 100, "api.github.com");
         no_subject.sources = vec![source("token_broker", Some("github"), None)];
         let mut blank_subject = github_token(5, 100, "api.github.com");
@@ -1075,6 +1083,7 @@ mod tests {
             unknown_shared,
             unknown_owner_only,
             non_numeric,
+            too_long,
             other_provider,
             no_provider,
             no_subject,
@@ -1087,6 +1096,14 @@ mod tests {
             assert_eq!(github_user_id_of(&[credential]), None, "credential {id}");
         }
         assert_eq!(github_user_id_of(&[]), None);
+
+        // The longest accepted subject is 20 digits.
+        let mut longest = github_token(18, 100, "api.github.com");
+        longest.sources[0].broker_provider_subject = Some("9".repeat(20));
+        assert_eq!(
+            github_user_id_of(&[longest]).as_deref(),
+            Some("9".repeat(20).as_str())
+        );
     }
 
     #[test]

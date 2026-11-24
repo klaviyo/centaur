@@ -515,9 +515,11 @@ fn pr_path(owner: &str, repo: &str, number: i64) -> (String, i64) {
 /// `GET /api/pr-bindings/{owner}/{repo}/{number}` query.
 #[derive(Debug, Deserialize)]
 pub(crate) struct BindingLookupQuery {
-    /// The PR's GraphQL node id. A binding is found by it when given, wherever
-    /// the path's repository and number point, which is how a renamed or
-    /// transferred repository still finds its binding.
+    /// The PR's GraphQL node id. When given, the binding is found by it alone,
+    /// wherever the path's repository and number point (which is how a renamed
+    /// or transferred repository still finds its binding), and a different
+    /// PR's older binding at the path's coordinates is never returned. The path
+    /// is used only when no node id is given.
     #[serde(default)]
     node_id: Option<String>,
     /// Make a miss final. See [`get_pr_binding`].
@@ -527,7 +529,8 @@ pub(crate) struct BindingLookupQuery {
 
 /// `GET /api/pr-bindings/{owner}/{repo}/{number}[?node_id=…][&authoritative=true]`:
 /// the binding (with its stored repository and number, for the caller's later
-/// calls), or 404.
+/// calls), or 404. With `node_id` the lookup is by that node id alone; without
+/// it, by the path.
 ///
 /// A plain miss answers at once, without locking. With `authoritative=true`
 /// a miss is final: before answering 404 the lookup takes the PR-create lock
@@ -546,13 +549,14 @@ pub(crate) async fn get_pr_binding(
     let (repository, number) = pr_path(&owner, &repo, number);
     let runtime = state.runtime()?;
     let store = runtime.store();
+    // With a node id, only that PR's own binding is a hit; without one, the
+    // path names the PR. An older row at the same coordinates for a different
+    // node (a deleted and recreated PR) is never this PR's binding.
     let lookup = || async {
-        if let Some(node_id) = query.node_id.as_deref()
-            && let Some(binding) = store.pr_binding_by_node_id(node_id).await?
-        {
-            return Ok(Some(binding));
+        match query.node_id.as_deref() {
+            Some(node_id) => store.pr_binding_by_node_id(node_id).await,
+            None => store.pr_binding(&repository, number).await,
         }
-        store.pr_binding(&repository, number).await
     };
     let mut found = lookup().await.map_err(SessionRuntimeError::from)?;
     if found.is_none() && query.authoritative {
@@ -1853,6 +1857,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_lookup_by_node_id_never_returns_another_prs_older_row_at_the_same_path() {
+        use std::time::Duration;
+
+        let Some(h) = Harness::exclusive().await else {
+            return;
+        };
+        // An older PR (node A) is bound at the path the lookup will name.
+        // `(repository, number)` is the table's primary key, so a second PR
+        // (node B) cannot be bound at those very coordinates: B's creation is
+        // in a repository GitHub has since renamed, which is also the case
+        // where a caller still holds the old path. The older row is seeded
+        // through the store.
+        let old_sandbox = h.sandbox_id("old");
+        let old_thread = h.session("C0TEST", &old_sandbox).await;
+        let node_a = format!("PR_{}_A", h.suffix);
+        h.store
+            .insert_pr_binding(&NewPrBinding {
+                repository: h.repository(),
+                number: 7,
+                thread_key: old_thread,
+                pr_id: 1,
+                pr_node_id: node_a.clone(),
+                author_github_id: AUTHOR_ID,
+                author_login: "ada".to_owned(),
+                sandbox_id: old_sandbox,
+                head_ref: "old".to_owned(),
+                base_ref: "main".to_owned(),
+                head_sha: "abcdef1".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        // B's creation pauses before its GitHub call, holding the shared lock.
+        let renamed = format!("acme/renamed-{}", h.suffix);
+        let sandbox = h.sandbox_id("new");
+        let thread_key = h.session("C0TEST", &sandbox).await;
+        h.backend
+            .respond(201, h.github_pull_request(7, AUTHOR_ID, "User", &renamed));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", h.token(&sandbox)).parse().unwrap(),
+        );
+        let caller = h.auth.authenticate(&headers).unwrap();
+        let mut body = h.create_body();
+        body["repository"] = json!(renamed);
+        let request: CreatePullRequestRequest = serde_json::from_value(body).unwrap();
+        let (paused_tx, paused_rx) = tokio::sync::oneshot::channel::<()>();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+        let creation = tokio::spawn({
+            let state = h.state.clone();
+            let raw = thread_key.as_str().to_owned();
+            async move {
+                create_session_pull_request_with(&state, &caller, raw, request, || async move {
+                    let _ = paused_tx.send(());
+                    let _ = resume_rx.await;
+                })
+                .await
+            }
+        });
+        paused_rx.await.expect("creation reached the GitHub call");
+
+        // The lookup names B's node id on the old path. It must not answer
+        // with A's row while B's creation is in flight.
+        let uri = format!(
+            "/api/pr-bindings/{}/7?node_id={}&authoritative=true",
+            h.repository(),
+            h.node_id()
+        );
+        let router = h.router.clone();
+        let mut lookup = tokio::spawn(async move {
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, format!("Bearer {GITHUBBOT_KEY}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), &mut lookup)
+                .await
+                .is_err(),
+            "the lookup answered while B's creation was in flight"
+        );
+
+        resume_tx.send(()).unwrap();
+        assert_eq!(creation.await.unwrap().unwrap()["bound"], true);
+        let (status, body) = tokio::time::timeout(Duration::from_secs(5), lookup)
+            .await
+            .expect("the lookup finishes once the creation does")
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["pr_node_id"], h.node_id(), "{body}");
+        assert_ne!(body["pr_node_id"], node_a.as_str());
+        assert_eq!(body["repository"], renamed);
+        assert_eq!(body["thread_key"], thread_key.as_str());
+    }
+
+    #[tokio::test]
     async fn creations_never_wait_on_each_other() {
         use std::time::Duration;
 
@@ -1973,8 +2083,9 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
-        // An unknown node id on the right path falls back to the path.
-        let (status, body) = h
+        // An unknown node id on the right path does not fall back to the path:
+        // the row there is another PR's, never this one's.
+        let (status, _) = h
             .send(
                 Method::GET,
                 &format!("/api/pr-bindings/{repository}/7?node_id=PR_unknown"),
@@ -1982,8 +2093,162 @@ mod tests {
                 None,
             )
             .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // With no node id the path alone still finds it.
+        let (status, body) = h
+            .send(
+                Method::GET,
+                &format!("/api/pr-bindings/{repository}/7"),
+                GITHUBBOT_KEY,
+                None,
+            )
+            .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["pr_node_id"], bound.pr_node_id);
+    }
+
+    #[tokio::test]
+    async fn a_lost_lock_transaction_before_the_insert_leaves_nothing_bound() {
+        let Some(h) = Harness::exclusive().await else {
+            return;
+        };
+        let sandbox = h.sandbox_id("lost-lock");
+        let thread_key = h.session("C0TEST", &sandbox).await;
+        h.backend.respond(
+            201,
+            h.github_pull_request(7, AUTHOR_ID, "User", &h.repository()),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", h.token(&sandbox)).parse().unwrap(),
+        );
+        let caller = h.auth.authenticate(&headers).unwrap();
+        let request: CreatePullRequestRequest = serde_json::from_value(h.create_body()).unwrap();
+
+        // The connection holding the global PR-create lock dies after the GitHub
+        // call is about to be made and before the binding is inserted.
+        let body = create_session_pull_request_with(
+            &h.state,
+            &caller,
+            thread_key.as_str().to_owned(),
+            request,
+            || async {
+                let killed: i64 = sqlx::query_scalar(
+                    "select count(*) from (
+                         select pg_terminate_backend(l.pid) from pg_locks l
+                         where l.locktype = 'advisory' and l.granted
+                           and ((l.classid::bigint << 32) | l.objid::bigint)
+                               = hashtextextended('centaur:pr-create', 0)
+                     ) killed",
+                )
+                .fetch_one(h.store.pool())
+                .await
+                .unwrap();
+                assert_eq!(killed, 1, "exactly the lock's connection is killed");
+            },
+        )
+        .await
+        .unwrap();
+
+        // The PR exists on GitHub and is reported, unbound, with a reason.
+        assert_eq!(body["pull_request"]["number"], 7);
+        assert_eq!(body["bound"], false, "{body}");
+        assert_eq!(body["reason"], "binding_unavailable");
+        assert_eq!(h.store.pr_binding(&h.repository(), 7).await.unwrap(), None);
+        assert_eq!(h.backend.calls().len(), 1);
+        // And the lock is gone with the connection.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            h.store.lock_pr_create_exclusive(),
+        )
+        .await
+        .expect("the dead lock was never released")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_binding_is_committed_with_the_lock_and_never_before() {
+        use std::time::Duration;
+
+        let Some(h) = Harness::exclusive().await else {
+            return;
+        };
+        // The binding is inserted inside the shared PR-create lock's transaction: invisible to
+        // other connections until the commit, then visible with the lock free.
+        let thread_key = h.session("C0TEST", &h.sandbox_id("commit")).await;
+        let mut lock = h.store.lock_pr_create().await.unwrap();
+        lock.insert_binding(&NewPrBinding {
+            repository: h.repository(),
+            number: 7,
+            thread_key: thread_key.clone(),
+            pr_id: 1,
+            pr_node_id: h.node_id(),
+            author_github_id: AUTHOR_ID,
+            author_login: "ada".to_owned(),
+            sandbox_id: "sbx".to_owned(),
+            head_ref: "fix".to_owned(),
+            base_ref: "main".to_owned(),
+            head_sha: "abcdef1".to_owned(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(h.store.pr_binding(&h.repository(), 7).await.unwrap(), None);
+        // A conflicting second insert fails without breaking the transaction.
+        let conflict = lock
+            .insert_binding(&NewPrBinding {
+                repository: h.repository(),
+                number: 7,
+                thread_key: thread_key.clone(),
+                pr_id: 2,
+                pr_node_id: "PR_other".to_owned(),
+                author_github_id: AUTHOR_ID,
+                author_login: "ada".to_owned(),
+                sandbox_id: "sbx".to_owned(),
+                head_ref: "fix".to_owned(),
+                base_ref: "main".to_owned(),
+                head_sha: "abcdef1".to_owned(),
+            })
+            .await;
+        assert!(matches!(
+            conflict,
+            Err(SessionStoreError::PrBindingConflict { .. })
+        ));
+        lock.commit().await.unwrap();
+        let bound = h
+            .store
+            .pr_binding(&h.repository(), 7)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound.pr_node_id, h.node_id());
+        tokio::time::timeout(Duration::from_secs(5), h.store.lock_pr_create_exclusive())
+            .await
+            .expect("commit releases the lock")
+            .unwrap();
+
+        // A rolled-back lock binds nothing.
+        let mut lock = h.store.lock_pr_create().await.unwrap();
+        lock.insert_binding(&NewPrBinding {
+            repository: "acme/rolled-back".to_owned(),
+            number: 9,
+            thread_key,
+            pr_id: 3,
+            pr_node_id: format!("PR_rb_{}", h.suffix),
+            author_github_id: AUTHOR_ID,
+            author_login: "ada".to_owned(),
+            sandbox_id: "sbx".to_owned(),
+            head_ref: "fix".to_owned(),
+            base_ref: "main".to_owned(),
+            head_sha: "abcdef1".to_owned(),
+        })
+        .await
+        .unwrap();
+        lock.release().await.unwrap();
+        assert_eq!(
+            h.store.pr_binding("acme/rolled-back", 9).await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -2741,6 +3006,102 @@ mod tests {
             .update_pr_binding_state(repository, 7, &h.node_id(), &update, None)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_notice_after_a_rename_links_the_current_url_and_keeps_the_stored_identity() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let (stored, binding) = bound_pr(&h, true).await;
+        let slack = Slack::default();
+        let new_name = format!("acme/new-name-{}", h.suffix);
+        let request = CiFailureRequest {
+            current_repository: Some(new_name.to_ascii_uppercase()),
+            current_number: Some(7),
+            html_url: format!("https://github.com/{new_name}/pull/7"),
+            ..h.ci("abcdef1", "abcdef1", true, true)
+        };
+
+        // The route is called at the binding's stored coordinates; the report
+        // carries the PR's current ones.
+        let outcome = report(&h, &stored, &request, &slack).await.unwrap();
+
+        assert_eq!(outcome, json!({"notice": "posted"}));
+        let posts = slack.posts();
+        assert_eq!(posts.len(), 1);
+        let text = posts[0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with(&format!(
+                "CI failed on <https://github.com/{new_name}/pull/7|{new_name}#7> at `abcdef1`"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains(&stored), "{text}");
+        // Dedupe and state still follow the node id: a repeat is a duplicate.
+        assert_eq!(
+            report(&h, &stored, &request, &slack).await.unwrap(),
+            json!({"notice": "duplicate"})
+        );
+        assert_eq!(
+            h.store
+                .pr_binding(&stored, 7)
+                .await
+                .unwrap()
+                .unwrap()
+                .repository,
+            binding.repository
+        );
+
+        // A URL for the old name no longer matches the current coordinates.
+        let stale = CiFailureRequest {
+            html_url: format!("https://github.com/{stored}/pull/7"),
+            ..request
+        };
+        assert_eq!(
+            report(&h, &stored, &stale, &slack).await.unwrap(),
+            json!({"notice": "skipped", "reason": "invalid_html_url"})
+        );
+        assert_eq!(slack.posts().len(), 1);
+        set_state(
+            &h,
+            &stored,
+            PrBindingStateUpdate {
+                head_sha: Some("fedcba9".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Without the current coordinates (older githubbot) the stored ones
+        // are used.
+        let legacy = h.ci("fedcba9", "fedcba9", true, true);
+        assert_eq!(
+            report(&h, &stored, &legacy, &slack).await.unwrap(),
+            json!({"notice": "posted"})
+        );
+        assert!(
+            slack.posts()[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("https://github.com/{stored}/pull/7"))
+        );
+
+        // Only one of the pair, or nonsense, is refused.
+        for (repository, number) in [
+            (Some("acme/x".to_owned()), None),
+            (None, Some(7)),
+            (Some("acme".to_owned()), Some(7)),
+            (Some("acme/x".to_owned()), Some(0)),
+        ] {
+            let bad = CiFailureRequest {
+                current_repository: repository,
+                current_number: number,
+                ..h.ci("fedcba9", "fedcba9", true, true)
+            };
+            let error = report(&h, &stored, &bad, &slack).await.unwrap_err();
+            assert!(matches!(error, ApiError::BadRequest(_)), "{error:?}");
+        }
     }
 
     #[tokio::test]
