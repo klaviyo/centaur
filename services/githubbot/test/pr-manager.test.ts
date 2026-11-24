@@ -12,6 +12,7 @@ import { emitWorkflowEvent, getPrBinding } from "../src/session-api";
 import {
   evaluateCi,
   fetchCiEvaluation,
+  firstUsableUrl,
   isCentaurSkipCheck,
   type CiCheck,
 } from "../src/workflow-events";
@@ -2078,6 +2079,19 @@ describe("PR session bindings", () => {
         expect(body.details_url).toBe(permalink);
       });
 
+      test("a detailsUrl the Slack renderer would drop yields to the permalink", async () => {
+        for (const detailsUrl of [
+          "https://ci.example.test/a|b",
+          "https://ci.example.test/has space",
+          "https://ci.example.test/a<b",
+          "https://ci.example.test/a>b",
+          "https://ci.example.test/a\tb",
+        ]) {
+          const body = await sent(failing({ detailsUrl, permalink }));
+          expect(body.details_url).toBe(permalink);
+        }
+      });
+
       test("a usable detailsUrl still wins over the permalink", async () => {
         const body = await sent(
           failing({ detailsUrl: "https://ci.example.test/runs/1", permalink }),
@@ -2597,6 +2611,10 @@ describe("PR session bindings", () => {
               run({ details_url: `https://ci.example.test/${"a".repeat(2_048)}` }),
             )
           ).details_url,
+        ).toBe("https://github.com/base/repo/runs/9");
+        // Slack would drop a `|` in the details URL: the html_url is the link.
+        expect(
+          (await urlFor(run({ details_url: "https://ci.example.test/a|b" }))).details_url,
         ).toBe("https://github.com/base/repo/runs/9");
         // Nothing usable: the check is still named, with no link.
         const none = await urlFor(
@@ -3428,5 +3446,50 @@ describe("getPrBinding", () => {
     }
     await expect(lookup(() => Response.json(null))).rejects.toThrow("unexpected shape");
     await expect(lookup(() => Response.json([valid]))).rejects.toThrow("unexpected shape");
+  });
+});
+
+describe("firstUsableUrl", () => {
+  const usable = "https://github.com/base/repo/runs/9";
+
+  test("keeps an HTTPS URL within the byte limit, and takes the first usable candidate", () => {
+    expect(firstUsableUrl("https://ci.example.test/a?b=c#d", usable)).toBe(
+      "https://ci.example.test/a?b=c#d",
+    );
+    expect(firstUsableUrl(null, undefined, "http://x.example", usable)).toBe(usable);
+    expect(firstUsableUrl("http://x.example", "javascript:alert(1)")).toBeUndefined();
+    expect(firstUsableUrl()).toBeUndefined();
+  });
+
+  test("counts the limit in UTF-8 bytes, as api-rs does", () => {
+    const prefix = "https://x.example/";
+    const atLimit = prefix + "a".repeat(2_048 - prefix.length);
+    expect(firstUsableUrl(atLimit)).toBe(atLimit);
+    expect(firstUsableUrl(atLimit + "a", usable)).toBe(usable);
+    // Few characters, but over the limit in bytes.
+    const wide = prefix + "é".repeat(1_100);
+    expect(wide.length).toBeLessThan(2_048);
+    expect(firstUsableUrl(wide, usable)).toBe(usable);
+  });
+
+  test("rejects whitespace, control characters and the characters that break a Slack link", () => {
+    for (const bad of [
+      "https://x.example/a b",
+      "https://x.example/a\tb",
+      "https://x.example/a\nb",
+      "https://x.example/a\rb",
+      "https://x.example/a\u0085b",
+      "https://x.example/a\u00a0b",
+      "https://x.example/a\u2028b",
+      "https://x.example/a\u3000b",
+      "https://x.example/a\u0000b",
+      "https://x.example/a\u007fb",
+      "https://x.example/a<b",
+      "https://x.example/a>b",
+      "https://x.example/a|b",
+    ]) {
+      expect(firstUsableUrl(bad, usable)).toBe(usable);
+      expect(firstUsableUrl(bad)).toBeUndefined();
+    }
   });
 });

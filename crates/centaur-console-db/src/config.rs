@@ -148,8 +148,10 @@ async fn build(
 ) -> Result<(Config, Option<String>)> {
     let credentials =
         effective_credentials(pool, values, subject.principal_id, requester_id).await?;
-    let attested = attested_github_credential(&credentials);
-    let github_user_id = attested.map(|(_, account)| account.to_owned());
+    let attested = attested_github_credential(&credentials, values)?;
+    let github_user_id = attested
+        .as_ref()
+        .map(|attested| attested.account.to_owned());
 
     let mut config = Config::default();
     for credential in credentials
@@ -198,9 +200,12 @@ async fn build(
         // to its account and the requester this proxy is bound to; or, when
         // none is attested, a sentinel that is not a credential and the
         // matching placeholder nothing real sends.
+        // The very value that was checked is the one the guard delivers.
         let (source, placeholder) = match attested {
-            Some((credential, account)) => (
-                source_value(&credential.sources[0], values)?,
+            Some(Attested {
+                account, source, ..
+            }) => (
+                Some(source),
                 PrOauthPlaceholder::derive(
                     account,
                     requester_id.map(|id| oid("prn", id)).as_deref(),
@@ -275,16 +280,22 @@ const GITHUB_API_HOST: &str = "api.github.com";
 ///   an app that is neither shared nor owner-only (an owner-only connection
 ///   stores `owner-<console user>` instead, so it names no GitHub account);
 /// - is not shared, so one connection does not serve many people;
+/// - delivers a GitHub OAuth App user token (`gho_…`), checked on the decrypted
+///   value the guard delivers: the row's identity fields do not prove the
+///   credential type, since its token can be replaced through the API;
 /// - was connected by the acting human (the requester, else the principal),
 ///   so the token is theirs and not another person's that a channel or role
 ///   grant happens to deliver.
 ///
 /// Any other shape (no credential, a non-OAuth token, a competing credential,
-/// a missing, non-numeric or over-long (more than 20 digits) subject) is
-/// `None`, never a guess.
+/// a missing, non-numeric or over-long (more than 20 digits) subject, a token
+/// that is not an OAuth App user token, or redacted values) is `None`, never a
+/// guess.
 #[cfg(test)]
-fn github_user_id_of(credentials: &[Credential]) -> Option<String> {
-    attested_github_credential(credentials).map(|(_, account)| account.to_owned())
+fn github_user_id_of(credentials: &[Credential], values: SecretValues<'_>) -> Option<String> {
+    attested_github_credential(credentials, values)
+        .unwrap()
+        .map(|attested| attested.account.to_owned())
 }
 
 /// The credential whose token the proxy would inject for the GitHub API, and
@@ -297,7 +308,10 @@ fn github_user_id_of(credentials: &[Credential]) -> Option<String> {
 /// widens what its token may do. And nothing else that rewrites headers may
 /// target `api.github.com`: no `oauth_token`, `hmac`, `aws_auth`, `gcp_auth` or
 /// `gcp_id_token` transform.
-fn attested_github_credential(credentials: &[Credential]) -> Option<(&Credential, &str)> {
+fn attested_github_credential<'a>(
+    credentials: &'a [Credential],
+    values: SecretValues<'_>,
+) -> Result<Option<Attested<'a>>> {
     let rewrites_headers = |credential: &Credential| {
         !matches!(
             credential.kind,
@@ -305,32 +319,36 @@ fn attested_github_credential(credentials: &[Credential]) -> Option<(&Credential
         ) && targets_host(credential, GITHUB_API_HOST)
     };
     if credentials.iter().any(rewrites_headers) {
-        return None;
+        return Ok(None);
     }
     let mut serving = credentials
         .iter()
         .filter(|credential| writes_header_on_host(credential, "authorization", GITHUB_API_HOST));
-    let credential = serving.next()?;
+    let Some(credential) = serving.next() else {
+        return Ok(None);
+    };
     if serving.next().is_some() {
-        return None;
+        return Ok(None);
     }
     let CredentialData::Static(data) = &credential.data else {
-        return None;
+        return Ok(None);
     };
     if !is_canonical_github_replace(data) || !rules_cover_pr_create(&credential.rules) {
-        return None;
+        return Ok(None);
     }
     // A static credential delivers its first source, as `build_config` does.
-    let source = credential.sources.first()?;
+    let Some(source) = credential.sources.first() else {
+        return Ok(None);
+    };
     if source.source_type != "token_broker"
         || source.broker_provider.as_deref() != Some("github")
         || source.broker_owner_only != Some(false)
         || source.broker_shared != Some(false)
         || source.broker_owned_by_actor != Some(true)
     {
-        return None;
+        return Ok(None);
     }
-    let account = source
+    let Some(account) = source
         .broker_provider_subject
         .as_deref()
         .map(str::trim)
@@ -338,8 +356,52 @@ fn attested_github_credential(credentials: &[Credential]) -> Option<(&Credential
             // At most 20 digits, the longest a placeholder can carry, so the
             // guard's derivation can never fail the config build.
             (1..=20).contains(&subject.len()) && subject.bytes().all(|b| b.is_ascii_digit())
-        })?;
-    Some((credential, account))
+        })
+    else {
+        return Ok(None);
+    };
+    // The credential type. The row's provider, owner and subject say whose
+    // GitHub account the token belongs to, not what kind of token it is:
+    // Console's GitHub provider is an OAuth App, but the row's token can be
+    // replaced through the broker-credential API (its token endpoint and
+    // refresh token are caller-set) or by a custom token endpoint, so an
+    // otherwise eligible row can deliver a personal access token or anything
+    // else for the same account. Attest only what is a GitHub OAuth App user
+    // token, checked on the very value the guard will deliver. With
+    // `SecretValues::Redacted` that value is the redaction marker, which is
+    // not one, so a redacted (display-only) build never attests: it fails
+    // closed, and proxy-sync, which mints the claim, always builds with
+    // decrypted values.
+    let Some(source) = source_value(source, values)? else {
+        return Ok(None);
+    };
+    if !source
+        .get("value")
+        .and_then(Value::as_str)
+        .is_some_and(is_github_oauth_user_token)
+    {
+        return Ok(None);
+    }
+    Ok(Some(Attested { account, source }))
+}
+
+/// A credential attested for pull-request creation: its GitHub account and the
+/// source value (the checked token) the guard delivers.
+struct Attested<'a> {
+    account: &'a str,
+    source: Value,
+}
+
+/// Whether `value` is shaped like a GitHub OAuth App user access token: `gho_`
+/// followed by ASCII alphanumerics, at most 255 characters in all. Personal
+/// access tokens (`ghp_…`, `github_pat_…`), app tokens (`ghu_`, `ghs_`) and
+/// anything else are not.
+fn is_github_oauth_user_token(value: &str) -> bool {
+    const MAX_LEN: usize = 255;
+    value.len() <= MAX_LEN
+        && value
+            .strip_prefix("gho_")
+            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
 /// Console's canonical `github_token` replacement (`CredentialProfiles::
@@ -712,7 +774,12 @@ fn mismatched_data(credential: &Credential) -> Error {
 mod tests {
     use serde_json::json;
 
-    use super::{Subject, github_user_id_of, postgres_settings, proxy_rules};
+    use active_record_encryption::ActiveRecordEncryption;
+
+    use super::{
+        SecretValues, Subject, github_user_id_of as github_user_id_with_values, postgres_settings,
+        proxy_rules,
+    };
     use crate::{
         conflicts::suppress,
         models::{
@@ -720,6 +787,31 @@ mod tests {
             StaticData,
         },
     };
+
+    const PRIMARY_KEY: &str = "dev_ar_encryption_primary_key_0000000000000000";
+    const SALT: &str = "dev_ar_encryption_key_derivation_salt_000000000";
+
+    /// Key derivation is slow, so derive once.
+    fn encryption() -> &'static ActiveRecordEncryption {
+        static ENCRYPTION: std::sync::LazyLock<ActiveRecordEncryption> =
+            std::sync::LazyLock::new(|| ActiveRecordEncryption::new(PRIMARY_KEY, SALT));
+        &ENCRYPTION
+    }
+
+    /// A made-up OAuth App user token: obviously fake, but the right shape.
+    fn oauth_token() -> String {
+        format!("gho_{}", "A".repeat(36))
+    }
+
+    /// `token` as stored: encrypted the way Console stores it.
+    fn stored(token: &str) -> String {
+        encryption().encrypt(token).unwrap()
+    }
+
+    /// The account attested for `credentials` under decrypted values.
+    fn github_user_id_of(credentials: &[Credential]) -> Option<String> {
+        github_user_id_with_values(credentials, SecretValues::Live(encryption()))
+    }
 
     fn rule(host: &str) -> RequestRule {
         RequestRule {
@@ -735,7 +827,7 @@ mod tests {
             source_type: source_type.to_owned(),
             config: serde_json::Map::new(),
             secret: None,
-            broker_access_token: Some("token".to_owned()),
+            broker_access_token: Some(stored(&oauth_token())),
             broker_provider: provider.map(str::to_owned),
             broker_provider_subject: subject.map(str::to_owned),
             broker_owner_only: Some(false),
@@ -1103,6 +1195,61 @@ mod tests {
         assert_eq!(
             github_user_id_of(&[longest]).as_deref(),
             Some("9".repeat(20).as_str())
+        );
+    }
+
+    #[test]
+    fn only_a_github_oauth_app_user_token_is_attested() {
+        let with_token = |token: Option<&str>| {
+            let mut credential = github_token(1, 100, "api.github.com");
+            credential.sources[0].broker_access_token = token.map(stored);
+            credential
+        };
+        // A valid OAuth App user token is attested, as before.
+        assert_eq!(
+            github_user_id_of(&[with_token(Some(&oauth_token()))]).as_deref(),
+            Some("90210001")
+        );
+        // Same account, same otherwise-eligible row, a different kind of token.
+        let alnum = "A".repeat(36);
+        for (label, token) in [
+            (
+                "classic personal access token",
+                Some(format!("ghp_{alnum}")),
+            ),
+            (
+                "fine-grained personal access token",
+                Some(format!("github_pat_{alnum}_{alnum}")),
+            ),
+            ("app user-to-server token", Some(format!("ghu_{alnum}"))),
+            ("installation token", Some(format!("ghs_{alnum}"))),
+            ("no prefix", Some(alnum.clone())),
+            ("prefix only", Some("gho_".to_owned())),
+            ("empty token", Some(String::new())),
+            ("no token", None),
+            (
+                "non-alphanumeric",
+                Some(format!("gho_{}-{}", "A".repeat(18), "A".repeat(17))),
+            ),
+            ("whitespace", Some(format!("gho_{alnum} "))),
+            ("non-ASCII", Some(format!("gho_{}é", "A".repeat(35)))),
+            ("too long", Some(format!("gho_{}", "A".repeat(252)))),
+            ("uppercase prefix", Some(format!("GHO_{alnum}"))),
+        ] {
+            assert_eq!(
+                github_user_id_of(&[with_token(token.as_deref())]),
+                None,
+                "{label}"
+            );
+        }
+        // The longest accepted token is 255 characters.
+        assert!(
+            github_user_id_of(&[with_token(Some(&format!("gho_{}", "A".repeat(251))))]).is_some()
+        );
+        // Redacted values cannot be checked, so they never attest.
+        assert_eq!(
+            github_user_id_with_values(&[with_token(Some(&oauth_token()))], SecretValues::Redacted),
+            None
         );
     }
 

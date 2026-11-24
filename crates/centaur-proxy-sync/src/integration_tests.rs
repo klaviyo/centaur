@@ -26,6 +26,20 @@ const ENCRYPTED: &str =
     r#"{"p":"xOiyro9XYBkfABUF","h":{"iv":"pCjJC5SxH78ZN0Nm","at":"s9DIUyHAkF8ZAthKO6ROtw=="}}"#;
 const JWT_SECRET: &str = "integration-test-signing-key";
 
+/// An obviously fake GitHub OAuth App user token: the shape a brokered GitHub
+/// credential must deliver to be attested.
+fn oauth_token() -> String {
+    format!("gho_{}", "A".repeat(36))
+}
+
+/// `token` encrypted the way Console stores it. Key derivation is slow, so the
+/// encryption is built once.
+fn encrypt(token: &str) -> String {
+    static ENCRYPTION: std::sync::LazyLock<ActiveRecordEncryption> =
+        std::sync::LazyLock::new(|| ActiveRecordEncryption::new(PRIMARY_KEY, SALT));
+    ENCRYPTION.encrypt(token).unwrap()
+}
+
 // Console's grant priorities: direct grants default to 100, role grants to 0.
 const DIRECT: i32 = 100;
 const ROLE: i32 = 0;
@@ -247,7 +261,7 @@ impl Fixture {
         )
         .bind(self.name(label))
         .bind(app)
-        .bind(minted.then_some(ENCRYPTED))
+        .bind(minted.then(|| encrypt(&oauth_token())))
         .bind(self.admin)
         .fetch_one(&self.pool)
         .await
@@ -1305,6 +1319,44 @@ async fn api_jwt_names_the_sandbox_and_the_github_account_behind_its_token() {
         "90210001"
     );
 
+    // The row's identity fields do not prove the credential type: the same
+    // eligible row holding a personal access token (or anything but an OAuth
+    // App user token) yields neither the claim nor an attested guard.
+    for pat in [
+        format!("ghp_{}", "A".repeat(36)),
+        format!("github_pat_{}", "A".repeat(40)),
+        String::new(),
+    ] {
+        sqlx::query("UPDATE broker_credentials SET access_token = $2 WHERE id = $1")
+            .bind(broker)
+            .bind(encrypt(&pat))
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        f.bump(principal).await;
+        let body = f.sync_raw(&token).await;
+        assert!(
+            api_jwt_claims(&body).get("github_user_id").is_none(),
+            "{pat:?}"
+        );
+        assert_guard(&body, None);
+        // The token still serves the sandbox's ordinary `GITHUB_TOKEN`
+        // requests, but the PR-create guard never carries it.
+        let guard = body["transforms"].as_array().unwrap().last().unwrap();
+        assert!(!guard.to_string().contains(&pat) || pat.is_empty());
+    }
+    sqlx::query("UPDATE broker_credentials SET access_token = $2 WHERE id = $1")
+        .bind(broker)
+        .bind(encrypt(&oauth_token()))
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    f.bump(principal).await;
+    assert_eq!(
+        api_jwt_claims(&f.sync_raw(&token).await)["github_user_id"],
+        "90210001"
+    );
+
     // A second credential writing Authorization on the host makes the
     // account ambiguous, so the claim disappears rather than guessing.
     let other = f.broker_credential("github-other", Some(app), true).await;
@@ -1801,7 +1853,7 @@ async fn disabled_apps_keep_existing_credentials_available() {
         let proxy = f.proxy(owner, requester, json!({})).await;
         let config = f.sync(&proxy).await;
         assert_eq!(secret_hosts(&config), vec!["api.github.test"]);
-        assert_eq!(config["secrets"][0]["source"]["value"], "known secret");
+        assert_eq!(config["secrets"][0]["source"]["value"], oauth_token());
     }
     let redacted = centaur_console_db::effective_config(&f.pool, principal)
         .await
@@ -1822,7 +1874,7 @@ async fn disabled_apps_keep_existing_credentials_available() {
     let proxy = f.proxy(Some(principal), None, json!({})).await;
     assert_eq!(
         f.sync(&proxy).await["secrets"][0]["source"]["value"],
-        "known secret"
+        oauth_token()
     );
 }
 

@@ -24,6 +24,19 @@ const ENCRYPTED: &str =
     r#"{"p":"xOiyro9XYBkfABUF","h":{"iv":"pCjJC5SxH78ZN0Nm","at":"s9DIUyHAkF8ZAthKO6ROtw=="}}"#;
 const PLAINTEXT: &str = "known secret";
 
+/// An obviously fake GitHub OAuth App user token.
+fn oauth_token() -> String {
+    format!("gho_{}", "A".repeat(36))
+}
+
+/// `token` encrypted the way Console stores it. Key derivation is slow, so the
+/// encryption is built once.
+fn encrypt(token: &str) -> String {
+    static ENCRYPTION: std::sync::LazyLock<ActiveRecordEncryption> =
+        std::sync::LazyLock::new(|| ActiveRecordEncryption::new(PRIMARY_KEY, SALT));
+    ENCRYPTION.encrypt(token).unwrap()
+}
+
 async fn database() -> Option<PgPool> {
     let Ok(url) = env::var("CONSOLE_DB_TEST_DATABASE_URL") else {
         assert!(
@@ -235,7 +248,7 @@ impl Fixture {
              VALUES ($1, 'https://idp.example/token', $2, $3, $4, $5, now(), now()) RETURNING id",
         )
         .bind(self.name(label))
-        .bind(ENCRYPTED)
+        .bind(encrypt(&oauth_token()))
         .bind(app)
         .bind(subject)
         .bind(app_shape.connected_by)
@@ -1113,6 +1126,88 @@ async fn the_account_is_derived_from_the_credentials_the_config_delivers() {
     let (config, account) = github_config(&fixture, undelivered).await;
     assert_eq!(account, None);
     assert!(github_secrets(&config).is_empty());
+}
+
+/// Sets the access token stored on the broker credential behind `secret`.
+async fn set_broker_token(fixture: &Fixture, secret: i64, token: &str) {
+    sqlx::query(
+        "UPDATE broker_credentials SET access_token = $2 \
+         WHERE id = (SELECT broker_credential_id FROM static_secrets WHERE id = $1)",
+    )
+    .bind(secret)
+    .bind(encrypt(token))
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn only_a_github_oauth_app_user_token_is_attested() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let principal = fixture.owner_principal("token-kind").await;
+    let secret = fixture
+        .brokered_token(
+            principal,
+            "github-token-kind",
+            "github",
+            Some("90210001"),
+            "api.github.com",
+            100,
+            fixture.personal(),
+        )
+        .await;
+
+    // A valid OAuth App user token is attested: the claim, and a guard that
+    // delivers that very token under the account's placeholder.
+    let (config, account) = github_config(&fixture, principal).await;
+    assert_eq!(account.as_deref(), Some("90210001"));
+    assert_eq!(
+        assert_guard_last(&config),
+        json!({"type": "control_plane", "value": oauth_token()})
+    );
+    assert_eq!(
+        guard_placeholder(&config),
+        "CENTAUR_PR_OAUTH_U90210001_NONE"
+    );
+
+    // The same eligible row (right app, owner, subject, sharing) holding any
+    // other kind of token is not: no claim, the sentinel, the unattested
+    // placeholder, and the token appears in no guard.
+    let alnum = "A".repeat(36);
+    for (label, token) in [
+        ("classic personal access token", format!("ghp_{alnum}")),
+        (
+            "fine-grained personal access token",
+            format!("github_pat_{alnum}_{alnum}"),
+        ),
+        ("empty token", String::new()),
+        ("gho_ with a non-alphanumeric", format!("gho_{alnum}-A")),
+        ("gho_ alone", "gho_".to_owned()),
+        ("no prefix", alnum.clone()),
+    ] {
+        set_broker_token(&fixture, secret, &token).await;
+        let (config, account) = github_config(&fixture, principal).await;
+        assert_eq!(account, None, "{label}");
+        assert_unattested_guard(&config);
+        assert!(
+            token.is_empty() || !pr_guard_json(&config).contains(&token),
+            "{label}"
+        );
+    }
+
+    // Restored to an OAuth token, it attests again.
+    set_broker_token(&fixture, secret, &oauth_token()).await;
+    assert_eq!(
+        github_account(&fixture, principal).await.as_deref(),
+        Some("90210001")
+    );
+}
+
+/// The guard transform, serialized, for a search of what it carries.
+fn pr_guard_json(config: &Config) -> String {
+    config.transforms.last().unwrap().to_string()
 }
 
 #[tokio::test]

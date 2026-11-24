@@ -76,12 +76,19 @@ export function isCentaurSkipCheck(name: string | null | undefined): boolean {
 }
 
 const MAX_NOTICE_URL_BYTES = 2_048;
+// Unicode White_Space and control characters (Rust's `char::is_whitespace` and
+// `char::is_control`), plus the three characters that break a Slack link.
+const UNRENDERABLE_URL_CHARS = /[\p{White_Space}\p{Cc}<>|]/u;
 
 /**
- * The first candidate api-rs will keep as a notice link: it starts with
- * `https://` and is at most 2,048 bytes. This mirrors api-rs's `is_usable_url`
- * (which drops anything else, and keeps its own validation), so a check's
- * unusable details URL never shadows a usable permalink or html URL.
+ * The first candidate api-rs will keep as a notice link, so a check's unusable
+ * details URL never shadows a usable permalink or html URL. It mirrors both of
+ * api-rs's rules (which keep their own validation):
+ * - `is_usable_url`: starts with `https://` and is at most 2,048 bytes;
+ * - the Slack renderer's `slack_link`: no whitespace, no control character,
+ *   and none of `<`, `>`, `|`, which would break or forge a Slack link.
+ * Where Rust and JavaScript could differ, this errs strict: skipping to a later
+ * candidate is safe, keeping one api-rs then drops is the bug.
  */
 export function firstUsableUrl(
   ...candidates: (string | null | undefined)[]
@@ -90,7 +97,8 @@ export function firstUsableUrl(
     (url): url is string =>
       typeof url === "string" &&
       url.startsWith("https://") &&
-      new TextEncoder().encode(url).length <= MAX_NOTICE_URL_BYTES,
+      new TextEncoder().encode(url).length <= MAX_NOTICE_URL_BYTES &&
+      !UNRENDERABLE_URL_CHARS.test(url),
   );
 }
 
