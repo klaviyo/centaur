@@ -8,7 +8,7 @@ import {
   isOwnedPr,
   type PrManagerContext,
 } from "../src/pr-manager";
-import { emitWorkflowEvent, getPrBinding } from "../src/session-api";
+import { emitWorkflowEvent, getPrBinding, isRetryableSessionApiError } from "../src/session-api";
 import {
   evaluateCi,
   fetchCiEvaluation,
@@ -16,6 +16,14 @@ import {
   isCentaurSkipCheck,
   type CiCheck,
 } from "../src/workflow-events";
+
+/** How api-rs answers a real binding miss: a coded 404, not just any 404. */
+function bindingMiss() {
+  return Response.json(
+    { error: "no binding for that pull request", code: "pr_binding_not_found" },
+    { status: 404 },
+  );
+}
 
 function makeState() {
   const values = new Map<string, unknown>();
@@ -106,13 +114,19 @@ describe("evaluateCi", () => {
       { name: "lint", status: "completed", conclusion: "failure", url: "https://ci.example.test/lint" },
       { name: "e2e", status: "completed", conclusion: "failure", url: "https://ci.example.test/e2e" },
     ];
-    expect(evaluateCi(failing, []).firstFailingUrl).toBe("https://ci.example.test/lint");
+    expect(evaluateCi(failing, []).noticeFailure).toEqual({
+      name: "lint",
+      url: "https://ci.example.test/lint",
+    });
     expect(
       evaluateCi(
         [{ name: "build", status: "completed", conclusion: "success" }],
         [{ state: "failure", context: "deploy", url: "https://ci.example.test/deploy" }],
       ),
-    ).toMatchObject({ failingNames: ["deploy"], firstFailingUrl: "https://ci.example.test/deploy" });
+    ).toMatchObject({
+      failingNames: ["deploy"],
+      noticeFailure: { name: "deploy", url: "https://ci.example.test/deploy" },
+    });
   });
 
   test("has no link when the first failure has none, and never borrows a later one", () => {
@@ -124,7 +138,7 @@ describe("evaluateCi", () => {
       [],
     );
     expect(result.failingNames[0]).toBe("lint");
-    expect(result.firstFailingUrl).toBeUndefined();
+    expect(result.noticeFailure).toEqual({ name: "lint" });
   });
 
   test("pending legacy status keeps it unsettled", () => {
@@ -224,6 +238,7 @@ describe("centaur-skip checks", () => {
     await expect(fetchCiEvaluation(ctx, "base", "repo", "abc123")).resolves.toEqual({
       failed: true,
       failingNames: ["build"],
+      noticeFailure: { name: "build" },
       settled: true,
     });
   });
@@ -405,6 +420,7 @@ describe("Actions fallback when check nodes are unreadable", () => {
     await expect(fetchCiEvaluation(ctx, "base", "repo", "abc123")).resolves.toEqual({
       failed: true,
       failingNames: ["typecheck"],
+      noticeFailure: { name: "typecheck" },
       settled: true,
     });
   });
@@ -460,6 +476,7 @@ describe("Actions fallback when check nodes are unreadable", () => {
     await expect(fetchCiEvaluation(ctx, "base", "repo", "abc123")).resolves.toEqual({
       failed: true,
       failingNames: ["build"],
+      noticeFailure: { name: "build" },
       settled: true,
     });
   });
@@ -663,7 +680,7 @@ describe("PR management webhooks", () => {
       options: {
         ...ctx.options,
         // Unbound: the binding lookup must not reach a real network.
-        fetch: () => Promise.resolve(new Response("{}", { status: 404 })),
+        fetch: () => Promise.resolve(bindingMiss()),
       },
       state: makeState(),
     } as unknown as PrManagerContext;
@@ -914,7 +931,7 @@ describe("CI fix counter and escalation", () => {
         fetch: (url: string | URL | Request) =>
           Promise.resolve(
             String(url).includes("/api/pr-bindings/")
-              ? new Response("not found", { status: 404 })
+              ? bindingMiss()
               : new Response("no", { status: 400 }),
           ),
       },
@@ -1556,6 +1573,8 @@ describe("PR session bindings", () => {
     binding: Binding | null;
     lookupStatus?: number;
     lookupBody?: unknown;
+    // The binding GET answers with this instead (a generic 404, say).
+    lookupResponse?: () => Response;
     // One entry per /state call, consumed in order: a failing HTTP status or a
     // network error. Calls after the list is used up succeed.
     stateFailures?: (number | "network" | "conflict")[];
@@ -1578,11 +1597,13 @@ describe("PR session bindings", () => {
     const notices: string[] = [];
     const calls: Call[] = [];
     const sessionCalls: string[] = [];
+    const sessionBodies: string[] = [];
     const fetch = async (url: string | URL | Request, init?: RequestInit) => {
       const path = new URL(String(url)).pathname;
       const method = init?.method ?? "GET";
       if (path.startsWith("/api/session/")) {
         sessionCalls.push(path);
+        sessionBodies.push(String(init?.body ?? ""));
         return new Response("no", { status: 400 });
       }
       const body = init?.body ? JSON.parse(String(init.body)) : undefined;
@@ -1599,13 +1620,14 @@ describe("PR session bindings", () => {
           !(byNodeId && byNodeId === (current?.pr_node_id ?? NODE_ID)) &&
           path !== `/api/pr-bindings/${input.storedAs.repository}/${input.storedAs.number}`
         ) {
-          return new Response("not found", { status: 404 });
+          return bindingMiss();
         }
         const lookupFailure = lookupFailures.shift();
         if (lookupFailure) return new Response("x", { status: lookupFailure });
         if (input.lookupStatus) return new Response("x", { status: input.lookupStatus });
+        if (input.lookupResponse) return input.lookupResponse();
         if ("lookupBody" in input) return Response.json(input.lookupBody);
-        if (!input.binding) return new Response("not found", { status: 404 });
+        if (!input.binding) return bindingMiss();
         return Response.json(stored(bindingJson(current ?? input.binding)));
       }
       if (path.endsWith("/ci-failures")) {
@@ -1659,7 +1681,7 @@ describe("PR session bindings", () => {
     };
     const posts = (suffix: string) =>
       calls.filter((c) => c.method === "POST" && c.path.endsWith(suffix));
-    return { calls, current: () => current, fetch, notices, posts, sessionCalls };
+    return { calls, current: () => current, fetch, notices, posts, sessionBodies, sessionCalls };
   }
 
   function makeCtx(input: {
@@ -2914,6 +2936,104 @@ describe("PR session bindings", () => {
       }
     });
 
+    test("a generic 404 starts no fix turn, no escalation and no counter change", async () => {
+      for (const lookupResponse of [
+        () => new Response("not found", { status: 404 }),
+        () => new Response("", { status: 404 }),
+        () => Response.json({ error: "not found" }, { status: 404 }),
+        () => Response.json({ code: "route_not_found" }, { status: 404 }),
+      ]) {
+        const api = makeApi({ binding: null, lookupResponse });
+        const state = makeState();
+        // At the cap, so a fall-through would escalate with a comment.
+        await state.set(PR_KEY, { consecutiveCiFixes: 3 });
+        const { ctx, comments } = makeCtx({ api, state });
+        await handleCiEvent(ctx, "check_run", redCheckRun);
+        await drainBackgroundWork(2000);
+        expect(api.sessionCalls).toEqual([]);
+        expect(comments).toEqual([]);
+        expect(api.posts("/ci-failures")).toHaveLength(0);
+        expect(await state.get(PR_KEY)).toEqual({ consecutiveCiFixes: 3 });
+        expect(await state.get("centaur-githubbot:ci-settled:base/repo#7:abc123")).toBeUndefined();
+      }
+    });
+
+    describe("a partially readable rollup", () => {
+      // One readable failing check, one unreadable: the verdict is the aggregate's.
+      test("leaves the unbound fix prompt and escalation exactly as before, with no failing names", async () => {
+        const api = makeApi({ binding: null });
+        const state = makeState();
+        const { ctx } = makeCtx({ api, state, partial: true });
+        await handleCiEvent(ctx, "check_run", redCheckRun);
+        await drainBackgroundWork(2000);
+        // The fix turn fires as in base. Its prompt is built from `failingNames`
+        // alone (`failingNames.join(", ") || "unknown"`), which the evaluation
+        // test below pins to [].
+        expect(api.sessionCalls.length).toBeGreaterThan(0);
+        expect(await state.get(PR_KEY)).toMatchObject({ consecutiveCiFixes: 1 });
+        expect(api.sessionBodies.join("\n")).not.toContain("build");
+        expect(api.posts("/ci-failures")).toHaveLength(0);
+
+        const atCap = makeState();
+        await atCap.set(PR_KEY, { consecutiveCiFixes: 3 });
+        const escalation = makeCtx({ api: makeApi({ binding: null }), state: atCap, partial: true });
+        await handleCiEvent(escalation.ctx, "check_run", redCheckRun);
+        expect(escalation.comments).toHaveLength(1);
+        expect(escalation.comments[0]).toContain("Still failing: the CI checks.");
+        expect(escalation.comments[0]).not.toContain("build");
+      });
+
+      test("still lets the bound notice name the readable check and its link", async () => {
+        const api = makeApi({ binding: { managed: true, closed: false } });
+        const { ctx } = makeCtx({ api, partial: true });
+        await handleCiEvent(ctx, "check_run", redCheckRun);
+        expect(api.sessionCalls).toEqual([]);
+        expect(api.posts("/ci-failures")[0]?.body).toMatchObject({
+          check_name: "build",
+          details_url: FAILURE_URL,
+        });
+      });
+
+      test("the evaluation's failing names are empty while the notice failure is kept", async () => {
+        const graphql = async () => ({
+          repository: {
+            object: {
+              statusCheckRollup: {
+                state: "FAILURE",
+                contexts: {
+                  nodes: [
+                    {
+                      __typename: "CheckRun",
+                      name: "build",
+                      status: "COMPLETED",
+                      conclusion: "FAILURE",
+                      detailsUrl: FAILURE_URL,
+                    },
+                    null,
+                  ],
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  checkRunCountsByState: [{ count: 2, state: "FAILURE" }],
+                  statusContextCountsByState: [],
+                },
+              },
+            },
+          },
+        });
+        const evaluation = await fetchCiEvaluation(
+          { octokit: { graphql, rest: {} }, options: { apiUrl: "http://localhost", logger: quietLogger } } as never,
+          "base",
+          "repo",
+          "abc123",
+        );
+        expect(evaluation).toEqual({
+          settled: true,
+          failed: true,
+          failingNames: [],
+          noticeFailure: { name: "build", url: FAILURE_URL },
+        });
+      });
+    });
+
     test("a later delivery after a failed lookup reports normally", async () => {
       const state = makeState();
       await handleCiEvent(
@@ -3403,8 +3523,23 @@ describe("getPrBinding", () => {
     );
   });
 
-  test("only an explicit 404 is unbound", async () => {
-    await expect(lookup(() => new Response("nf", { status: 404 }))).resolves.toBeNull();
+  test("only a coded 404 is unbound", async () => {
+    await expect(lookup(() => bindingMiss())).resolves.toBeNull();
+    // A generic 404 is not a binding miss: an older replica without the route
+    // answers one while a newer replica has bound the PR.
+    for (const generic of [
+      () => new Response("nf", { status: 404 }),
+      () => new Response("", { status: 404 }),
+      () => Response.json({ error: "not found" }, { status: 404 }),
+      () => Response.json({ code: "something_else" }, { status: 404 }),
+      () => Response.json({ error: { code: "pr_binding_not_found" } }, { status: 404 }),
+      () => Response.json(["pr_binding_not_found"], { status: 404 }),
+    ]) {
+      const error = await lookup(generic).catch((e: unknown) => e);
+      expect((error as Error).message).toContain("get pr binding failed: 404");
+      // Not retryable: nothing can be assumed from it.
+      expect(isRetryableSessionApiError(error)).toBe(false);
+    }
     for (const status of [400, 403, 500, 503]) {
       await expect(lookup(() => new Response("x", { status }))).rejects.toThrow();
     }

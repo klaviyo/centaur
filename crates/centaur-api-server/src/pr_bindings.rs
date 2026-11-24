@@ -529,7 +529,9 @@ pub(crate) struct BindingLookupQuery {
 
 /// `GET /api/pr-bindings/{owner}/{repo}/{number}[?node_id=…][&authoritative=true]`:
 /// the binding (with its stored repository and number, for the caller's later
-/// calls), or 404. With `node_id` the lookup is by that node id alone; without
+/// calls), or 404 with `code: "pr_binding_not_found"` (only a completed lookup
+/// answers that; any other 404, such as a replica without the route, does not).
+/// With `node_id` the lookup is by that node id alone; without
 /// it, by the path.
 ///
 /// A plain miss answers at once, without locking. With `authoritative=true`
@@ -567,9 +569,16 @@ pub(crate) async fn get_pr_binding(
         found = lookup().await.map_err(SessionRuntimeError::from)?;
         guard.release().await.map_err(SessionRuntimeError::from)?;
     }
-    found
-        .map(Json)
-        .ok_or_else(|| ApiError::NotFound(format!("no PR binding for {repository}#{number}")))
+    // A completed lookup that found nothing carries a stable code: a bare 404
+    // is also what a replica without this route answers mid-rollout, which a
+    // caller must not read as "unbound".
+    found.map(Json).ok_or_else(|| {
+        ApiError::coded(
+            StatusCode::NOT_FOUND,
+            "pr_binding_not_found",
+            format!("no PR binding for {repository}#{number}"),
+        )
+    })
 }
 
 /// `POST /api/pr-bindings/{owner}/{repo}/{number}/state` body. `pr_node_id`
@@ -1843,13 +1852,13 @@ mod tests {
             );
         }
         let plain = format!("/api/pr-bindings/acme/other-{}/7", h.suffix);
-        let (status, _) = tokio::time::timeout(
+        let (status, body) = tokio::time::timeout(
             Duration::from_secs(3),
             h.send(Method::GET, &plain, GITHUBBOT_KEY, None),
         )
         .await
         .expect("a plain lookup waited");
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_binding_miss(status, &body);
 
         // The creation commits its binding; the waiting lookups then read.
         resume_tx.send(()).unwrap();
@@ -1863,11 +1872,11 @@ mod tests {
         assert_eq!(body["number"], 7);
         // The renamed path alone still finds nothing (a lookup by node id
         // would), but only after the wait.
-        let (status, _) = tokio::time::timeout(Duration::from_secs(5), other_lookup)
+        let (status, body) = tokio::time::timeout(Duration::from_secs(5), other_lookup)
             .await
             .expect("the other lookup finishes once the creation does")
             .unwrap();
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_binding_miss(status, &body);
     }
 
     #[tokio::test]
@@ -2067,13 +2076,13 @@ mod tests {
             .unwrap();
         // And a lookup miss answers at once.
         let uri = format!("/api/pr-bindings/{}/7", h.repository());
-        let (status, _) = tokio::time::timeout(
+        let (status, body) = tokio::time::timeout(
             Duration::from_secs(5),
             h.send(Method::GET, &uri, GITHUBBOT_KEY, None),
         )
         .await
         .expect("the miss waited on a lock a refusal should have released");
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_binding_miss(status, &body);
     }
 
     #[tokio::test]
@@ -2086,8 +2095,8 @@ mod tests {
         // GitHub now calls the repository something else, and the PR a
         // different number in the caller's mind. By path alone: no binding.
         let renamed = format!("/api/pr-bindings/acme/renamed-{}/7", h.suffix);
-        let (status, _) = h.send(Method::GET, &renamed, GITHUBBOT_KEY, None).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, body) = h.send(Method::GET, &renamed, GITHUBBOT_KEY, None).await;
+        assert_binding_miss(status, &body);
 
         // By node id: found, and the response carries the stored repository
         // and number for the caller's later calls.
@@ -2106,7 +2115,7 @@ mod tests {
         assert_eq!(body["thread_key"], bound.thread_key.as_str());
 
         // An unknown node id on an unknown path is still a (waited-for) miss.
-        let (status, _) = h
+        let (status, body) = h
             .send(
                 Method::GET,
                 &format!("{renamed}?node_id=PR_unknown"),
@@ -2114,11 +2123,11 @@ mod tests {
                 None,
             )
             .await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_binding_miss(status, &body);
 
         // An unknown node id on the right path does not fall back to the path:
         // the row there is another PR's, never this one's.
-        let (status, _) = h
+        let (status, body) = h
             .send(
                 Method::GET,
                 &format!("/api/pr-bindings/{repository}/7?node_id=PR_unknown"),
@@ -2126,7 +2135,7 @@ mod tests {
                 None,
             )
             .await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_binding_miss(status, &body);
         // With no node id the path alone still finds it.
         let (status, body) = h
             .send(
@@ -2942,8 +2951,8 @@ mod tests {
             )
             .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        let (status, _) = h.send(Method::GET, &unbound, GITHUBBOT_KEY, None).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, body) = h.send(Method::GET, &unbound, GITHUBBOT_KEY, None).await;
+        assert_binding_miss(status, &body);
         let binding = h
             .store
             .pr_binding(&h.repository(), 7)
@@ -2989,6 +2998,61 @@ mod tests {
 
     /// A store with one bound PR at head `abcdef1` in a Slack channel,
     /// managed as asked.
+    /// The final answer of a completed binding lookup that found nothing: a
+    /// 404 carrying the stable code githubbot keys on.
+    fn assert_binding_miss(status: StatusCode, body: &Value) {
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["code"], "pr_binding_not_found", "{body}");
+        assert_eq!(body["ok"], false, "{body}");
+    }
+
+    #[tokio::test]
+    async fn only_a_completed_lookup_miss_carries_the_binding_not_found_code() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        // A miss on the binding route is coded, with its message.
+        let (status, body) = h
+            .send(
+                Method::GET,
+                &format!("/api/pr-bindings/{}/7", h.repository()),
+                GITHUBBOT_KEY,
+                None,
+            )
+            .await;
+        assert_binding_miss(status, &body);
+        assert_eq!(
+            body["error"],
+            format!("no PR binding for {}#7", h.repository())
+        );
+        // A route this api-rs does not have (what an older replica answers for
+        // the binding route itself during a rollout) is a bare 404 without it,
+        // so a caller can tell the two apart.
+        for uri in [
+            "/api/pr-bindings/acme/widgets/7/unknown",
+            "/api/pr-bindings/acme/widgets",
+            "/api/pr-bindings-unknown/acme/widgets/7",
+        ] {
+            let (status, body) = h.send(Method::GET, uri, GITHUBBOT_KEY, None).await;
+            assert_ne!(body["code"], "pr_binding_not_found", "{uri}: {body}");
+            assert!(
+                status == StatusCode::NOT_FOUND || status == StatusCode::FORBIDDEN,
+                "{uri}: {status}"
+            );
+        }
+        // A malformed path keeps its own shape too.
+        let (status, body) = h
+            .send(
+                Method::GET,
+                "/api/pr-bindings/acme/widgets/notanumber",
+                GITHUBBOT_KEY,
+                None,
+            )
+            .await;
+        assert!(status.is_client_error(), "{status}");
+        assert_ne!(body["code"], "pr_binding_not_found", "{body}");
+    }
+
     async fn bound_pr_in(h: &Harness, channel: &str, managed: bool) -> (String, PrBinding) {
         let sandbox = h.sandbox_id("ci");
         let thread_key = h.session(channel, &sandbox).await;

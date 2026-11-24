@@ -677,9 +677,11 @@ function sleep(ms: number): Promise<void> {
 export type PrBindingRef = { repository: string; number: number };
 
 /**
- * The binding for a PR. Only an explicit 404 means unbound (null); any other
- * status, or a malformed body, throws so callers cannot mistake an unknown
- * binding for an unbound PR.
+ * The binding for a PR. Only a 404 that api-rs itself labels
+ * `{"code": "pr_binding_not_found"}` means unbound (null). Any other status,
+ * any other 404 (a generic one, as an older api-rs replica without this route
+ * answers during a rolling deploy), or a malformed body throws a non-retryable
+ * error, so callers cannot mistake an unknown binding for an unbound PR.
  */
 export async function getPrBinding(
   options: GithubbotOptions,
@@ -699,9 +701,35 @@ export async function getPrBinding(
     method: "GET",
     headers: apiHeaders(options, false),
   });
-  if (response.status === 404) return null;
+  if (response.status === 404) {
+    // Read the body once: it says whether this is a real miss.
+    let body = "";
+    try {
+      body = await response.text();
+    } catch {
+      body = "";
+    }
+    if (isBindingNotFound(body)) return null;
+    logApiErrorBody(options, "get pr binding", response, body);
+    throw new SessionApiError({
+      action: "get pr binding",
+      body,
+      retryable: false,
+      status: response.status,
+      statusText: response.statusText,
+    });
+  }
   await ensureApiOk(response, "get pr binding", options);
   return parsePrBinding(await response.json());
+}
+
+function isBindingNotFound(body: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    return isJsonObject(parsed) && parsed.code === "pr_binding_not_found";
+  } catch {
+    return false;
+  }
 }
 
 /**

@@ -111,12 +111,20 @@ export type CiCheck = {
 };
 export type CiStatus = { state: string; context: string; url?: string | null };
 
+/** A failing check as the bound-PR notice names it, with its usable link. */
+export type CiNoticeFailure = { name: string; url?: string };
+
 export type CiEvaluation = {
   settled: boolean;
   failed: boolean;
   failingNames: string[];
-  /** Link to the failure behind `failingNames[0]`, when GitHub gave one. */
-  firstFailingUrl?: string;
+  /**
+   * The first failing check this evaluation could read, for the failed-CI
+   * notice of a PR bound to a Slack session. Only that path reads it: the
+   * unbound flow (fix prompt, escalation, workflow events) uses `failingNames`
+   * alone, which this never alters.
+   */
+  noticeFailure?: CiNoticeFailure;
 };
 
 export function evaluateCi(
@@ -140,12 +148,13 @@ export function evaluateCi(
     ...failingChecks.map((c) => c.name),
     ...failingStatuses.map((s) => s.context),
   ];
-  const firstFailingUrl = (failingChecks[0] ?? failingStatuses[0])?.url;
+  const firstName = failingChecks[0]?.name ?? failingStatuses[0]?.context;
+  const firstUrl = (failingChecks[0] ?? failingStatuses[0])?.url;
   return {
     settled: !anyCheckPending && !anyStatusPending,
     failed: failingNames.length > 0,
     failingNames,
-    ...(firstFailingUrl ? { firstFailingUrl } : {}),
+    ...(firstName ? { noticeFailure: { name: firstName, ...(firstUrl ? { url: firstUrl } : {}) } } : {}),
   };
 }
 
@@ -304,17 +313,18 @@ export async function fetchCiEvaluation(
   else if (countsPending !== undefined) {
     settled = !aggregatePending && !countsPending;
   }
-  // Without a complete detail set, the verdict is the aggregate's, but a
-  // failing check among the contexts that *were* readable is still a real
-  // failing check: keep its name and link for whoever reports it.
+  // Without a complete detail set, the verdict is the aggregate's and
+  // `failingNames` stays empty, exactly as before. But a failing check among
+  // the contexts that *were* readable is still a real failing check: keep it,
+  // separately, for the bound-PR notice alone.
   const named = detail ?? (nodes.length > 0 ? evaluateCiRollupContexts(nodes) : null);
   return {
     settled,
     // GitHub computes rollupState over every context, marked ones included, so
     // OR-ing it in would undo the filter. A readable detail set is authoritative.
     failed: detail ? detail.failed : rollupState === "FAILURE" || rollupState === "ERROR",
-    failingNames: named?.failingNames ?? [],
-    ...(named?.firstFailingUrl ? { firstFailingUrl: named.firstFailingUrl } : {}),
+    failingNames: detail?.failingNames ?? [],
+    ...(named?.noticeFailure ? { noticeFailure: named.noticeFailure } : {}),
   };
 }
 

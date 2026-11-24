@@ -1025,8 +1025,8 @@ async function reportBoundCiFailure(
   // stand in, and only once a fresh read confirms it is still failing on this
   // exact repository and head. With no identifiable failing check there is
   // nothing true to say: report nothing.
-  const failing: FailingCheck | undefined = evaluation.failingNames[0]
-    ? { name: evaluation.failingNames[0], url: evaluation.firstFailingUrl }
+  const failing: FailingCheck | undefined = evaluation.noticeFailure
+    ? evaluation.noticeFailure
     : eventFailure
       ? await confirmEventFailure(ctx, owner, repo, headSha, eventFailure)
       : undefined;
