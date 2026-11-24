@@ -12,7 +12,7 @@ RUN --mount=type=cache,id=sandbox-apt-cache,target=/var/cache/apt,sharing=locked
     --mount=type=cache,id=sandbox-apt-lib,target=/var/lib/apt,sharing=locked \
     printf '%s\n' "Acquire::Retries \"5\";" "Acquire::http::Timeout \"30\";" "Acquire::https::Timeout \"30\";" > /etc/apt/apt.conf.d/80-network-retries \
     && apt-get update && apt-get install -y --no-install-recommends \
-    openssh-client git curl wget ca-certificates=${CA_CERTIFICATES_VERSION} gnupg lsb-release sudo \
+    openssh-client git curl wget ca-certificates=${CA_CERTIFICATES_VERSION} libnss3-tools gnupg lsb-release sudo \
     build-essential pkg-config cmake ninja-build \
     ffmpeg ghostscript dvisvgm file \
     libssl-dev libclang-dev protobuf-compiler \
