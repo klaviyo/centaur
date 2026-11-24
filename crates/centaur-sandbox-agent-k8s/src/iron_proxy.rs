@@ -101,10 +101,11 @@ pub struct IronProxyConfig {
     pub ca_cert_secret_key: String,
     /// A file holding only the PEM CA certificate, projected into api-rs from
     /// the certificate entry of `ca_cert_secret_name` alone. The trusted
-    /// pull-request create call trusts exactly this file; api-rs never reads
-    /// the CA Secret through the Kubernetes API, so the CA key can never reach
-    /// it whatever else that Secret holds. `None` leaves that call
-    /// unsupported. Proxy and sandbox pods ignore it and keep using the Secret
+    /// pull-request create call trusts exactly this file, and api-rs never
+    /// reads the CA Secret through the Kubernetes API. The certificate entry
+    /// must hold only the certificate: a combined certificate-and-key entry
+    /// would be mounted as is, and api-rs then refuses the file (see
+    /// `parse_proxy_ca`). `None` leaves that call unsupported. Proxy and sandbox pods ignore it and keep using the Secret
     /// names.
     pub ca_cert_file: Option<PathBuf>,
     pub ca_key_secret_name: String,
@@ -1554,8 +1555,9 @@ impl AgentSandboxBackend {
 
     /// The proxy CA's public certificate, from `ca_cert_file`: a file the
     /// chart projects from the certificate entry of the CA Secret alone. The
-    /// Secrets API is never called, so the CA key, even in the same Secret,
-    /// never reaches api-rs. A missing or unreadable file is a backend error.
+    /// Secrets API is never called, so a CA key kept in a separate entry, even
+    /// of the same Secret, never reaches api-rs. A missing, unreadable or
+    /// key-bearing file is a backend error.
     async fn proxy_ca_certificate(
         &self,
         iron_proxy: &IronProxyConfig,

@@ -275,6 +275,19 @@ spec:
 {{- end }}
             - name: RUN_MIGRATIONS
               value: {{ .Values.apiRs.runMigrations | quote }}
+{{- /* The trusted-create gate and, while it is on, the CA selectors it relies
+on come only from their chart values: an extraEnv entry would be rendered after
+them and override what the checks below compared. */}}
+{{- if hasKey .Values.apiRs.extraEnv "TRUSTED_PR_CREATE_ENABLED" }}
+{{- fail "set apiRs.trustedPrCreateEnabled, not apiRs.extraEnv.TRUSTED_PR_CREATE_ENABLED" }}
+{{- end }}
+{{- if .Values.apiRs.trustedPrCreateEnabled }}
+{{- range $name := list "KUBERNETES_FIREWALL_CA_SECRET_NAME" "KUBERNETES_FIREWALL_CA_KEY_SECRET_NAME" "KUBERNETES_FIREWALL_CA_SECRET_KEY" "KUBERNETES_FIREWALL_CA_KEY_SECRET_KEY" "KUBERNETES_FIREWALL_CA_CERT_FILE" }}
+{{- if hasKey $.Values.apiRs.extraEnv $name }}
+{{- fail (printf "apiRs.extraEnv.%s can't be set while apiRs.trustedPrCreateEnabled is on; use the firewall values" $name) }}
+{{- end }}
+{{- end }}
+{{- end }}
             - name: TRUSTED_PR_CREATE_ENABLED
               value: {{ .Values.apiRs.trustedPrCreateEnabled | default false | quote }}
 {{- if not (hasKey .Values.apiRs.extraEnv "DATABASE_TEXT_SEARCH") }}
