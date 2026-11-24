@@ -17,6 +17,9 @@ import {
   type CiCheck,
 } from "../src/workflow-events";
 
+/** The app the fixture's default failing check run was reported by. */
+const CHECK_APP_ID = 15368;
+
 /** How api-rs answers a real binding miss: a coded 404, not just any 404. */
 function bindingMiss() {
   return Response.json(
@@ -116,6 +119,7 @@ describe("evaluateCi", () => {
     ];
     expect(evaluateCi(failing, []).noticeFailure).toEqual({
       name: "lint",
+      kind: "check_run",
       url: "https://ci.example.test/lint",
     });
     expect(
@@ -125,7 +129,7 @@ describe("evaluateCi", () => {
       ),
     ).toMatchObject({
       failingNames: ["deploy"],
-      noticeFailure: { name: "deploy", url: "https://ci.example.test/deploy" },
+      noticeFailure: { name: "deploy", kind: "status", url: "https://ci.example.test/deploy" },
     });
   });
 
@@ -138,7 +142,7 @@ describe("evaluateCi", () => {
       [],
     );
     expect(result.failingNames[0]).toBe("lint");
-    expect(result.noticeFailure).toEqual({ name: "lint" });
+    expect(result.noticeFailure).toEqual({ name: "lint", kind: "check_run" });
   });
 
   test("pending legacy status keeps it unsettled", () => {
@@ -238,7 +242,7 @@ describe("centaur-skip checks", () => {
     await expect(fetchCiEvaluation(ctx, "base", "repo", "abc123")).resolves.toEqual({
       failed: true,
       failingNames: ["build"],
-      noticeFailure: { name: "build" },
+      noticeFailure: { name: "build", kind: "check_run" },
       settled: true,
     });
   });
@@ -420,7 +424,7 @@ describe("Actions fallback when check nodes are unreadable", () => {
     await expect(fetchCiEvaluation(ctx, "base", "repo", "abc123")).resolves.toEqual({
       failed: true,
       failingNames: ["typecheck"],
-      noticeFailure: { name: "typecheck" },
+      noticeFailure: { name: "typecheck", kind: "check_run" },
       settled: true,
     });
   });
@@ -476,7 +480,7 @@ describe("Actions fallback when check nodes are unreadable", () => {
     await expect(fetchCiEvaluation(ctx, "base", "repo", "abc123")).resolves.toEqual({
       failed: true,
       failingNames: ["build"],
-      noticeFailure: { name: "build" },
+      noticeFailure: { name: "build", kind: "check_run" },
       settled: true,
     });
   });
@@ -1628,6 +1632,8 @@ describe("PR session bindings", () => {
         if (input.lookupResponse) return input.lookupResponse();
         if ("lookupBody" in input) return Response.json(input.lookupBody);
         if (!input.binding) return bindingMiss();
+        // Like api-rs: a lookup by node id finds that PR's binding or misses.
+        if (byNodeId && (current?.pr_node_id ?? NODE_ID) !== byNodeId) return bindingMiss();
         return Response.json(stored(bindingJson(current ?? input.binding)));
       }
       if (path.endsWith("/ci-failures")) {
@@ -1723,6 +1729,7 @@ describe("PR session bindings", () => {
       conclusion: input.settled === false ? null : "FAILURE",
       detailsUrl: FAILURE_URL,
       permalink: "https://github.com/base/repo/runs/1",
+      checkSuite: { app: { slug: "ci", databaseId: CHECK_APP_ID } },
     };
     const comments: string[] = [];
     // Every GitHub read, in order, so a test can see which one came last.
@@ -2854,17 +2861,135 @@ describe("PR session bindings", () => {
         expect(body(api)).toMatchObject({ check_name: "build" });
       });
 
-      test("a partially readable evaluation keeps the failing check it did read", async () => {
+      const buildRun = {
+        ...stillFailing,
+        id: 70,
+        name: "build",
+        details_url: FAILURE_URL,
+      };
+      const lintNode = (extra: Record<string, unknown> = {}) => ({
+        __typename: "CheckRun",
+        name: "lint",
+        status: "COMPLETED",
+        conclusion: "FAILURE",
+        detailsUrl: "https://ci.example.test/lint/old",
+        checkSuite: { app: { slug: "ci", databaseId: APP_ID } },
+        ...extra,
+      });
+
+      test("a check read from an incomplete rollup is named only once its latest run is confirmed failing", async () => {
         const api = bound();
-        const { ctx, reads } = makeCtx({
+        const { ctx, reads, checkQueries } = makeCtx({
           api,
           partial: true,
           // A readable event that would name something else must not win.
-          github: { checkRuns: [{ ...stillFailing, name: "other" }] },
+          github: { checkRuns: [buildRun] },
         });
         await handleCiEvent(ctx, "check_run", eventFor({ name: "other", conclusion: "failure" }));
         expect(body(api)).toMatchObject({ check_name: "build", details_url: FAILURE_URL });
-        expect(reads).not.toContain("check");
+        // Confirmed by name and app, before the final PR read.
+        expect(checkQueries).toEqual([
+          expect.objectContaining({ check_name: "build", app_id: APP_ID, filter: "latest" }),
+        ]);
+        expect(reads).toEqual(["pr", "check", "pr"]);
+      });
+
+      test("an old failed run whose rerun passed (unreadably) is not named; the confirmed event's check is", async () => {
+        const api = bound();
+        const { ctx, checkQueries } = makeCtx({
+          api,
+          partial: true,
+          checkNode: lintNode(),
+          github: {
+            checkRuns: [
+              // lint: the visible failure was superseded by a newer passing run.
+              { ...stillFailing, id: 60, name: "lint", conclusion: "failure" },
+              { ...stillFailing, id: 61, name: "lint", started_at: "2026-11-23T10:05:00Z", conclusion: "success" },
+              // build: the real, confirmed failure.
+              buildRun,
+            ],
+          },
+        });
+        await handleCiEvent(ctx, "check_run", eventFor({ name: "build", conclusion: "failure" }));
+        expect(body(api)).toMatchObject({ check_name: "build", details_url: FAILURE_URL });
+        expect(checkQueries.map((q) => q.check_name)).toEqual(["lint", "build"]);
+      });
+
+      test("an unconfirmed provisional check with no event failure reports nothing and claims nothing", async () => {
+        const api = bound();
+        const state = makeState();
+        const { ctx } = makeCtx({
+          api,
+          state,
+          partial: true,
+          checkNode: lintNode(),
+          github: { checkRuns: [{ ...stillFailing, name: "lint", conclusion: "success" }] },
+        });
+        await handleCiEvent(
+          ctx,
+          "check_suite",
+          JSON.stringify({
+            repository: { full_name: "base/repo" },
+            check_suite: { head_sha: "abc123", pull_requests: [{ number: 7 }] },
+          }),
+        );
+        expect(api.posts("/ci-failures")).toHaveLength(0);
+        expect(state.keys()).toEqual([]);
+        expect(api.sessionCalls).toEqual([]);
+      });
+
+      test("a provisional check with no app id can't be confirmed, so the event's check is used", async () => {
+        const api = bound();
+        const { ctx, checkQueries } = makeCtx({
+          api,
+          partial: true,
+          checkNode: lintNode({ checkSuite: undefined }),
+          github: { checkRuns: [{ ...stillFailing, name: "lint" }, buildRun] },
+        });
+        await handleCiEvent(ctx, "check_run", eventFor({ name: "build", conclusion: "failure" }));
+        // Only the event's check was looked up; lint was never confirmable.
+        expect(checkQueries.map((q) => q.check_name)).toEqual(["build"]);
+        expect(body(api)).toMatchObject({ check_name: "build" });
+      });
+
+      test("a provisional failing status is confirmed by its latest state for the sha", async () => {
+        const statusNode = {
+          __typename: "StatusContext",
+          context: "deploy",
+          state: "FAILURE",
+          targetUrl: "https://ci.example.test/deploy/old",
+        };
+        const confirm = (state: string) => ({
+          sha: "abc123",
+          statuses: [{ context: "deploy", state, target_url: "https://ci.example.test/deploy/new" }],
+        });
+        const failing = bound();
+        await handleCiEvent(
+          makeCtx({
+            api: failing,
+            partial: true,
+            checkNode: statusNode,
+            github: { combinedStatus: confirm("failure") },
+          }).ctx,
+          "check_run",
+          eventFor({ name: "x", conclusion: "success" }),
+        );
+        expect(body(failing)).toMatchObject({
+          check_name: "deploy",
+          details_url: "https://ci.example.test/deploy/new",
+        });
+        const passed = bound();
+        await handleCiEvent(
+          makeCtx({
+            api: passed,
+            partial: true,
+            checkNode: statusNode,
+            github: { combinedStatus: confirm("success") },
+          }).ctx,
+          "check_run",
+          eventFor({ name: "x", conclusion: "success" }),
+        );
+        expect(passed.posts("/ci-failures")).toHaveLength(0);
       });
 
       test("never overrides a failing check the evaluation did read", async () => {
@@ -2958,6 +3083,65 @@ describe("PR session bindings", () => {
       }
     });
 
+    describe("an answer for another PR's binding", () => {
+      // Not a miss: only a coded miss means unbound. api-rs answers a node-id
+      // lookup with that PR's binding or a miss, so anything else is anomalous.
+      const otherPr = () =>
+        Response.json({
+          repository: "base/repo",
+          number: 7,
+          thread_key: "slack:T0:C0:1700000000.000100",
+          pr_node_id: "PR_other",
+          revision: 1,
+          head_sha: "abc123",
+          managed: true,
+          closed: false,
+        });
+
+      test("a 200 for a different node starts no fix turn, no escalation, no counter change and no claim", async () => {
+        const api = makeApi({ binding: null, lookupResponse: otherPr });
+        const state = makeState();
+        // At the cap, so a fall-through would escalate with a comment.
+        await state.set(PR_KEY, { consecutiveCiFixes: 3 });
+        const { ctx, comments } = makeCtx({ api, state });
+        await handleCiEvent(ctx, "check_run", redCheckRun);
+        await drainBackgroundWork(2000);
+        expect(api.sessionCalls).toEqual([]);
+        expect(comments).toEqual([]);
+        expect(api.posts("/ci-failures")).toHaveLength(0);
+        expect(api.posts("/state")).toHaveLength(0);
+        expect(await state.get(PR_KEY)).toEqual({ consecutiveCiFixes: 3 });
+        expect(await state.get("centaur-githubbot:ci-settled:base/repo#7:abc123")).toBeUndefined();
+        expect(state.keys()).toEqual([PR_KEY]);
+      });
+
+      test("lifecycle and assignment events write nothing and take no turn for it", async () => {
+        const lifecycle = (action: string, assignee?: string) =>
+          JSON.stringify({
+            action,
+            repository: { full_name: "base/repo" },
+            pull_request: { number: 7, node_id: NODE_ID, head: { sha: "abc123" } },
+            ...(assignee ? { assignee: { login: assignee } } : {}),
+          });
+        for (const [action, assignee] of [
+          ["closed", undefined],
+          ["reopened", undefined],
+          ["synchronize", undefined],
+          ["unassigned", "centaur-bot"],
+          ["assigned", "centaur-bot"],
+        ] as const) {
+          const api = makeApi({ binding: null, lookupResponse: otherPr });
+          const { ctx } = makeCtx({ api });
+          await handlePullRequestEvent(ctx, lifecycle(action, assignee));
+          await drainBackgroundWork(2000);
+          expect(api.posts("/state")).toHaveLength(0);
+          expect(api.posts("/ci-failures")).toHaveLength(0);
+          // Not even an assignment's forced takeover runs a turn on it.
+          expect(api.sessionCalls).toEqual([]);
+        }
+      });
+    });
+
     describe("a partially readable rollup", () => {
       // One readable failing check, one unreadable: the verdict is the aggregate's.
       test("leaves the unbound fix prompt and escalation exactly as before, with no failing names", async () => {
@@ -2985,7 +3169,26 @@ describe("PR session bindings", () => {
 
       test("still lets the bound notice name the readable check and its link", async () => {
         const api = makeApi({ binding: { managed: true, closed: false } });
-        const { ctx } = makeCtx({ api, partial: true });
+        const { ctx } = makeCtx({
+          api,
+          partial: true,
+          // The provisional check is confirmed still failing before it is named.
+          github: {
+            checkRuns: [
+              {
+                id: 1,
+                started_at: "2026-11-23T10:00:00Z",
+                head_sha: "abc123",
+                app: { id: CHECK_APP_ID },
+                status: "completed",
+                conclusion: "failure",
+                name: "build",
+                details_url: FAILURE_URL,
+                html_url: "https://github.com/base/repo/runs/1",
+              },
+            ],
+          },
+        });
         await handleCiEvent(ctx, "check_run", redCheckRun);
         expect(api.sessionCalls).toEqual([]);
         expect(api.posts("/ci-failures")[0]?.body).toMatchObject({
@@ -3008,6 +3211,7 @@ describe("PR session bindings", () => {
                       status: "COMPLETED",
                       conclusion: "FAILURE",
                       detailsUrl: FAILURE_URL,
+                      checkSuite: { app: { slug: "ci", databaseId: CHECK_APP_ID } },
                     },
                     null,
                   ],
@@ -3029,7 +3233,14 @@ describe("PR session bindings", () => {
           settled: true,
           failed: true,
           failingNames: [],
-          noticeFailure: { name: "build", url: FAILURE_URL },
+          // Provisional: the unreadable half may hold a newer run of it.
+          noticeFailure: {
+            name: "build",
+            kind: "check_run",
+            url: FAILURE_URL,
+            appId: CHECK_APP_ID,
+            provisional: true,
+          },
         });
       });
     });

@@ -348,7 +348,8 @@ export async function handlePullRequestEvent(
   // A failed lookup is not "unbound": the invalidating writes (close, unassign,
   // reopen) are still attempted on the signed payload's node id, which api-rs
   // checks against the binding.
-  if (!lookup.ok || lookup.binding) {
+  // (An answer for another PR's binding is no basis for a write at all.)
+  if (!lookup.ok ? !lookup.mismatch : lookup.binding) {
     await recordBindingState(
       ctx,
       bindingRef(repo.owner, repo.repo, number),
@@ -380,11 +381,17 @@ function bindingRef(owner: string, repo: string, number: number): PrBindingRef {
   return { repository: `${owner}/${repo}`.toLowerCase(), number };
 }
 
-type BindingLookup = { ok: true; binding: PrBinding | null } | { ok: false; error: unknown };
+type BindingLookup =
+  | { ok: true; binding: PrBinding | null }
+  // `mismatch`: api-rs answered, but with another PR's binding.
+  | { ok: false; error: unknown; mismatch?: true };
 
 /**
- * The PR's session binding. `binding: null` is an explicit 404 (unbound);
+ * The PR's session binding. `binding: null` is a coded miss (unbound);
  * `ok: false` means api-rs could not say, which is never the same as unbound.
+ * That includes an answer for a *different* PR than the node id asked about:
+ * a node-id lookup that returns anything else than its own PR's binding, or a
+ * coded miss, is an error, not a reason to treat the PR as unbound.
  */
 async function lookupBinding(
   ctx: PrManagerContext,
@@ -395,15 +402,25 @@ async function lookupBinding(
   authoritative = false,
 ): Promise<BindingLookup> {
   try {
-    return {
-      ok: true,
-      binding: await getPrBinding(
-        ctx.options,
-        bindingRef(owner, repo, number),
-        nodeId,
-        authoritative,
-      ),
-    };
+    const binding = await getPrBinding(
+      ctx.options,
+      bindingRef(owner, repo, number),
+      nodeId,
+      authoritative,
+    );
+    if (binding && nodeId && binding.pr_node_id !== nodeId) {
+      logger(ctx).warn("githubbot_pr_binding_node_mismatch", {
+        expected_node_id: nodeId,
+        pr: `${owner}/${repo}#${number}`,
+        received_node_id: binding.pr_node_id,
+      });
+      return {
+        ok: false,
+        mismatch: true,
+        error: new Error("binding lookup answered with another PR's binding"),
+      };
+    }
+    return { ok: true, binding };
   } catch (error) {
     logger(ctx).warn("githubbot_pr_binding_lookup_failed", {
       error: errorMessage(error),
@@ -918,23 +935,8 @@ async function processCi(
     const lookup = await lookupBinding(ctx, owner, repo, number, pr.nodeId ?? undefined, true);
     if (!lookup.ok) return;
     if (lookup.binding) {
-      // A binding for another PR (a recycled repo and number) says nothing
-      // about this one: it takes the unbound flow below, unchanged. A PR whose
-      // node id is unknown can't be told apart, so it is left alone.
-      if (lookup.binding.pr_node_id === pr.nodeId) {
-        await reportBoundCiFailure(
-          ctx,
-          owner,
-          repo,
-          number,
-          headSha,
-          lookup.binding,
-          evaluation,
-          trace,
-          eventFailure,
-        );
-        return;
-      }
+      // The lookup already refused another PR's binding (a lookup error). A PR
+      // whose node id is unknown can't be matched to one, so it is left alone.
       if (!pr.nodeId) {
         traceLog(ctx.options, "githubbot_bound_ci_skipped", trace, {
           pr: `${owner}/${repo}#${number}`,
@@ -942,9 +944,18 @@ async function processCi(
         });
         return;
       }
-      traceLog(ctx.options, "githubbot_pr_binding_other_pr", trace, {
-        pr: `${owner}/${repo}#${number}`,
-      });
+      await reportBoundCiFailure(
+        ctx,
+        owner,
+        repo,
+        number,
+        headSha,
+        lookup.binding,
+        evaluation,
+        trace,
+        eventFailure,
+      );
+      return;
     }
   }
 
@@ -1020,16 +1031,29 @@ async function reportBoundCiFailure(
   if (binding.closed) return skip("closed");
 
   // Name the failing check before the final PR read, so that read stays the
-  // last one. The evaluation's own failing check wins, even from a partially
-  // readable rollup. Only when it names none does the signed event's check
-  // stand in, and only once a fresh read confirms it is still failing on this
-  // exact repository and head. With no identifiable failing check there is
-  // nothing true to say: report nothing.
-  const failing: FailingCheck | undefined = evaluation.noticeFailure
-    ? evaluation.noticeFailure
-    : eventFailure
-      ? await confirmEventFailure(ctx, owner, repo, headSha, eventFailure)
+  // last one. A failing check read from a complete rollup is named as is. One
+  // read from an incomplete rollup is only provisional (a newer run of it may be
+  // among the unreadable contexts), so it is named only once the same latest-run
+  // confirmation the signed event's check gets shows it still failing. When
+  // neither stands, there is nothing true to say: report nothing.
+  const noticeFailure = evaluation.noticeFailure;
+  let failing: FailingCheck | undefined =
+    noticeFailure && !noticeFailure.provisional
+      ? { name: noticeFailure.name, url: noticeFailure.url }
       : undefined;
+  if (!failing && noticeFailure?.provisional) {
+    failing = await confirmEventFailure(ctx, owner, repo, headSha, {
+      kind: noticeFailure.kind,
+      owner,
+      repo,
+      headSha,
+      name: noticeFailure.name,
+      ...(noticeFailure.appId !== undefined ? { appId: noticeFailure.appId } : {}),
+    });
+  }
+  if (!failing && eventFailure) {
+    failing = await confirmEventFailure(ctx, owner, repo, headSha, eventFailure);
+  }
   if (!failing) return skip("no_failing_check");
 
   // api-rs revalidates and posts inside the report request, so its inputs must

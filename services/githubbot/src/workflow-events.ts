@@ -108,11 +108,26 @@ export type CiCheck = {
   name: string;
   /** Where the check's own page or log lives (details or html URL). */
   url?: string | null;
+  /** The GitHub App that reported the check run, when the rollup says. */
+  appId?: number | null;
 };
 export type CiStatus = { state: string; context: string; url?: string | null };
 
 /** A failing check as the bound-PR notice names it, with its usable link. */
-export type CiNoticeFailure = { name: string; url?: string };
+export type CiNoticeFailure = {
+  name: string;
+  url?: string;
+  /** What `name` names, so it can be looked up again. */
+  kind: "check_run" | "status";
+  /** For a check run: the app that reported it (a name alone is ambiguous). */
+  appId?: number;
+  /**
+   * Taken from an incomplete rollup, where a newer run of the same check may be
+   * among the unreadable ones. It must be confirmed still failing, by a fresh
+   * read of that check's latest run, before it is named.
+   */
+  provisional?: true;
+};
 
 export type CiEvaluation = {
   settled: boolean;
@@ -148,13 +163,27 @@ export function evaluateCi(
     ...failingChecks.map((c) => c.name),
     ...failingStatuses.map((s) => s.context),
   ];
-  const firstName = failingChecks[0]?.name ?? failingStatuses[0]?.context;
-  const firstUrl = (failingChecks[0] ?? failingStatuses[0])?.url;
+  const firstCheck = failingChecks[0];
+  const firstStatus = failingStatuses[0];
+  const noticeFailure: CiNoticeFailure | undefined = firstCheck
+    ? {
+        name: firstCheck.name,
+        kind: "check_run",
+        ...(firstCheck.url ? { url: firstCheck.url } : {}),
+        ...(typeof firstCheck.appId === "number" ? { appId: firstCheck.appId } : {}),
+      }
+    : firstStatus
+      ? {
+          name: firstStatus.context,
+          kind: "status",
+          ...(firstStatus.url ? { url: firstStatus.url } : {}),
+        }
+      : undefined;
   return {
     settled: !anyCheckPending && !anyStatusPending,
     failed: failingNames.length > 0,
     failingNames,
-    ...(firstName ? { noticeFailure: { name: firstName, ...(firstUrl ? { url: firstUrl } : {}) } } : {}),
+    ...(noticeFailure ? { noticeFailure } : {}),
   };
 }
 
@@ -177,7 +206,7 @@ const CI_ROLLUP_QUERY = `query($owner: String!, $repo: String!, $sha: GitObjectI
                 detailsUrl
                 permalink
                 checkSuite {
-                  app { slug }
+                  app { slug databaseId }
                   workflowRun {
                     event
                     workflow { name }
@@ -199,7 +228,7 @@ const CI_ROLLUP_QUERY = `query($owner: String!, $repo: String!, $sha: GitObjectI
 type CiRollupContext = {
   __typename: string;
   checkSuite?: {
-    app?: { slug?: string | null } | null;
+    app?: { slug?: string | null; databaseId?: number | null } | null;
     workflowRun?: {
       event?: string | null;
       workflow?: { name?: string | null } | null;
@@ -324,7 +353,15 @@ export async function fetchCiEvaluation(
     // OR-ing it in would undo the filter. A readable detail set is authoritative.
     failed: detail ? detail.failed : rollupState === "FAILURE" || rollupState === "ERROR",
     failingNames: detail?.failingNames ?? [],
-    ...(named?.noticeFailure ? { noticeFailure: named.noticeFailure } : {}),
+    ...(named?.noticeFailure
+      ? {
+          // From an incomplete detail set it is only provisional: a newer run
+          // of that very check may be among the contexts that couldn't be read.
+          noticeFailure: detail
+            ? named.noticeFailure
+            : { ...named.noticeFailure, provisional: true as const },
+        }
+      : {}),
   };
 }
 
@@ -476,6 +513,7 @@ function evaluateCiRollupContexts(nodes: CiRollupContext[]): CiEvaluation {
       conclusion: node.conclusion?.toLowerCase() ?? null,
       name: node.name,
       url: firstUsableUrl(node.detailsUrl, node.permalink),
+      appId: node.checkSuite?.app?.databaseId,
     }));
   const statuses = latestCiStatuses(nodes).map((node) => ({
     state: node.state.toLowerCase(),

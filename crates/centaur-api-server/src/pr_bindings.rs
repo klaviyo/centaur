@@ -2996,8 +2996,6 @@ mod tests {
         }
     }
 
-    /// A store with one bound PR at head `abcdef1` in a Slack channel,
-    /// managed as asked.
     /// The final answer of a completed binding lookup that found nothing: a
     /// 404 carrying the stable code githubbot keys on.
     fn assert_binding_miss(status: StatusCode, body: &Value) {
@@ -3053,6 +3051,8 @@ mod tests {
         assert_ne!(body["code"], "pr_binding_not_found", "{body}");
     }
 
+    /// A store with one bound PR at head `abcdef1` in a Slack channel,
+    /// managed as asked.
     async fn bound_pr_in(h: &Harness, channel: &str, managed: bool) -> (String, PrBinding) {
         let sandbox = h.sandbox_id("ci");
         let thread_key = h.session(channel, &sandbox).await;
