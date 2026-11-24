@@ -238,6 +238,23 @@ impl PgSessionStore {
         .transpose()
     }
 
+    /// The binding for the PR with GraphQL node id `pr_node_id`, if any. Node
+    /// ids are unique and survive a repository rename or transfer, which
+    /// repository and number do not.
+    pub async fn pr_binding_by_node_id(
+        &self,
+        pr_node_id: &str,
+    ) -> Result<Option<PrBinding>, SessionStoreError> {
+        sqlx::query_as::<_, PrBindingRow>(&format!(
+            "select {BINDING_COLUMNS} from pr_session_bindings where pr_node_id = $1"
+        ))
+        .bind(pr_node_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(TryInto::try_into)
+        .transpose()
+    }
+
     /// Applies `update` to an existing binding of the PR `pr_node_id`. Fails
     /// with [`SessionStoreError::PrBindingNotFound`] when none exists and with
     /// [`SessionStoreError::PrBindingConflict`] when the binding is for a
@@ -1151,6 +1168,62 @@ mod tests {
         // A matching revision does not let an older observation through.
         let outcome = write(&store, &new, set_closed(true, Some(4)), at(9)).await;
         assert!(!outcome.applied);
+    }
+
+    #[tokio::test]
+    async fn the_pr_create_lock_serializes_one_repository_and_only_that_one() {
+        use std::time::Duration;
+
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let repository = format!("Acme/lock-{}", Uuid::new_v4().simple());
+        let other = format!("acme/other-{}", Uuid::new_v4().simple());
+        let held = store.lock_pr_create(&repository).await.unwrap();
+
+        // The same repository, in any case, waits; another one does not.
+        let waiting = tokio::time::timeout(
+            Duration::from_millis(300),
+            store.lock_pr_create(&repository.to_ascii_lowercase()),
+        )
+        .await;
+        assert!(waiting.is_err(), "the same repository did not wait");
+        tokio::time::timeout(Duration::from_secs(5), store.lock_pr_create(&other))
+            .await
+            .expect("another repository's lock is free")
+            .unwrap()
+            .release()
+            .await
+            .unwrap();
+
+        held.release().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), store.lock_pr_create(&repository))
+            .await
+            .expect("the lock is free once released")
+            .unwrap();
+        assert!(matches!(
+            store.lock_pr_create("not-a-repository").await,
+            Err(SessionStoreError::InvalidPrBinding(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn bindings_are_found_by_their_immutable_node_id() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key = session(&store).await;
+        let new = new_binding(&thread_key);
+        let stored = store.insert_pr_binding(&new).await.unwrap();
+
+        assert_eq!(
+            store.pr_binding_by_node_id(&new.pr_node_id).await.unwrap(),
+            Some(stored)
+        );
+        assert_eq!(
+            store.pr_binding_by_node_id("PR_unknown").await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

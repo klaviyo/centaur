@@ -684,9 +684,14 @@ export type PrBindingRef = { repository: string; number: number };
 export async function getPrBinding(
   options: GithubbotOptions,
   ref: PrBindingRef,
+  // The PR's immutable node id: lets api-rs find a binding whose repository was
+  // since renamed or transferred.
+  nodeId?: string,
 ): Promise<PrBinding | null> {
   const fetchFn = options.fetch ?? fetch;
-  const response = await fetchFn(prBindingUrl(options.apiUrl, ref), {
+  const url = new URL(prBindingUrl(options.apiUrl, ref));
+  if (nodeId) url.searchParams.set("node_id", nodeId);
+  const response = await fetchFn(url.toString(), {
     method: "GET",
     headers: apiHeaders(options, false),
   });

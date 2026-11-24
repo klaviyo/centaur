@@ -113,10 +113,28 @@ pub struct ProxyBindingLock {
     _permit: OwnedSemaphorePermit,
 }
 
+/// A repository's PR-creation lock, returned by
+/// [`PgSessionStore::lock_pr_create`]. Dropping it releases the lock; call
+/// [`Self::release`] to release it at once.
+pub struct PrCreateLock {
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl PrCreateLock {
+    /// Releases the lock now, rather than leaving it to the dropped
+    /// transaction's deferred rollback.
+    pub async fn release(self) -> Result<(), SessionStoreError> {
+        self.tx.rollback().await?;
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct PgSessionStore {
     pool: PgPool,
     proxy_binding_permits: Arc<Semaphore>,
+    pr_create_permits: Arc<Semaphore>,
 }
 
 impl PgSessionStore {
@@ -124,6 +142,7 @@ impl PgSessionStore {
         Self {
             pool,
             proxy_binding_permits: Arc::new(Semaphore::new(PROXY_BINDING_LOCK_CONCURRENCY)),
+            pr_create_permits: Arc::new(Semaphore::new(PROXY_BINDING_LOCK_CONCURRENCY)),
         }
     }
 
@@ -704,6 +723,42 @@ impl PgSessionStore {
         .await?;
         Ok(ProxyBindingLock {
             _tx: tx,
+            _permit: permit,
+        })
+    }
+
+    /// Waits for, then holds, the repository's PR-creation lock until the
+    /// returned guard is released or dropped. Every api-rs replica shares it.
+    /// A trusted PR creation holds it from before its GitHub call through its
+    /// binding insert, and a binding lookup that finds nothing takes it once
+    /// (and lets go) before answering, so "no binding" is never reported while
+    /// a creation for that repository is still in flight.
+    ///
+    /// Lock order: a creation takes the thread's proxy-binding lock first and
+    /// this one second; a lookup takes only this one. The two use separate
+    /// replica-wide permit pools, so waiting for one kind can never starve the
+    /// holders of the other, and no cycle can form. `repository` is
+    /// case-insensitive.
+    pub async fn lock_pr_create(
+        &self,
+        repository: &str,
+    ) -> Result<PrCreateLock, SessionStoreError> {
+        let repository = normalize_pr_repository(repository)?;
+        let permit = self
+            .pr_create_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the PR-create semaphore is never closed");
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "select pg_advisory_xact_lock(hashtextextended('centaur:pr-create:' || $1::text, 0))",
+        )
+        .bind(&repository)
+        .execute(&mut *tx)
+        .await?;
+        Ok(PrCreateLock {
+            tx,
             _permit: permit,
         })
     }

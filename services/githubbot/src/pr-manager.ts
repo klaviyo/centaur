@@ -62,20 +62,6 @@ const DEFAULT_CI_FIX_MAX_ATTEMPTS = 3;
 // Close, unassign and reopen writes invalidate a notice, so they get 3 attempts
 // over about 30s (10s then 20s apart) before githubbot gives up and logs.
 const DEFAULT_STATE_WRITE_RETRY_DELAYS_MS = [10_000, 20_000];
-// api-rs inserts a binding a moment after GitHub creates the PR, so a very
-// early event can find none yet. Two re-checks (2s, then 5s later) settle that
-// before a PR is taken as unbound.
-const BINDING_RECHECK_DELAYS_MS = [2_000, 5_000];
-// ...and only a PR this young can be in that window; an older one with no
-// binding is simply unbound.
-const BINDING_RECHECK_MAX_PR_AGE_MS = 60_000;
-
-function isJustCreated(pr: PullRequestSummary): boolean {
-  const created = pr.createdAt ? Date.parse(pr.createdAt) : Number.NaN;
-  const age = Date.now() - created;
-  return Number.isFinite(age) && age <= BINDING_RECHECK_MAX_PR_AGE_MS;
-}
-
 // ---------------------------------------------------------------------------
 // Pure decision helpers (unit-tested without GitHub).
 // ---------------------------------------------------------------------------
@@ -224,7 +210,6 @@ type PullRequestSummary = {
   number: number;
   state: string;
   title: string;
-  createdAt: string | null;
   updatedAt: string | null;
 };
 
@@ -246,7 +231,6 @@ function summarizePr(pr: {
   number: number;
   state: string;
   title: string;
-  created_at?: string | null;
   updated_at?: string | null;
   assignees?: ({ login?: string } | null)[] | null;
 }): PullRequestSummary {
@@ -264,7 +248,6 @@ function summarizePr(pr: {
     number: pr.number,
     state: pr.state,
     title: pr.title,
-    createdAt: pr.created_at ?? null,
     updatedAt: pr.updated_at ?? null,
   };
 }
@@ -342,17 +325,15 @@ export async function handlePullRequestEvent(
   if (number === undefined) return;
   // A PR opened through a session binding keeps its lifecycle state in api-rs,
   // recorded before (and regardless of) the unbound handling below.
-  let lookup = await lookupBindingWithRetry(ctx, repo.owner, repo.repo, number);
-  const assigneeLogin = isRecord(payload.assignee) ? stringValue(payload.assignee.login) : undefined;
-  if (
-    action === "assigned" &&
-    assigneeLogin?.toLowerCase() === ctx.userName.toLowerCase() &&
-    lookup.ok &&
-    !lookup.binding
-  ) {
-    // An automatic assignment can beat the binding's insert.
-    lookup = await recheckForBinding(ctx, repo.owner, repo.repo, number);
-  }
+  // The PR's node id from the signed payload lets api-rs find a binding whose
+  // repository was since renamed.
+  const lookup = await lookupBindingWithRetry(
+    ctx,
+    repo.owner,
+    repo.repo,
+    number,
+    stringValue(prNode.node_id),
+  );
   // A failed lookup is not "unbound": the invalidating writes (close, unassign,
   // reopen) are still attempted on the signed payload's node id, which api-rs
   // checks against the binding.
@@ -399,9 +380,13 @@ async function lookupBinding(
   owner: string,
   repo: string,
   number: number,
+  nodeId?: string,
 ): Promise<BindingLookup> {
   try {
-    return { ok: true, binding: await getPrBinding(ctx.options, bindingRef(owner, repo, number)) };
+    return {
+      ok: true,
+      binding: await getPrBinding(ctx.options, bindingRef(owner, repo, number), nodeId),
+    };
   } catch (error) {
     logger(ctx).warn("githubbot_pr_binding_lookup_failed", {
       error: errorMessage(error),
@@ -409,28 +394,6 @@ async function lookupBinding(
     });
     return { ok: false, error };
   }
-}
-
-/**
- * After an explicit 404, look again a couple of times before believing it: the
- * binding may be inserted just after the event that asked. Returns the first
- * lookup that finds one or fails, else the last 404. Callers use this only
- * where an early event is expected (the bot being assigned, a red head).
- */
-async function recheckForBinding(
-  ctx: PrManagerContext,
-  owner: string,
-  repo: string,
-  number: number,
-): Promise<BindingLookup> {
-  const sleep = ctx.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-  let lookup: BindingLookup = { ok: true, binding: null };
-  for (const delay of BINDING_RECHECK_DELAYS_MS) {
-    await sleep(delay);
-    lookup = await lookupBinding(ctx, owner, repo, number);
-    if (!lookup.ok || lookup.binding) return lookup;
-  }
-  return lookup;
 }
 
 /**
@@ -443,11 +406,12 @@ async function lookupBindingWithRetry(
   owner: string,
   repo: string,
   number: number,
+  nodeId?: string,
 ): Promise<BindingLookup> {
   const delays = ctx.stateWriteRetryDelaysMs ?? DEFAULT_STATE_WRITE_RETRY_DELAYS_MS;
   const sleep = ctx.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   for (let attempt = 0; ; attempt += 1) {
-    const lookup = await lookupBinding(ctx, owner, repo, number);
+    const lookup = await lookupBinding(ctx, owner, repo, number, nodeId);
     if (lookup.ok || attempt >= delays.length || !isRetryableSessionApiError(lookup.error)) {
       return lookup;
     }
@@ -491,7 +455,13 @@ async function recordBindingState(
     // A conflict means another writer got in: read the binding again, for its
     // new revision, *before* reading the PR it will be compared against.
     if (reread) {
-      const again = await lookupBinding(ctx, owner, repo, ref.number);
+      const again = await lookupBinding(
+        ctx,
+        owner,
+        repo,
+        ref.number,
+        current?.pr_node_id ?? stringValue(prNode.node_id),
+      );
       if (again.ok) {
         if (!again.binding) return undefined;
         current = again.binding;
@@ -534,7 +504,10 @@ async function recordBindingState(
   if (!update) return;
   // Enabling management is as unrepeatable as disabling it (one delivery, no
   // redelivery), so both get the bounded retry.
-  await writeBindingState(ctx, ref, update, invalidating || action === "assigned", action, () =>
+  // api-rs knows the PR by the coordinates it was bound under, which a rename
+  // or transfer may have left different from this event's.
+  const target = current ? { repository: current.repository, number: current.number } : ref;
+  await writeBindingState(ctx, target, update, invalidating || action === "assigned", action, () =>
     build(true),
   );
 }
@@ -911,11 +884,7 @@ async function processCi(
   // early skip may already have consumed it). Only an explicit 404 means
   // unbound: if api-rs can't say, do nothing at all, and take no claim.
   if (evaluation.failed) {
-    let lookup = await lookupBinding(ctx, owner, repo, number);
-    // A red head on a just-created PR can beat the binding's insert.
-    if (lookup.ok && !lookup.binding && isJustCreated(pr)) {
-      lookup = await recheckForBinding(ctx, owner, repo, number);
-    }
+    const lookup = await lookupBinding(ctx, owner, repo, number, pr.nodeId ?? undefined);
     if (!lookup.ok) return;
     if (lookup.binding) {
       // A binding for another PR (a recycled repo and number) says nothing
@@ -1011,6 +980,9 @@ async function reportBoundCiFailure(
   eventFailure?: CiEventFailure,
 ): Promise<void> {
   const prLabel = `${owner}/${repo}#${number}`;
+  // api-rs knows the PR by the coordinates it was bound under, which a rename
+  // or transfer may have left different from this event's.
+  const bindingTarget = { repository: binding.repository, number: binding.number };
   const skip = (reason: string) =>
     traceLog(ctx.options, "githubbot_bound_ci_skipped", trace, { pr: prLabel, reason });
   if (!binding.managed) return skip("not_managed");
@@ -1044,7 +1016,7 @@ async function reportBoundCiFailure(
   if (binding.head_sha !== fresh.headSha) {
     const recorded = await writeBindingState(
       ctx,
-      bindingRef(owner, repo, number),
+      bindingTarget,
       {
         pr_node_id: fresh.nodeId,
         observed_updated_at: fresh.updatedAt,
@@ -1056,7 +1028,7 @@ async function reportBoundCiFailure(
       "ci_head_sync",
       async () => {
         // Binding first (its new revision), then the PR it is compared with.
-        const rebound = await lookupBinding(ctx, owner, repo, number);
+        const rebound = await lookupBinding(ctx, owner, repo, number, binding.pr_node_id);
         if (!rebound.ok || !rebound.binding || rebound.binding.pr_node_id !== binding.pr_node_id) {
           return undefined;
         }
@@ -1086,7 +1058,7 @@ async function reportBoundCiFailure(
   // is also the only dedupe authority, keyed by (pr_node_id, head_sha): a
   // repeat delivery is answered `duplicate`, so githubbot keeps no claim here.
   try {
-    const result = await reportPrCiFailure(ctx.options, bindingRef(owner, repo, number), {
+    const result = await reportPrCiFailure(ctx.options, bindingTarget, {
       pr_node_id: fresh.nodeId,
       observed_updated_at: fresh.updatedAt,
       head_sha: headSha,

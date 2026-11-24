@@ -18,7 +18,7 @@ use std::future::Future;
 
 use axum::{
     Extension, Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
 };
 use centaur_sandbox_core::SandboxError;
@@ -341,6 +341,14 @@ where
         ));
     };
 
+    // From here to the binding insert, a lookup that misses must wait for this
+    // creation (see `lock_pr_create`). Taken after the thread's lock, always
+    // in that order.
+    let pr_create = runtime
+        .store()
+        .lock_pr_create(&request.repository)
+        .await
+        .map_err(SessionRuntimeError::from)?;
     before_github().await;
     let response = runtime
         .create_github_pull_request(sandbox_id, &request.owner, &request.repo, request.payload)
@@ -369,6 +377,10 @@ where
         .await
         .map(|_| ()),
     };
+    // The binding (if any) is committed: let lookups that missed go on.
+    if let Err(error) = pr_create.release().await {
+        tracing::warn!(%error, "failed to release the PR-create lock");
+    }
     Ok(match outcome {
         Ok(()) => json!({"pull_request": pull_request.summary(), "bound": true}),
         Err(reason) => {
@@ -464,18 +476,52 @@ fn pr_path(owner: &str, repo: &str, number: i64) -> (String, i64) {
     (format!("{owner}/{repo}"), number)
 }
 
-/// `GET /api/pr-bindings/{owner}/{repo}/{number}`: the binding, or 404.
+/// `GET /api/pr-bindings/{owner}/{repo}/{number}` query.
+#[derive(Debug, Deserialize)]
+pub(crate) struct BindingLookupQuery {
+    /// The PR's GraphQL node id. A binding is found by it when given, wherever
+    /// the path's repository and number point, which is how a renamed or
+    /// transferred repository still finds its binding.
+    #[serde(default)]
+    node_id: Option<String>,
+}
+
+/// `GET /api/pr-bindings/{owner}/{repo}/{number}[?node_id=…]`: the binding
+/// (with its stored repository and number, for the caller's later calls), or
+/// 404.
+///
+/// A miss is authoritative: before answering 404 the lookup waits for any
+/// PR creation in flight for the repository (it takes, and at once releases,
+/// the repository's PR-create lock) and reads again, so a creation that had
+/// already made its GitHub call cannot bind just after a "no binding" answer.
 pub(crate) async fn get_pr_binding(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
+    Query(query): Query<BindingLookupQuery>,
 ) -> Result<Json<PrBinding>, ApiError> {
     let (repository, number) = pr_path(&owner, &repo, number);
-    state
-        .runtime()?
-        .store()
-        .pr_binding(&repository, number)
-        .await
-        .map_err(SessionRuntimeError::from)?
+    let runtime = state.runtime()?;
+    let store = runtime.store();
+    let lookup = || async {
+        if let Some(node_id) = query.node_id.as_deref()
+            && let Some(binding) = store.pr_binding_by_node_id(node_id).await?
+        {
+            return Ok(Some(binding));
+        }
+        store.pr_binding(&repository, number).await
+    };
+    let mut found = lookup().await.map_err(SessionRuntimeError::from)?;
+    if found.is_none() {
+        store
+            .lock_pr_create(&repository)
+            .await
+            .map_err(SessionRuntimeError::from)?
+            .release()
+            .await
+            .map_err(SessionRuntimeError::from)?;
+        found = lookup().await.map_err(SessionRuntimeError::from)?;
+    }
+    found
         .map(Json)
         .ok_or_else(|| ApiError::NotFound(format!("no PR binding for {repository}#{number}")))
 }
@@ -1595,6 +1641,185 @@ mod tests {
         .await
         .expect("a refusal releases the lock")
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lookup_miss_waits_for_an_in_flight_creation_in_its_repository() {
+        use std::time::Duration;
+
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let sandbox = h.sandbox_id("lookup");
+        let thread_key = h.session("C0TEST", &sandbox).await;
+        h.backend.respond(
+            201,
+            h.github_pull_request(7, AUTHOR_ID, "User", &h.repository()),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", h.token(&sandbox)).parse().unwrap(),
+        );
+        let caller = h.auth.authenticate(&headers).unwrap();
+        let request: CreatePullRequestRequest = serde_json::from_value(h.create_body()).unwrap();
+
+        // Creation pauses just before its GitHub call, holding the repository's
+        // PR-create lock.
+        let (paused_tx, paused_rx) = tokio::sync::oneshot::channel::<()>();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+        let creation = tokio::spawn({
+            let state = h.state.clone();
+            let raw = thread_key.as_str().to_owned();
+            async move {
+                create_session_pull_request_with(&state, &caller, raw, request, || async move {
+                    let _ = paused_tx.send(());
+                    let _ = resume_rx.await;
+                })
+                .await
+            }
+        });
+        paused_rx.await.expect("creation reached the GitHub call");
+
+        // A lookup that misses for that repository waits instead of answering
+        // 404 while a binding may be about to appear.
+        let uri = format!("/api/pr-bindings/{}/7", h.repository());
+        let mut lookup = tokio::spawn({
+            let router = h.router.clone();
+            async move {
+                let response = router
+                    .oneshot(
+                        Request::builder()
+                            .uri(uri)
+                            .header(header::AUTHORIZATION, format!("Bearer {GITHUBBOT_KEY}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+                )
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), &mut lookup)
+                .await
+                .is_err(),
+            "the miss answered while a creation was in flight"
+        );
+
+        // Another repository's lookup does not wait.
+        let other = format!("/api/pr-bindings/acme/other-{}/7", h.suffix);
+        let (status, _) = tokio::time::timeout(
+            Duration::from_secs(3),
+            h.send(Method::GET, &other, GITHUBBOT_KEY, None),
+        )
+        .await
+        .expect("another repository's lookup waited");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // The creation commits its binding; the waiting lookup finds it.
+        resume_tx.send(()).unwrap();
+        assert_eq!(creation.await.unwrap().unwrap()["bound"], true);
+        let (status, body) = tokio::time::timeout(Duration::from_secs(5), lookup)
+            .await
+            .expect("the lookup finishes once the creation does")
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["thread_key"], thread_key.as_str());
+        assert_eq!(body["number"], 7);
+    }
+
+    #[tokio::test]
+    async fn a_refused_creation_releases_the_repository_lock() {
+        use std::time::Duration;
+
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let sandbox = h.sandbox_id("refused");
+        let thread_key = h.session("C0TEST", &sandbox).await;
+        // GitHub refuses after the lock is taken.
+        h.backend
+            .respond(422, json!({"message": "Validation Failed"}));
+        let (status, _) = h
+            .create(&thread_key, &h.token(&sandbox), h.create_body())
+            .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            h.store.lock_pr_create(&h.repository()),
+        )
+        .await
+        .expect("the refusal left the repository lock held")
+        .unwrap();
+        // And a lookup miss answers at once.
+        let uri = format!("/api/pr-bindings/{}/7", h.repository());
+        let (status, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            h.send(Method::GET, &uri, GITHUBBOT_KEY, None),
+        )
+        .await
+        .expect("the miss waited on a lock a refusal should have released");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_binding_is_found_by_node_id_after_a_repository_rename() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let (repository, bound) = bound_pr(&h, true).await;
+
+        // GitHub now calls the repository something else, and the PR a
+        // different number in the caller's mind. By path alone: no binding.
+        let renamed = format!("/api/pr-bindings/acme/renamed-{}/7", h.suffix);
+        let (status, _) = h.send(Method::GET, &renamed, GITHUBBOT_KEY, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // By node id: found, and the response carries the stored repository
+        // and number for the caller's later calls.
+        let (status, body) = h
+            .send(
+                Method::GET,
+                &format!("{renamed}?node_id={}", h.node_id()),
+                GITHUBBOT_KEY,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["repository"], repository);
+        assert_eq!(body["number"], 7);
+        assert_eq!(body["pr_node_id"], bound.pr_node_id);
+        assert_eq!(body["thread_key"], bound.thread_key.as_str());
+
+        // An unknown node id on an unknown path is still a (waited-for) miss.
+        let (status, _) = h
+            .send(
+                Method::GET,
+                &format!("{renamed}?node_id=PR_unknown"),
+                GITHUBBOT_KEY,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // An unknown node id on the right path falls back to the path.
+        let (status, body) = h
+            .send(
+                Method::GET,
+                &format!("/api/pr-bindings/{repository}/7?node_id=PR_unknown"),
+                GITHUBBOT_KEY,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["pr_node_id"], bound.pr_node_id);
     }
 
     #[tokio::test]

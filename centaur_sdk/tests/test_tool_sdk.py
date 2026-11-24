@@ -718,6 +718,8 @@ def test_create_pull_request_cli_prints_result(
         (403, "dm_not_supported", True),
         (403, "sandbox_mismatch", True),
         (503, "sandbox_proxy_unavailable", True),
+        (501, "pull_requests_unsupported", True),
+        (403, "sandbox_claim_required", True),
         (409, "requester_not_applied", False),
         (409, "no_active_execution", False),
         (502, "upstream_error", False),

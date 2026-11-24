@@ -25,6 +25,8 @@ _FALLBACK_CODES = (
     "github_oauth_required",
     "sandbox_mismatch",
     "sandbox_proxy_unavailable",
+    "pull_requests_unsupported",
+    "sandbox_claim_required",
 )
 _FALLBACK_HINT = (
     "This session cannot open a session-bound pull request; "
