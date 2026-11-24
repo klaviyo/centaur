@@ -32,6 +32,9 @@ pub(crate) async fn build_config(
         proxy.requester_principal_id,
     )
     .await?;
+    // Everything appended from here goes into `secrets`. Nothing may be added
+    // to `transforms`: the PR-create guard built above must stay the final
+    // transform, the last writer of `Authorization`.
     append_api_jwt(state, proxy, &mut config, github_user_id, now).await?;
     append_sandbox_jwt(state, proxy, &mut config, now)?;
     Ok(config)

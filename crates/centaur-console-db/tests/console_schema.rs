@@ -653,13 +653,26 @@ fn github_secrets(config: &Config) -> Vec<&Value> {
         .collect()
 }
 
-/// The secrets that carry the PR-create OAuth placeholder.
+/// The guards in `config`: secrets under the PR-create OAuth placeholder, in
+/// `secrets` or inside any `secrets` transform. A healthy config has exactly
+/// one, in the last transform.
 fn pr_oauth_secrets(config: &Config) -> Vec<&Value> {
-    config
+    let in_secrets = config
         .secrets
         .iter()
-        .filter(|secret| secret["replace"]["proxy_value"] == PR_OAUTH_PLACEHOLDER)
-        .collect()
+        .filter(|secret| secret["replace"]["proxy_value"] == PR_OAUTH_PLACEHOLDER);
+    let in_transforms = config
+        .transforms
+        .iter()
+        .filter(|transform| transform["name"] == "secrets")
+        .flat_map(|transform| {
+            transform["config"]["secrets"]
+                .as_array()
+                .into_iter()
+                .flatten()
+        })
+        .filter(|secret| secret["replace"]["proxy_value"] == PR_OAUTH_PLACEHOLDER);
+    in_secrets.chain(in_transforms).collect()
 }
 
 /// The sentinel the guard carries when no account is attested.
@@ -667,19 +680,33 @@ fn sentinel() -> Value {
     json!({"type": "control_plane", "value": "centaur-unattested-oauth"})
 }
 
-/// Checks that `config` ends with exactly one PR-create guard, `require: true`,
-/// for the one create operation, and returns its source.
+/// Checks that `config` ends with exactly one PR-create guard: the last
+/// element of `transforms`, a `secrets` transform holding that one secret,
+/// `require: true`, for the one create operation, and that nothing is in
+/// `secrets`. A managed proxy runs `secrets` first and then each transform in
+/// order, so only the last transform can be the last `Authorization` writer.
+/// Returns the guard's source.
 fn assert_guard_last(config: &Config) -> Value {
+    assert!(
+        config
+            .secrets
+            .iter()
+            .all(|secret| secret["replace"]["proxy_value"] != PR_OAUTH_PLACEHOLDER),
+        "the guard must not be in `secrets`"
+    );
     let guards = pr_oauth_secrets(config);
     assert_eq!(guards.len(), 1, "{guards:?}");
+    let last = config.transforms.last().expect("a trailing transform");
+    assert_eq!(last["name"], "secrets");
+    assert_eq!(last["config"]["secrets"].as_array().map(Vec::len), Some(1));
+    assert_eq!(&last["config"]["secrets"][0], guards[0]);
     assert_eq!(
-        config.secrets.last().map(|secret| &secret["replace"]),
-        Some(&json!({
+        guards[0]["replace"],
+        json!({
             "proxy_value": "CENTAUR_PR_OAUTH",
             "match_headers": ["Authorization"],
             "require": true,
-        })),
-        "the guard must be the last secret"
+        })
     );
     assert_eq!(
         guards[0]["rules"],
@@ -862,14 +889,21 @@ async fn a_transform_targeting_the_api_host_withdraws_the_claim() {
         github_account(&fixture, actor).await.as_deref(),
         Some("90210001")
     );
+    // The transform is delivered, and the guard still comes after it.
+    let (config, _) = github_config(&fixture, actor).await;
+    assert_eq!(config.transforms.len(), 2);
+    assert_eq!(config.transforms[0]["name"], "gcp_auth");
+    assert_ne!(assert_guard_last(&config), sentinel());
 
     // ... and one that targets api.github.com withdraws it, leaving the guard
-    // with the sentinel.
+    // (still last, after the transform) with the sentinel.
     fixture
         .rule("gcp_auth_secret_id", gcp, "api.github.com")
         .await;
     let (config, account) = github_config(&fixture, actor).await;
     assert_eq!(account, None);
+    assert_eq!(config.transforms.len(), 2);
+    assert_eq!(config.transforms[0]["name"], "gcp_auth");
     assert_eq!(assert_guard_last(&config), sentinel());
 }
 

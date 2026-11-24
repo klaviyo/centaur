@@ -488,8 +488,10 @@ impl Fixture {
     /// credentials themselves. The guard has its own tests (`sync_raw`).
     async fn sync(&self, token: &str) -> Value {
         let mut body = self.sync_raw(token).await;
-        if let Some(secrets) = body["secrets"].as_array_mut() {
-            secrets.retain(|secret| secret["replace"]["proxy_value"] != "CENTAUR_PR_OAUTH");
+        if let Some(transforms) = body["transforms"].as_array_mut()
+            && transforms.last().is_some_and(is_guard_transform)
+        {
+            transforms.pop();
         }
         body
     }
@@ -954,6 +956,97 @@ fn api_jwt_claims(body: &Value) -> Value {
 }
 
 #[tokio::test]
+async fn the_pr_create_guard_stays_the_final_transform_whatever_other_transforms_exist() {
+    let Some(f) = Fixture::with_jwt(true).await else {
+        return;
+    };
+    // A GitHub credential the actor connected themselves: attested.
+    let principal = f.principal("principal").await;
+    sqlx::query("UPDATE principals SET kind = 'console_user', console_user_id = $2 WHERE id = $1")
+        .bind(principal)
+        .bind(f.admin)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let app = f.oauth_app("github-order", false).await;
+    let broker = f
+        .broker_credential("github-order-user", Some(app), true)
+        .await;
+    f.update(
+        "UPDATE broker_credentials SET provider_subject = '90210001' WHERE id = $1",
+        broker,
+    )
+    .await;
+    let wrapper = f
+        .github_wrapper_secret("github-order-token", broker, broker, "api.github.com")
+        .await;
+    f.grant(
+        Grantee::Principal(principal),
+        "static_secret_id",
+        wrapper,
+        DIRECT,
+    )
+    .await;
+    let token = f.proxy(Some(principal), None, json!({})).await;
+
+    let body = f.sync_raw(&token).await;
+    assert_eq!(api_jwt_claims(&body)["github_user_id"], "90210001");
+    let delivered = body["secrets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|secret| secret["rules"] == json!([{ "host": "api.github.com" }]))
+        .unwrap()
+        .clone();
+    assert_guard(&body, Some(&delivered["source"]));
+
+    // An oauth_token transform on another host: it is delivered, and the
+    // guard is still the last transform, after it. (The API token's own
+    // secrets are appended to `secrets`, never to `transforms`.)
+    let other = f.oauth_token("other-host", None, "mcp.example.com").await;
+    f.grant(
+        Grantee::Principal(principal),
+        "oauth_token_secret_id",
+        other,
+        DIRECT,
+    )
+    .await;
+    f.bump(principal).await;
+    let body = f.sync_raw(&token).await;
+    let names: Vec<&str> = body["transforms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|transform| transform["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["oauth_token", "secrets"]);
+    assert_guard(&body, Some(&delivered["source"]));
+
+    // One that targets api.github.com is delivered too and withdraws the
+    // claim, and the guard (now with the sentinel) is still last, so it runs
+    // after the transform and fails closed against it.
+    let github = f.oauth_token("github-host", None, "api.github.com").await;
+    f.grant(
+        Grantee::Principal(principal),
+        "oauth_token_secret_id",
+        github,
+        DIRECT,
+    )
+    .await;
+    f.bump(principal).await;
+    let body = f.sync_raw(&token).await;
+    assert!(api_jwt_claims(&body).get("github_user_id").is_none());
+    let names: Vec<&str> = body["transforms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|transform| transform["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["oauth_token", "secrets"]);
+    assert_guard(&body, None);
+}
+
+#[tokio::test]
 async fn api_jwt_names_the_requester_the_proxy_is_bound_to() {
     let Some(f) = Fixture::with_jwt(true).await else {
         return;
@@ -999,32 +1092,57 @@ async fn api_jwt_names_the_requester_the_proxy_is_bound_to() {
     );
 }
 
-/// The secrets a sync response delivers under the PR-create OAuth placeholder.
+/// Whether `transform` is a `secrets` transform holding the PR-create guard.
+fn is_guard_transform(transform: &Value) -> bool {
+    transform["name"] == "secrets"
+        && transform["config"]["secrets"]
+            .as_array()
+            .is_some_and(|secrets| {
+                secrets
+                    .iter()
+                    .any(|secret| secret["replace"]["proxy_value"] == "CENTAUR_PR_OAUTH")
+            })
+}
+
+/// The secrets a sync response delivers under the PR-create OAuth placeholder,
+/// wherever they are.
 fn pr_oauth_secrets(body: &Value) -> Vec<Value> {
-    body["secrets"]
+    let in_secrets = body["secrets"].as_array().unwrap().iter();
+    let in_transforms = body["transforms"]
         .as_array()
         .unwrap()
         .iter()
+        .filter(|transform| transform["name"] == "secrets")
+        .flat_map(|transform| transform["config"]["secrets"].as_array().unwrap().iter());
+    in_secrets
+        .chain(in_transforms)
         .filter(|secret| secret["replace"]["proxy_value"] == "CENTAUR_PR_OAUTH")
         .cloned()
         .collect()
 }
 
 /// Asserts that `body` ends with exactly one PR-create guard (`require: true`,
-/// for the one create operation) and that its source is `source`, or the
-/// unattested sentinel when `None`.
+/// for the one create operation) as its final transform, never in `secrets`,
+/// and that its source is `source`, or the unattested sentinel when `None`.
+///
+/// A managed proxy runs `secrets` first and then each transform in order, so
+/// only the last transform can be the last `Authorization` writer.
 fn assert_guard(body: &Value, source: Option<&Value>) {
     let guards = pr_oauth_secrets(body);
     assert_eq!(guards.len(), 1, "{guards:?}");
-    // The last secret for the GitHub API host (the API token's own secret
-    // targets another host and may follow).
-    let github: Vec<&Value> = body["secrets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|secret| secret["rules"][0]["host"] == "api.github.com")
-        .collect();
-    assert_eq!(github.last().copied(), guards.first());
+    assert!(
+        body["secrets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|secret| secret["replace"]["proxy_value"] != "CENTAUR_PR_OAUTH"),
+        "the guard must not be in `secrets`"
+    );
+    let last = body["transforms"].as_array().unwrap().last().unwrap();
+    assert_eq!(
+        last,
+        &json!({"name": "secrets", "config": {"secrets": [guards[0].clone()]}})
+    );
     assert_eq!(
         guards[0]["replace"],
         json!({"proxy_value": "CENTAUR_PR_OAUTH", "match_headers": ["Authorization"], "require": true})

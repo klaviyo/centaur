@@ -77,17 +77,23 @@ pub async fn build_config(
 /// callers compare it with the author GitHub reports for a PR created with
 /// that token.
 ///
-/// Every configuration built here ends with one guard secret, appended after
-/// all credentials' own so it never takes part in conflict suppression and is
-/// the last writer of `Authorization` for `POST api.github.com
-/// /repos/*/*/pulls`. It replaces the placeholder [`PR_OAUTH_PLACEHOLDER`] and
-/// is `require: true`, which makes the proxy refuse the request outright when
-/// an earlier secret has already written that header. api-rs's pull-request
-/// create call sends that placeholder instead of the generic `GITHUB_TOKEN`
-/// one, so it authenticates only with the attested OAuth credential in the
-/// configuration in force at that moment: if the credential has since become a
-/// personal access token, or something injects `Authorization` directly, the
-/// call fails closed instead of going out under another token.
+/// Every configuration built here ends with one guard: a trailing `secrets`
+/// transform, the very last element of `transforms`, holding a single secret.
+/// In a managed proxy the control-plane `secrets` run first and then each
+/// transform in list order, so a transform here runs after everything else,
+/// including `oauth_token`, `aws_auth`, `gcp_*` and `hmac` transforms that
+/// could overwrite `Authorization`. The guard is therefore the last writer of
+/// `Authorization` for `POST api.github.com /repos/*/*/pulls`: it replaces the
+/// placeholder [`PR_OAUTH_PLACEHOLDER`] and is `require: true`, so the proxy
+/// refuses the request outright if an earlier secret or transform has already
+/// written that header. (Placed in `secrets` instead, a later transform would
+/// overwrite it and the guard would fail open.) Callers must append nothing
+/// to `transforms` after this build. api-rs's pull-request create call sends
+/// that placeholder instead of the generic `GITHUB_TOKEN` one, so it
+/// authenticates only with the attested OAuth credential in the configuration
+/// in force at that moment: if the credential has since become a personal
+/// access token, or something injects or rewrites `Authorization`, the call
+/// fails closed instead of going out under another token.
 ///
 /// The guard is in every configuration, not only attested ones, because a
 /// guard that exists only while OAuth is attested could vanish in the very
@@ -176,7 +182,7 @@ async fn build(
             None => None,
         }
         .unwrap_or_else(|| UNATTESTED_OAUTH_SOURCE.clone());
-        config.secrets.push(json!({
+        let guard = json!({
             "source": source,
             "replace": {
                 "proxy_value": PR_OAUTH_PLACEHOLDER,
@@ -188,7 +194,10 @@ async fn build(
                 "methods": ["POST"],
                 "paths": ["/repos/*/*/pulls"],
             }],
-        }));
+        });
+        config
+            .transforms
+            .push(json!({ "name": "secrets", "config": { "secrets": [guard] } }));
     }
     Ok((config, github_user_id))
 }
