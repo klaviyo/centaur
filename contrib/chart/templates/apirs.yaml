@@ -2,6 +2,15 @@
 {{- $console := include "centaur.consoleValues" . | fromYaml -}}
 {{- $mcpPublicUrl := default .Values.slackbotv2.mcpPublicUrl .Values.apiRs.mcpPublicUrl -}}
 {{- $apiRsName := include "centaur.componentName" (dict "root" . "component" "api-rs") -}}
+{{- /* The trusted-create gate, validated once: every use below (the env
+value, the override and selector checks, the certificate projection) reads this
+boolean, so a non-boolean value (possible when the schema is skipped) can't
+leave them disagreeing. */ -}}
+{{- $trustedPrCreateRaw := .Values.apiRs.trustedPrCreateEnabled | default false -}}
+{{- if not (kindIs "bool" $trustedPrCreateRaw) -}}
+{{- fail (printf "apiRs.trustedPrCreateEnabled must be a boolean; got %v (%s)" $trustedPrCreateRaw (kindOf $trustedPrCreateRaw)) -}}
+{{- end -}}
+{{- $trustedPrCreate := $trustedPrCreateRaw -}}
 {{- $repoCacheStorageType := include "centaur.repoCacheStorageType" . -}}
 {{- $repoCacheUsePvc := eq $repoCacheStorageType "persistentVolumeClaim" -}}
 {{- $repoCachePvcName := include "centaur.repoCachePvcName" . -}}
@@ -126,6 +135,9 @@ connectors, so later sources come later in the list. */ -}}
 {{- $apiRsEtlPassthroughNames = append $apiRsEtlPassthroughNames $env.name -}}
 {{- end -}}
 {{- with (get .Values.apiRs.extraEnv "SESSION_SANDBOX_PASSTHROUGH_ENV") -}}
+{{- if not (kindIs "string" .) -}}
+{{- fail "apiRs.extraEnv.SESSION_SANDBOX_PASSTHROUGH_ENV must be a comma-separated string" -}}
+{{- end -}}
 {{- range $name := splitList "," (toString .) -}}
 {{- $trimmedName := trim $name -}}
 {{- if $trimmedName -}}
@@ -281,7 +293,7 @@ them and override what the checks below compared. */}}
 {{- if hasKey .Values.apiRs.extraEnv "TRUSTED_PR_CREATE_ENABLED" }}
 {{- fail "set apiRs.trustedPrCreateEnabled, not apiRs.extraEnv.TRUSTED_PR_CREATE_ENABLED" }}
 {{- end }}
-{{- if .Values.apiRs.trustedPrCreateEnabled }}
+{{- if $trustedPrCreate }}
 {{- range $name := list "KUBERNETES_FIREWALL_CA_SECRET_NAME" "KUBERNETES_FIREWALL_CA_KEY_SECRET_NAME" "KUBERNETES_FIREWALL_CA_SECRET_KEY" "KUBERNETES_FIREWALL_CA_KEY_SECRET_KEY" "KUBERNETES_FIREWALL_CA_CERT_FILE" }}
 {{- if hasKey $.Values.apiRs.extraEnv $name }}
 {{- fail (printf "apiRs.extraEnv.%s can't be set while apiRs.trustedPrCreateEnabled is on; use the firewall values" $name) }}
@@ -289,7 +301,7 @@ them and override what the checks below compared. */}}
 {{- end }}
 {{- end }}
             - name: TRUSTED_PR_CREATE_ENABLED
-              value: {{ .Values.apiRs.trustedPrCreateEnabled | default false | quote }}
+              value: {{ $trustedPrCreate | quote }}
 {{- if not (hasKey .Values.apiRs.extraEnv "DATABASE_TEXT_SEARCH") }}
             - name: DATABASE_TEXT_SEARCH
               value: {{ ternary "paradedb" (default "postgres" .Values.externalDatabase.textSearch) .Values.postgres.enabled | quote }}
@@ -541,7 +553,7 @@ them and override what the checks below compared. */}}
               value: {{ .Values.firewall.existingCaSecretKey | default "ca-cert.pem" | quote }}
             - name: KUBERNETES_FIREWALL_CA_KEY_SECRET_KEY
               value: {{ .Values.firewall.existingCaKeySecretKey | default "ca-key.pem" | quote }}
-{{- if .Values.apiRs.trustedPrCreateEnabled }}
+{{- if $trustedPrCreate }}
 {{- /* Kubernetes expands $(VAR) in env values, so a selector could resolve in
 the container to something other than what the alias check below compares.
 Valid Secret names and keys can't contain "$": require their real formats. */}}
@@ -793,14 +805,14 @@ the schema is skipped) would otherwise override the quoted name above. */}}
 {{ toYaml .Values.containerSecurityContext | nindent 12 }}
           resources:
 {{ toYaml .Values.apiRs.resources | nindent 12 }}
-{{- if or $useOverlayRepoCache .Values.apiRs.trustedPrCreateEnabled }}
+{{- if or $useOverlayRepoCache $trustedPrCreate }}
           volumeMounts:
 {{- if $useOverlayRepoCache }}
             - name: repo-cache
               mountPath: {{ .Values.repoCache.hostPath | quote }}
               readOnly: true
 {{- end }}
-{{- if .Values.apiRs.trustedPrCreateEnabled }}
+{{- if $trustedPrCreate }}
             - name: proxy-ca-cert
               mountPath: /etc/centaur/proxy-ca
               readOnly: true
@@ -818,7 +830,7 @@ the schema is skipped) would otherwise override the quoted name above. */}}
             type: DirectoryOrCreate
 {{- end }}
 {{- end }}
-{{- if .Values.apiRs.trustedPrCreateEnabled }}
+{{- if $trustedPrCreate }}
         # Only the proxy CA certificate entry, never the CA key even if the
         # same Secret holds it. Mounted only when trusted creation is on, so
         # api-rs doesn't otherwise depend on this Secret at startup.

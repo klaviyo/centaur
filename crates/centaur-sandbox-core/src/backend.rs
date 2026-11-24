@@ -230,8 +230,10 @@ pub trait SandboxBackend: Send + Sync {
     /// this one operation, and only while that credential is attested as an
     /// OAuth App user token for the same identity. A proxy bound to anyone
     /// else, or with nothing attested, refuses the call itself (403) before
-    /// GitHub sees it. An older proxy without the guard passes the placeholder
-    /// through unsubstituted, and GitHub rejects it. The pull
+    /// GitHub sees it. A proxy whose config predates the guard gives no such
+    /// assurance (an older direct `Authorization` injector could replace the
+    /// placeholder), which is why trusted creation may be enabled only once
+    /// every proxy serves the guard; see `TRUSTED_PR_CREATE_ENABLED`. The pull
     /// request is authored as that person and api-rs never holds the token.
     /// Callers must still verify the author in the response.
     async fn create_github_pull_request(
