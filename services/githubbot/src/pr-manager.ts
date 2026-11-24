@@ -621,8 +621,23 @@ async function processCi(
     const lookup = await lookupBinding(ctx, owner, repo, number);
     if (!lookup.ok) return;
     if (lookup.binding) {
-      await reportBoundCiFailure(ctx, owner, repo, number, headSha, lookup.binding, evaluation, trace);
-      return;
+      // A binding for another PR (a recycled repo and number) says nothing
+      // about this one: it takes the unbound flow below, unchanged. A PR whose
+      // node id is unknown can't be told apart, so it is left alone.
+      if (lookup.binding.pr_node_id === pr.nodeId) {
+        await reportBoundCiFailure(ctx, owner, repo, number, headSha, lookup.binding, evaluation, trace);
+        return;
+      }
+      if (!pr.nodeId) {
+        traceLog(ctx.options, "githubbot_bound_ci_skipped", trace, {
+          pr: `${owner}/${repo}#${number}`,
+          reason: "pr_node_id_unknown",
+        });
+        return;
+      }
+      traceLog(ctx.options, "githubbot_pr_binding_other_pr", trace, {
+        pr: `${owner}/${repo}#${number}`,
+      });
     }
   }
 
@@ -693,11 +708,11 @@ async function reportBoundCiFailure(
   if (!binding.managed) return skip("not_managed");
   if (binding.closed) return skip("closed");
   // api-rs revalidates and posts inside the report request, so its inputs must
-  // be fresh: this is the last GitHub read before the report, and it fails
-  // closed (no read, no report, and no claim has been taken yet).
-  const fresh = await fetchPr(ctx, owner, repo, number);
+  // be fresh, and the whole report is built from the last GitHub read before
+  // it. Every read fails closed: no read, no report.
+  let fresh = await fetchPr(ctx, owner, repo, number);
   if (!fresh) return skip("pr_unreadable");
-  if (!fresh.nodeId || fresh.nodeId !== binding.pr_node_id) return skip("identity_mismatch");
+  if (fresh.nodeId !== binding.pr_node_id) return skip("identity_mismatch");
   if (!fresh.updatedAt) return skip("pr_unreadable");
   if (fresh.headSha !== headSha) return skip("stale_head");
 
@@ -717,6 +732,13 @@ async function reportBoundCiFailure(
       "ci_head_sync",
     );
     if (!recorded) return skip("head_not_recorded");
+    // The write took time: the PR may have closed or moved on since the read
+    // it was derived from. Read again and build the report from that.
+    fresh = await fetchPr(ctx, owner, repo, number);
+    if (!fresh) return skip("pr_unreadable");
+    if (fresh.nodeId !== binding.pr_node_id) return skip("identity_mismatch");
+    if (!fresh.updatedAt) return skip("pr_unreadable");
+    if (fresh.headSha !== headSha) return skip("stale_head");
   }
 
   // open and assigned come from the fresh read; api-rs decides and records. It

@@ -113,6 +113,8 @@ struct ProxyAttestation {
     /// The GitHub account of the human whose OAuth token the proxy would
     /// inject for `api.github.com`, when that is unambiguous.
     github_user_id: Option<String>,
+    /// The requester principal the proxy is bound to right now, if any.
+    requester_principal_id: Option<String>,
 }
 
 /// What an API client access token says about its validity.
@@ -166,6 +168,16 @@ impl AuthenticatedCaller {
     /// older tokens, and whenever the proxy could not name one unambiguously.
     pub(crate) fn github_user_id(&self) -> Option<&str> {
         self.proxy_attestation.github_user_id.as_deref()
+    }
+
+    /// The requester principal (`prn_…`) its proxy is bound to right now: the
+    /// person whose credentials the proxy would act with in addition to the
+    /// session's own. `None` for every other caller class, and when its proxy
+    /// has no requester bound. Absence is meaningful (no requester), so a
+    /// caller must compare it with what api-rs intended, never treat it as
+    /// "unknown".
+    pub(crate) fn requester_principal_id(&self) -> Option<&str> {
+        self.proxy_attestation.requester_principal_id.as_deref()
     }
 }
 
@@ -359,6 +371,7 @@ impl ApiAuthConfig {
                     proxy_attestation: ProxyAttestation {
                         sandbox_id: claims.sandbox_id.and_then(non_blank),
                         github_user_id: claims.github_user_id.and_then(non_blank),
+                        requester_principal_id: claims.requester_principal_id.and_then(non_blank),
                     },
                     api_client_token: None,
                 })
@@ -468,6 +481,8 @@ struct ApiJwtClaims {
     sandbox_id: Option<String>,
     #[serde(default)]
     github_user_id: Option<String>,
+    #[serde(default)]
+    requester_principal_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -960,11 +975,13 @@ mod tests {
         let caller = auth
             .authenticate(&bearer(&sign(claims(json!({
                 "sandbox_id": "sbx-1", "github_user_id": "90210001",
+                "requester_principal_id": "prn_alice",
             })))))
             .unwrap();
         assert_eq!(caller.class(), CallerClass::Principal);
         assert_eq!(caller.sandbox_id(), Some("sbx-1"));
         assert_eq!(caller.github_user_id(), Some("90210001"));
+        assert_eq!(caller.requester_principal_id(), Some("prn_alice"));
 
         // Tokens minted before the claims existed still verify, with neither.
         let caller = auth
@@ -973,6 +990,7 @@ mod tests {
         assert_eq!(caller.principal_subject(), Some("prn_test"));
         assert_eq!(caller.sandbox_id(), None);
         assert_eq!(caller.github_user_id(), None);
+        assert_eq!(caller.requester_principal_id(), None);
 
         // Each claim stands alone, and a blank one is no claim.
         let caller = auth

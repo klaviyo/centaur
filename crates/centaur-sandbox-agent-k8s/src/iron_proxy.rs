@@ -1422,6 +1422,9 @@ impl AgentSandboxBackend {
                 operation: "create_github_pull_request",
             });
         };
+        // Sandboxes created before the tunnel rule existed lack it; add it so
+        // their proxy admits this call.
+        self.ensure_api_tunnel_ingress(id, iron_proxy).await?;
         let ca = self.proxy_ca_certificate(iron_proxy).await?;
         let proxy_url = format!(
             "http://{}.{}.svc:{PROXY_TUNNEL_PORT}",
@@ -1430,6 +1433,37 @@ impl AgentSandboxBackend {
         );
         let client = github_pull_request_client(&proxy_url, ca)?;
         send_github_pull_request(&client, &path, payload).await
+    }
+
+    /// Makes sure the sandbox proxy's NetworkPolicy admits api-rs on the tunnel
+    /// port, adding the one rule the policy builder gives new proxies if an
+    /// older policy lacks it. Idempotent: a policy that already has it is not
+    /// written. Fails when the policy cannot be read or updated, which the
+    /// caller reports as the sandbox proxy being unavailable.
+    async fn ensure_api_tunnel_ingress(
+        &self,
+        id: &SandboxId,
+        iron_proxy: &IronProxyConfig,
+    ) -> SandboxResult<()> {
+        let name = iron_proxy_policy_name(id);
+        let policies = self.network_policies();
+        let existing = policies
+            .get(&name)
+            .await
+            .map_err(|err| map_kube_error("get iron-proxy network policy", err))?;
+        let Some(ingress) = ingress_with_api_tunnel(&existing, iron_proxy, PROXY_TUNNEL_PORT)
+        else {
+            return Ok(());
+        };
+        policies
+            .patch(
+                &name,
+                &PatchParams::default(),
+                &Patch::Merge(json!({ "spec": { "ingress": ingress } })),
+            )
+            .await
+            .map_err(|err| map_kube_error("update iron-proxy network policy", err))?;
+        Ok(())
     }
 
     /// The proxy CA's public certificate, from the Secret the proxies and
@@ -2104,15 +2138,7 @@ fn build_iron_proxy_network_policies(
                         from: Some(vec![pod_peer(iron_proxy.api_pod_labels.clone())]),
                         ports: Some(vec![network_port(PROXY_MANAGEMENT_PORT)]),
                     },
-                    // api-rs -> proxy tunnel port. This exists only for
-                    // `SandboxBackend::create_github_pull_request`, the one
-                    // call api-rs makes through a sandbox's proxy so GitHub
-                    // sees the human's token, never api-rs's. The backend fixes
-                    // that request's method, host, path and headers.
-                    NetworkPolicyIngressRule {
-                        from: Some(vec![pod_peer(iron_proxy.api_pod_labels.clone())]),
-                        ports: Some(vec![network_port(resolved.proxy_port)]),
-                    },
+                    api_tunnel_ingress_rule(iron_proxy, resolved.proxy_port),
                 ]),
                 egress: Some(proxy_egress_rules(iron_proxy, control_targets)),
             }),
@@ -2129,6 +2155,41 @@ fn build_iron_proxy_network_policies(
             }),
         },
     ]
+}
+
+/// api-rs -> proxy tunnel port. This exists only for
+/// `SandboxBackend::create_github_pull_request`, the one call api-rs makes
+/// through a sandbox's proxy so GitHub sees the human's token, never api-rs's.
+/// The backend fixes that request's method, host, path and headers.
+fn api_tunnel_ingress_rule(
+    iron_proxy: &IronProxyConfig,
+    tunnel_port: u16,
+) -> NetworkPolicyIngressRule {
+    NetworkPolicyIngressRule {
+        from: Some(vec![pod_peer(iron_proxy.api_pod_labels.clone())]),
+        ports: Some(vec![network_port(tunnel_port)]),
+    }
+}
+
+/// The ingress list `existing` should have to admit api-rs on the tunnel port:
+/// `None` when it already does, otherwise its rules plus the api tunnel rule.
+/// Existing rules are kept as they are, so this only ever adds that one rule.
+fn ingress_with_api_tunnel(
+    existing: &NetworkPolicy,
+    iron_proxy: &IronProxyConfig,
+    tunnel_port: u16,
+) -> Option<Vec<NetworkPolicyIngressRule>> {
+    let rule = api_tunnel_ingress_rule(iron_proxy, tunnel_port);
+    let mut ingress = existing
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.ingress.clone())
+        .unwrap_or_default();
+    if ingress.contains(&rule) {
+        return None;
+    }
+    ingress.push(rule);
+    Some(ingress)
 }
 
 fn sandbox_to_proxy_ports(resolved: &ResolvedIronProxy) -> Vec<NetworkPolicyPort> {
@@ -2741,6 +2802,8 @@ fn unique_suffix() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     fn no_scheduling() -> ProxyPodScheduling<'static> {
@@ -4288,12 +4351,15 @@ AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
     }
 
     fn offline_backend(iron_proxy: Option<IronProxyConfig>) -> AgentSandboxBackend {
+        // Nothing listens here, and these tests never reach the client.
+        backend_at("http://127.0.0.1:1", iron_proxy)
+    }
+
+    fn backend_at(api_server: &str, iron_proxy: Option<IronProxyConfig>) -> AgentSandboxBackend {
         // kube builds a TLS connector even for http URLs.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        // Nothing listens here, and these tests never reach the client.
         let client =
-            kube::Client::try_from(kube::Config::new("http://127.0.0.1:1".parse().unwrap()))
-                .unwrap();
+            kube::Client::try_from(kube::Config::new(api_server.parse().unwrap())).unwrap();
         let mut config =
             crate::AgentSandboxConfig::new("centaur", crate::test_iron_control_settings());
         config.iron_proxy = iron_proxy;
@@ -4346,5 +4412,262 @@ AwEB/zAKBggqhkjOPQQDAgNJADBGAiEA7OQ1ttTPfqABb8xQzK1VoNyB9rbSnQk/
             .await
             .unwrap_err();
         assert!(matches!(error, SandboxError::Unsupported { .. }));
+    }
+
+    /// One request a stub API server received.
+    #[derive(Clone, Debug)]
+    struct Received {
+        method: String,
+        path: String,
+        content_type: String,
+        body: String,
+    }
+
+    /// A stand-in Kubernetes API server for one NetworkPolicy: it serves the
+    /// policy on GET, records every request, and answers a PATCH with the
+    /// policy unchanged. Any other path is a 404.
+    async fn spawn_policy_api(
+        policy_name: String,
+        policy: NetworkPolicy,
+    ) -> (String, Arc<std::sync::Mutex<Vec<Received>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let received = Arc::new(std::sync::Mutex::new(Vec::<Received>::new()));
+        let log = received.clone();
+        let policy_path =
+            format!("/apis/networking.k8s.io/v1/namespaces/centaur/networkpolicies/{policy_name}");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let log = log.clone();
+                let policy_path = policy_path.clone();
+                let policy = serde_json::to_string(&policy).unwrap();
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        // Read one request: head, then Content-Length bytes.
+                        let (head, body_start) = loop {
+                            if let Some(end) =
+                                buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                            {
+                                let head = String::from_utf8_lossy(&buffer[..end]).into_owned();
+                                break (head, end + 4);
+                            }
+                            match stream.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                            }
+                        };
+                        let header = |name: &str| {
+                            head.lines()
+                                .find_map(|line| {
+                                    let (key, value) = line.split_once(':')?;
+                                    key.eq_ignore_ascii_case(name)
+                                        .then(|| value.trim().to_owned())
+                                })
+                                .unwrap_or_default()
+                        };
+                        let length: usize = header("content-length").parse().unwrap_or(0);
+                        while buffer.len() < body_start + length {
+                            match stream.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                            }
+                        }
+                        let body =
+                            String::from_utf8_lossy(&buffer[body_start..body_start + length])
+                                .into_owned();
+                        buffer.drain(..body_start + length);
+                        let mut request_line = head.lines().next().unwrap_or_default().split(' ');
+                        let method = request_line.next().unwrap_or_default().to_owned();
+                        let path = request_line.next().unwrap_or_default().to_owned();
+                        log.lock().unwrap().push(Received {
+                            method,
+                            path: path.clone(),
+                            content_type: header("content-type"),
+                            body,
+                        });
+                        let (status, payload) = if path.split('?').next()
+                            == Some(policy_path.as_str())
+                        {
+                            ("200 OK", policy.clone())
+                        } else {
+                            (
+                                "404 Not Found",
+                                r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404,"message":"not found"}"#
+                                    .to_owned(),
+                            )
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{payload}",
+                            payload.len()
+                        );
+                        if stream.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (url, received)
+    }
+
+    /// The proxy policy a sandbox created before the tunnel rule has: the
+    /// builder's, minus every rule on the tunnel port.
+    fn pre_rollout_proxy_policy(id: &SandboxId, iron_proxy: &IronProxyConfig) -> NetworkPolicy {
+        let mut policy =
+            build_iron_proxy_network_policies(id, &resolved(), iron_proxy, &[], None).remove(1);
+        let tunnel = api_tunnel_ingress_rule(iron_proxy, PROXY_TUNNEL_PORT);
+        policy
+            .spec
+            .as_mut()
+            .unwrap()
+            .ingress
+            .as_mut()
+            .unwrap()
+            .retain(|rule| *rule != tunnel);
+        policy
+    }
+
+    #[test]
+    fn an_older_proxy_policy_gets_exactly_the_api_tunnel_rule_added() {
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        let id = SandboxId::new("asbx-test");
+        let older = pre_rollout_proxy_policy(&id, &iron_proxy);
+        let before = older.spec.as_ref().unwrap().ingress.clone().unwrap();
+        assert_eq!(before.len(), 2);
+
+        let ingress = ingress_with_api_tunnel(&older, &iron_proxy, PROXY_TUNNEL_PORT)
+            .expect("the older policy lacks the rule");
+        assert_eq!(ingress.len(), 3);
+        assert_eq!(ingress[..2], before[..]);
+        assert_eq!(
+            ingress[2],
+            api_tunnel_ingress_rule(&iron_proxy, PROXY_TUNNEL_PORT)
+        );
+
+        // A current policy, built fresh, needs nothing.
+        let current =
+            build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, &[], None).remove(1);
+        assert_eq!(
+            ingress_with_api_tunnel(&current, &iron_proxy, PROXY_TUNNEL_PORT),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn the_create_path_adds_the_tunnel_rule_to_a_proxy_that_lacks_it_once() {
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        let id = SandboxId::new("asbx-old");
+        let older = pre_rollout_proxy_policy(&id, &iron_proxy);
+        let (url, received) = spawn_policy_api(iron_proxy_policy_name(&id), older).await;
+        let backend = backend_at(&url, Some(iron_proxy.clone()));
+
+        backend
+            .ensure_api_tunnel_ingress(&id, &iron_proxy)
+            .await
+            .unwrap();
+
+        let requests = received.lock().unwrap().clone();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            ["GET", "PATCH"]
+        );
+        let patch = &requests[1];
+        assert!(
+            patch
+                .path
+                .split('?')
+                .next()
+                .unwrap()
+                .ends_with(&iron_proxy_policy_name(&id)),
+            "{}",
+            patch.path
+        );
+        assert!(
+            patch.content_type.contains("merge-patch"),
+            "{}",
+            patch.content_type
+        );
+        let body: Value = serde_json::from_str(&patch.body).unwrap();
+        let ingress = body["spec"]["ingress"].as_array().unwrap();
+        let ports = |rule: &Value| rule["ports"][0]["port"].as_i64();
+        assert_eq!(
+            ingress.iter().map(ports).collect::<Vec<_>>(),
+            [
+                Some(i64::from(PROXY_TUNNEL_PORT)),
+                Some(i64::from(PROXY_MANAGEMENT_PORT)),
+                Some(i64::from(PROXY_TUNNEL_PORT))
+            ]
+        );
+        // The added rule admits the configured api-rs pods and no one else.
+        assert_eq!(
+            ingress[2]["from"][0]["podSelector"]["matchLabels"],
+            json!(iron_proxy.api_pod_labels)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_create_path_leaves_a_current_proxy_policy_alone() {
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        let id = SandboxId::new("asbx-new");
+        let current =
+            build_iron_proxy_network_policies(&id, &resolved(), &iron_proxy, &[], None).remove(1);
+        let (url, received) = spawn_policy_api(iron_proxy_policy_name(&id), current).await;
+        let backend = backend_at(&url, Some(iron_proxy.clone()));
+
+        backend
+            .ensure_api_tunnel_ingress(&id, &iron_proxy)
+            .await
+            .unwrap();
+
+        let methods: Vec<String> = received
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.method.clone())
+            .collect();
+        assert_eq!(methods, ["GET"]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_reconcile_stops_the_create_before_the_ca_or_github_are_touched() {
+        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
+        // The API server knows no policy for this sandbox.
+        let (url, received) =
+            spawn_policy_api("some-other-policy".to_owned(), NetworkPolicy::default()).await;
+        let backend = backend_at(&url, Some(iron_proxy));
+
+        let error = backend
+            .create_github_pull_request_through_proxy(
+                &SandboxId::new("asbx-gone"),
+                "acme",
+                "widgets",
+                &json!({}),
+            )
+            .await
+            .unwrap_err();
+
+        // Not InvalidSpec or Unsupported: the API maps it to the
+        // sandbox-proxy-unavailable error.
+        assert!(
+            matches!(
+                error,
+                SandboxError::NotFound(_) | SandboxError::Backend { .. }
+            ),
+            "{error:?}"
+        );
+        let requests = received.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0].method, "GET");
+        assert!(requests[0].path.contains("networkpolicies"));
     }
 }

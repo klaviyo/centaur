@@ -715,6 +715,8 @@ def test_create_pull_request_cli_prints_result(
         (403, "slack_session_required", True),
         (403, "dm_not_supported", True),
         (403, "sandbox_mismatch", True),
+        (503, "sandbox_proxy_unavailable", True),
+        (409, "requester_not_applied", False),
         (502, "upstream_error", False),
     ],
 )
@@ -754,4 +756,6 @@ def test_create_pull_request_cli_reports_http_errors(
     assert f"HTTP {status}" in captured.err
     assert code in captured.err
     assert ("open the pull request as you normally would" in captured.err) is fallback
+    # The identity switch is retried, never worked around.
+    assert ("retry in a few seconds" in captured.err) is (code == "requester_not_applied")
     assert captured.out == ""

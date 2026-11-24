@@ -905,6 +905,52 @@ fn api_jwt_claims(body: &Value) -> Value {
     .claims
 }
 
+#[tokio::test]
+async fn api_jwt_names_the_requester_the_proxy_is_bound_to() {
+    let Some(f) = Fixture::with_jwt(true).await else {
+        return;
+    };
+    let principal = f.principal("channel").await;
+    let alice = f.principal("alice").await;
+    let bob = f.principal("bob").await;
+
+    // No requester bound: the claim is absent.
+    let token = f.proxy(Some(principal), None, json!({})).await;
+    assert!(
+        api_jwt_claims(&f.sync(&token).await)
+            .get("requester_principal_id")
+            .is_none()
+    );
+
+    // Each requester the proxy is rebound to is named, and only that one.
+    for requester in [alice, bob] {
+        sqlx::query("UPDATE proxies SET requester_principal_id = $1 WHERE bearer_token_hash = $2")
+            .bind(requester)
+            .bind(hex::encode(Sha256::digest(token.as_bytes())))
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let claims = api_jwt_claims(&f.sync(&token).await);
+        assert_eq!(
+            claims["requester_principal_id"],
+            centaur_console_db::oid("prn", requester)
+        );
+        assert_eq!(claims["sub"], centaur_console_db::oid("prn", principal));
+    }
+
+    // Unbound again: the claim goes away, so a stale one never lingers.
+    sqlx::query("UPDATE proxies SET requester_principal_id = NULL WHERE bearer_token_hash = $1")
+        .bind(hex::encode(Sha256::digest(token.as_bytes())))
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    assert!(
+        api_jwt_claims(&f.sync(&token).await)
+            .get("requester_principal_id")
+            .is_none()
+    );
+}
+
 /// How many secrets a sync response delivers for `api.github.com`.
 fn github_secret_count(body: &Value) -> usize {
     body["secrets"]

@@ -2508,6 +2508,19 @@ impl SessionRuntime {
                     return Err(error);
                 }
             };
+            // Record what this execution intends before binding it to the
+            // sandbox's proxy, so a caller acting in the turn can be checked
+            // against api-rs's own record rather than anything it claims.
+            if let Err(error) = self
+                .store
+                .set_execution_requester(&execution.execution_id, requester_principal_id.as_deref())
+                .await
+            {
+                let error = SessionRuntimeError::Store(error);
+                self.record_execution_failure(thread_key, &execution.execution_id, &error)
+                    .await;
+                return Err(error);
+            }
             let desired_capabilities = match pre_resolved_sandbox_capabilities {
                 Some(capabilities) => capabilities,
                 None => match self
@@ -12137,6 +12150,16 @@ mod adoption_tests {
 
         let spec = backend.created_specs().pop().expect("created cold spec");
         assert_eq!(spec.iron_control_requester_principal, None);
+        // api-rs recorded, before binding, that this turn runs without one.
+        let recorded = store
+            .latest_execution_for_thread(&thread_key)
+            .await
+            .expect("load execution")
+            .expect("execution exists");
+        assert_eq!(
+            centaur_session_sqlx::execution_requester(&recorded),
+            Some(None)
+        );
         assert!(
             !requests
                 .lock()

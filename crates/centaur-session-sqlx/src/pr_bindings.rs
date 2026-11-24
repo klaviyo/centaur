@@ -354,7 +354,9 @@ impl PgSessionStore {
     /// this PR (`pr_node_id`), at this head, managed and not closed. A close,
     /// unassignment or head change committed after the caller read the binding
     /// therefore cannot be missed: the insert finds the row changed and claims
-    /// nothing. The notice is keyed by `(pr_node_id, head_sha)`, so a second
+    /// nothing. The binding row is read `FOR SHARE`, so a close, unassignment
+    /// or head change still in flight (holding the row's lock) is waited for
+    /// and its result decides, instead of the claim reading the old row. The notice is keyed by `(pr_node_id, head_sha)`, so a second
     /// claim for the same PR and head is [`PrCiNoticeClaim::Duplicate`].
     /// Release the claim if the post fails, so a later event can retry.
     pub async fn claim_pr_ci_notice(
@@ -374,6 +376,7 @@ impl PgSessionStore {
             where b.repository = $1 and b.number = $2
               and b.pr_node_id = $3 and b.head_sha = $4
               and b.managed and not b.closed
+            for share of b
             on conflict (pr_node_id, head_sha) do nothing
             "#,
         )
@@ -1002,6 +1005,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_claim_waits_for_an_in_flight_invalidation_and_then_loses_to_it() {
+        use std::time::Duration;
+
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let new = managed_binding(&store).await;
+
+        // Connection A closes the PR and has not committed yet.
+        let mut invalidation = store.pool().begin().await.unwrap();
+        let closed = sqlx::query(
+            "update pr_session_bindings set closed = true where repository = $1 and number = $2",
+        )
+        .bind(new.repository.to_ascii_lowercase())
+        .bind(new.number)
+        .execute(&mut *invalidation)
+        .await
+        .unwrap();
+        assert_eq!(closed.rows_affected(), 1);
+
+        // Connection B claims the notice. It must block on A's row lock
+        // rather than read the still-open row and claim.
+        let mut claiming = tokio::spawn({
+            let store = store.clone();
+            let new = new.clone();
+            async move { claim(&store, &new, "abc1234567").await }
+        });
+        let early = tokio::time::timeout(Duration::from_millis(500), &mut claiming).await;
+        assert!(
+            early.is_err(),
+            "the claim did not wait for the in-flight invalidation: {early:?}"
+        );
+
+        // A commits: the claim re-evaluates against the closed row.
+        invalidation.commit().await.unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), claiming)
+            .await
+            .expect("the claim finishes once the invalidation commits")
+            .unwrap();
+        assert_eq!(outcome, PrCiNoticeClaim::NotEligible);
+
+        // Nothing was claimed: reopened, the notice can still be claimed.
+        write(
+            &store,
+            &new,
+            PrBindingStateUpdate {
+                closed: Some(false),
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        assert_eq!(
+            claim(&store, &new, "abc1234567").await,
+            PrCiNoticeClaim::Claimed
+        );
+    }
+
+    #[tokio::test]
     async fn a_claim_needs_the_binding_to_still_be_this_pr_at_this_head_managed_and_open() {
         let Some(store) = test_store().await else {
             return;
@@ -1119,6 +1181,58 @@ mod tests {
             store.unique_session_for_sandbox(&sandbox_id).await.unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn an_execution_records_the_requester_api_rs_intended_for_it() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key = session(&store).await;
+        let execution = store
+            .create_execution(&thread_key, None, json!({}))
+            .await
+            .unwrap()
+            .execution;
+        // Nothing recorded yet is not the same as "no requester".
+        assert_eq!(crate::execution_requester(&execution), None);
+
+        store
+            .set_execution_requester(&execution.execution_id, Some("prn_alice"))
+            .await
+            .unwrap();
+        let recorded = store
+            .latest_execution_for_thread(&thread_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::execution_requester(&recorded),
+            Some(Some("prn_alice"))
+        );
+
+        store
+            .set_execution_requester(&execution.execution_id, None)
+            .await
+            .unwrap();
+        let recorded = store
+            .latest_execution_for_thread(&thread_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(crate::execution_requester(&recorded), Some(None));
+
+        assert!(matches!(
+            store.set_execution_requester("exe_missing", None).await,
+            Err(SessionStoreError::ExecutionNotFound { .. })
+        ));
+
+        // Other crates' tests share this database and adopt active executions.
+        sqlx::query("delete from sessions where thread_key = $1")
+            .bind(thread_key.as_str())
+            .execute(store.pool())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

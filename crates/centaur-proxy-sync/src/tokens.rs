@@ -32,6 +32,13 @@ struct ApiJwtClaims {
     /// author GitHub reports for a pull request created with that token.
     #[serde(skip_serializing_if = "Option::is_none")]
     github_user_id: Option<String>,
+    /// The `prn_…` principal of the requester bound to this proxy right now,
+    /// from the same proxy record that built the rest of the config; absent
+    /// when none is bound. api-rs compares it with the requester it bound for
+    /// the running execution, so a PR is created only while the proxy acts for
+    /// the person whose turn it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requester_principal_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -138,6 +145,9 @@ fn api_jwt_claims(
         },
         sandbox_id: proxy.name.clone(),
         github_user_id,
+        requester_principal_id: proxy
+            .requester_principal_id
+            .map(|requester| oid("prn", requester)),
     }
 }
 
@@ -203,6 +213,8 @@ mod tests {
     use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
     use serde_json::{Value, json};
 
+    use centaur_console_db::oid;
+
     use super::{ConsoleSlackChannels, api_jwt_claims, jwt, window_start};
     use crate::models::ProxyRecord;
 
@@ -265,5 +277,19 @@ mod tests {
     fn windowed_tokens_are_stable_within_a_window() {
         let start = window_start("prn_example", 1_700_000_001, 900);
         assert_eq!(start, window_start("prn_example", start + 899, 900));
+    }
+
+    #[test]
+    fn api_jwt_names_the_requester_bound_to_its_proxy_and_omits_it_otherwise() {
+        let mut bound = proxy("sandbox-abc");
+        bound.requester_principal_id = Some(21);
+        let claims = decoded(&bound, None);
+        assert_eq!(claims["requester_principal_id"], oid("prn", 21));
+        // The requester is the proxy record's, not the principal's.
+        assert_eq!(claims["sub"], "prn_test");
+        assert_ne!(claims["requester_principal_id"], claims["sub"]);
+
+        let claims = decoded(&proxy("sandbox-abc"), None);
+        assert!(claims.get("requester_principal_id").is_none());
     }
 }

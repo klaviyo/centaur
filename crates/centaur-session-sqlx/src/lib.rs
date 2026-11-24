@@ -551,6 +551,38 @@ impl PgSessionStore {
         Ok(())
     }
 
+    /// Records the requester api-rs resolved for `execution_id`, before it
+    /// binds that requester to the sandbox's proxy: the principal id, or none
+    /// when the turn runs without one. Writing "none" is a record too, so a
+    /// reader can tell a turn api-rs intended to run without a requester from
+    /// one whose requester was not recorded yet. See [`execution_requester`].
+    pub async fn set_execution_requester(
+        &self,
+        execution_id: &str,
+        requester_principal_id: Option<&str>,
+    ) -> Result<(), SessionStoreError> {
+        let updated = sqlx::query_scalar::<_, String>(
+            r#"
+            update session_executions
+            set metadata = metadata || jsonb_build_object(
+                    'centaur.requester', jsonb_build_object('principal_id', $2::text)),
+                updated_at = now()
+            where execution_id = $1
+            returning execution_id
+            "#,
+        )
+        .bind(execution_id)
+        .bind(requester_principal_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        if updated.is_none() {
+            return Err(SessionStoreError::ExecutionNotFound {
+                execution_id: execution_id.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     pub async fn active_execution_for_thread(
         &self,
         thread_key: &ThreadKey,
@@ -2418,6 +2450,15 @@ impl TryFrom<SessionEventRow> for SessionEvent {
             created_at: row.created_at,
         })
     }
+}
+
+/// The requester api-rs recorded for `execution` (see
+/// [`PgSessionStore::set_execution_requester`]): `None` when nothing was
+/// recorded yet, `Some(None)` when the turn was recorded as having no
+/// requester, and `Some(Some(id))` for the requester principal.
+pub fn execution_requester(execution: &SessionExecution) -> Option<Option<&str>> {
+    let recorded = execution.metadata.get("centaur.requester")?;
+    Some(recorded.get("principal_id").and_then(Value::as_str))
 }
 
 fn parse_persisted<T>(value: String) -> Result<T, SessionStoreError>

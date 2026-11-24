@@ -1606,6 +1606,9 @@ describe("PR session bindings", () => {
     // Head the PR reports on its Nth fetch (the last entry repeats).
     heads?: string[];
     nodeId?: string;
+    // Overrides for the Nth PR read (0-based): the owns gate, then the fresh
+    // read before a report, then the read after a head repair.
+    perRead?: Record<number, { fails?: boolean; nodeId?: string; state?: string; updatedAt?: string }>;
     prFetchFails?: boolean;
     prState?: string;
     state?: ReturnType<typeof makeState>;
@@ -1646,8 +1649,9 @@ describe("PR session bindings", () => {
           pulls: {
             get: async () => {
               const head = heads[Math.min(fetches, heads.length - 1)];
+              const read = input.perRead?.[fetches] ?? {};
               fetches += 1;
-              if (input.prFetchFails) throw new Error("github unavailable");
+              if (input.prFetchFails || read.fails) throw new Error("github unavailable");
               return {
                 data: {
                   ...prPayload({
@@ -1656,9 +1660,12 @@ describe("PR session bindings", () => {
                     headSha: head,
                   }),
                   html_url: PR_URL,
-                  node_id: input.nodeId ?? NODE_ID,
-                  state: input.prState ?? "open",
-                  updated_at: input.updatedAt === null ? undefined : (input.updatedAt ?? UPDATED_AT),
+                  node_id: read.nodeId ?? input.nodeId ?? NODE_ID,
+                  state: read.state ?? input.prState ?? "open",
+                  updated_at:
+                    input.updatedAt === null
+                      ? undefined
+                      : (read.updatedAt ?? input.updatedAt ?? UPDATED_AT),
                 },
               };
             },
@@ -1890,16 +1897,96 @@ describe("PR session bindings", () => {
       noNoticeClaim(state);
     });
 
-    test("a binding for another PR (reused number) is neither reported nor given a turn", async () => {
+    test("a binding for another PR (recycled repo and number) leaves this PR on the unbound flow", async () => {
       const api = makeApi({ binding: { managed: true, closed: false, pr_node_id: "PR_other" } });
       const state = makeState();
       const { ctx } = makeCtx({ api, state });
       await handleCiEvent(ctx, "check_run", redCheckRun);
       await drainBackgroundWork(2000);
+      // Exactly today's unbound behaviour: the settled claim, the fix turn and
+      // the attempt counter. Nothing is reported to the other PR's binding.
       expect(api.posts("/ci-failures")).toHaveLength(0);
-      expect(api.sessionCalls).toEqual([]);
+      expect(api.posts("/state")).toHaveLength(0);
+      expect(api.sessionCalls.length).toBeGreaterThan(0);
+      expect(await state.get(PR_KEY)).toMatchObject({ consecutiveCiFixes: 1 });
+      expect(await state.get("centaur-githubbot:ci-settled:base/repo#7:abc123")).toBeDefined();
       noNoticeClaim(state);
-      expect(await state.get(PR_KEY)).toBeUndefined();
+    });
+
+    test("a recycled repo and number escalates at the cap like any unbound PR", async () => {
+      const api = makeApi({ binding: { managed: true, closed: false, pr_node_id: "PR_other" } });
+      const state = makeState();
+      await state.set(PR_KEY, { consecutiveCiFixes: 3 });
+      const { ctx, comments } = makeCtx({ api, state });
+      await handleCiEvent(ctx, "check_run", redCheckRun);
+      expect(comments).toHaveLength(1);
+      expect(api.sessionCalls).toEqual([]);
+    });
+
+    describe("after a head repair", () => {
+      const stale = { managed: true, closed: false, head_sha: "old111" };
+      const reported = (api: ReturnType<typeof makeApi>) => api.posts("/ci-failures");
+
+      test("reads the PR again and builds the whole report from that read", async () => {
+        const api = makeApi({ binding: stale });
+        const { ctx } = makeCtx({
+          api,
+          perRead: { 2: { updatedAt: "2026-11-23T10:05:00Z" } },
+        });
+        await handleCiEvent(ctx, "check_run", redCheckRun);
+        expect(api.posts("/state")).toHaveLength(1);
+        expect(reported(api).map((c) => c.body)).toEqual([
+          expect.objectContaining({
+            // The repair carries the first read's time; the report the final one's.
+            observed_updated_at: "2026-11-23T10:05:00Z",
+            head_sha: "abc123",
+            current_head_sha: "abc123",
+            open: true,
+            assigned: true,
+          }),
+        ]);
+      });
+
+      test("a close that lands between the repair and the report is what gets reported", async () => {
+        const api = makeApi({ binding: stale });
+        await handleCiEvent(
+          makeCtx({ api, perRead: { 2: { state: "closed" } } }).ctx,
+          "check_run",
+          redCheckRun,
+        );
+        expect(reported(api).map((c) => c.body)).toEqual([
+          expect.objectContaining({ open: false }),
+        ]);
+      });
+
+      test("a new head between the repair and the report is not reported", async () => {
+        const api = makeApi({ binding: stale });
+        await handleCiEvent(
+          makeCtx({ api, heads: ["abc123", "abc123", "def456"] }).ctx,
+          "check_run",
+          redCheckRun,
+        );
+        expect(api.posts("/state")).toHaveLength(1);
+        expect(reported(api)).toHaveLength(0);
+        expect(api.sessionCalls).toEqual([]);
+      });
+
+      test("a different node id, or an unreadable PR, between the repair and the report is not reported", async () => {
+        for (const perRead of [{ 2: { nodeId: "PR_other" } }, { 2: { fails: true } }]) {
+          const api = makeApi({ binding: stale });
+          await handleCiEvent(makeCtx({ api, perRead }).ctx, "check_run", redCheckRun);
+          expect(reported(api)).toHaveLength(0);
+          expect(api.sessionCalls).toEqual([]);
+        }
+      });
+
+      test("without a repair the single fresh read is the last one", async () => {
+        const api = makeApi({ binding: { managed: true, closed: false } });
+        const { ctx } = makeCtx({ api, perRead: { 2: { fails: true } } });
+        await handleCiEvent(ctx, "check_run", redCheckRun);
+        expect(api.posts("/state")).toHaveLength(0);
+        expect(reported(api)).toHaveLength(1);
+      });
     });
 
     test("does not depend on the shared settled claim, which a green result may have consumed", async () => {

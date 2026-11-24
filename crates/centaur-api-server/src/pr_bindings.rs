@@ -22,11 +22,11 @@ use axum::{
     http::StatusCode,
 };
 use centaur_sandbox_core::SandboxError;
-use centaur_session_core::{ChatDestination, ThreadKey};
+use centaur_session_core::{ChatDestination, ExecutionStatus, ThreadKey};
 use centaur_session_runtime::SessionRuntimeError;
 use centaur_session_sqlx::{
     NewPrBinding, PgSessionStore, PrBinding, PrBindingStateUpdate, PrCiNoticeClaim,
-    SessionStoreError, normalize_pr_repository,
+    SessionStoreError, execution_requester, normalize_pr_repository,
 };
 use centaur_workflows::{WorkflowRuntimeError, send_slack_request};
 use serde::Deserialize;
@@ -191,8 +191,9 @@ impl GithubPullRequest {
 ///
 /// Access (each failure has its own `code`): a principal caller that owns the
 /// session, whose proxy-attested sandbox is the session's one sandbox, on a
-/// Slack session that is not a DM and has a queued or running execution, with
-/// a GitHub account attested by its proxy.
+/// Slack session that is not a DM and has a running execution whose requester
+/// api-rs bound is the one its proxy attests, with a GitHub account attested
+/// by its proxy.
 pub(crate) async fn create_session_pull_request(
     State(state): State<AppState>,
     Extension(caller): Extension<AuthenticatedCaller>,
@@ -261,17 +262,29 @@ pub(crate) async fn create_session_pull_request(
             ));
         }
     }
-    if runtime
+    // The turn must be running, not merely queued, and the proxy must be
+    // acting for the requester api-rs bound for it. A speaker change can leave
+    // the proxy on the previous person's credentials for a moment; a PR
+    // created then would be authored, and bound, as someone who is not
+    // speaking. api-rs's own record is the reference, never the caller's word.
+    let execution = runtime
         .store()
         .active_execution_for_thread(&thread_key)
         .await
         .map_err(SessionRuntimeError::from)?
-        .is_none()
-    {
+        .filter(|execution| execution.status == ExecutionStatus::Running);
+    let Some(execution) = execution else {
         return Err(ApiError::coded(
             StatusCode::CONFLICT,
             "no_active_execution",
-            "the session has no queued or running execution",
+            "the session has no running execution",
+        ));
+    };
+    if execution_requester(&execution) != Some(caller.requester_principal_id()) {
+        return Err(ApiError::coded(
+            StatusCode::CONFLICT,
+            "requester_not_applied",
+            "the sandbox proxy is not yet acting for this turn's requester; try again",
         ));
     }
     let Some(github_user_id) = caller.github_user_id() else {
@@ -928,6 +941,16 @@ mod tests {
         sandbox_id: Option<&str>,
         github_user_id: Option<&str>,
     ) -> String {
+        proxy_token_for(subject, sandbox_id, github_user_id, None)
+    }
+
+    /// A proxy token that also attests the requester its proxy is bound to.
+    fn proxy_token_for(
+        subject: &str,
+        sandbox_id: Option<&str>,
+        github_user_id: Option<&str>,
+        requester: Option<&str>,
+    ) -> String {
         let mut claims = json!({
             "iss": "centaur-console",
             "sub": subject,
@@ -945,6 +968,9 @@ mod tests {
         }
         if let Some(github_user_id) = github_user_id {
             claims["github_user_id"] = json!(github_user_id);
+        }
+        if let Some(requester) = requester {
+            claims["requester_principal_id"] = json!(requester);
         }
         encode(
             &Header::new(Algorithm::HS256),
@@ -964,6 +990,35 @@ mod tests {
         router: axum::Router,
         principal: String,
         suffix: String,
+        database_url: String,
+    }
+
+    /// The tests' sessions hold running executions in a database other crates'
+    /// tests share, and the runtime's adoption scan would pick them up. Delete
+    /// them (and their bindings, notices and executions, by cascade) when the
+    /// harness goes away, from a fresh connection on a thread of its own.
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            let (url, principal) = (self.database_url.clone(), self.principal.clone());
+            let _ = std::thread::spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                runtime.block_on(async {
+                    if let Ok(store) = PgSessionStore::connect(&url).await {
+                        let _ =
+                            sqlx::query("delete from sessions where iron_control_principal = $1")
+                                .bind(&principal)
+                                .execute(store.pool())
+                                .await;
+                    }
+                });
+            })
+            .join();
+        }
     }
 
     impl Harness {
@@ -996,12 +1051,26 @@ mod tests {
                 router,
                 principal: format!("prn_{suffix}"),
                 suffix,
+                database_url: url,
             })
         }
 
         /// A Slack session owned by this harness's principal, assigned
-        /// `sandbox_id`, with a running execution.
+        /// `sandbox_id`, with a running execution api-rs recorded as having
+        /// no requester.
         async fn session(&self, channel: &str, sandbox_id: &str) -> ThreadKey {
+            self.session_for(channel, sandbox_id, Some(None)).await
+        }
+
+        /// Like [`Self::session`], but the running execution's recorded
+        /// requester is `requester`: `None` records nothing yet, `Some(None)`
+        /// no requester, `Some(Some(id))` that requester.
+        async fn session_for(
+            &self,
+            channel: &str,
+            sandbox_id: &str,
+            requester: Option<Option<&str>>,
+        ) -> ThreadKey {
             let thread_key = ThreadKey::parse(format!(
                 "slack:T0TEST:{channel}:{}.000100",
                 Uuid::new_v4().simple()
@@ -1025,8 +1094,20 @@ mod tests {
                 .update_sandbox_id(&thread_key, Some(sandbox_id))
                 .await
                 .unwrap();
-            self.store
+            let execution = self
+                .store
                 .create_execution(&thread_key, None, json!({}))
+                .await
+                .unwrap()
+                .execution;
+            if let Some(requester) = requester {
+                self.store
+                    .set_execution_requester(&execution.execution_id, requester)
+                    .await
+                    .unwrap();
+            }
+            self.store
+                .mark_execution_running(&execution.execution_id)
                 .await
                 .unwrap();
             thread_key
@@ -1372,6 +1453,126 @@ mod tests {
             (StatusCode::CONFLICT, Some("no_active_execution"))
         );
 
+        assert!(h.backend.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_proxys_requester_must_be_the_one_api_rs_bound_for_the_running_turn() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let author = AUTHOR_ID.to_string();
+        let token = |sandbox: &str, requester: Option<&str>| {
+            proxy_token_for(&h.principal, Some(sandbox), Some(&author), requester)
+        };
+        h.backend.respond(
+            201,
+            h.github_pull_request(7, AUTHOR_ID, "User", &h.repository()),
+        );
+
+        // Alice's turn: api-rs bound Alice and the proxy attests Alice.
+        let sandbox = h.sandbox_id("alice");
+        let alice = h
+            .session_for("C0TEST", &sandbox, Some(Some("prn_alice")))
+            .await;
+        let (status, body) = h
+            .create(&alice, &token(&sandbox, Some("prn_alice")), h.create_body())
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["bound"], true);
+        let calls = h.backend.calls().len();
+        assert_eq!(calls, 1);
+
+        // Bob's turn: api-rs bound Bob, but the proxy still acts for the
+        // previous speaker. The refusal is before any GitHub call.
+        let sandbox = h.sandbox_id("bob");
+        let bob = h
+            .session_for("C0TEST", &sandbox, Some(Some("prn_bob")))
+            .await;
+        for (label, requester) in [
+            ("previous speaker's claim", Some("prn_alice")),
+            ("missing claim while a requester is bound", None),
+        ] {
+            let (status, body) = h
+                .create(&bob, &token(&sandbox, requester), h.create_body())
+                .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{label}: {body}");
+            assert_eq!(body["code"], "requester_not_applied", "{label}");
+        }
+        // Once the proxy has caught up, the same request goes through.
+        let (status, _) = h
+            .create(&bob, &token(&sandbox, Some("prn_bob")), h.create_body())
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(h.backend.calls().len(), calls + 1);
+    }
+
+    #[tokio::test]
+    async fn a_requester_claim_is_refused_when_api_rs_bound_none_or_nothing_is_recorded() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let author = AUTHOR_ID.to_string();
+        // api-rs ran this turn without a requester, yet the proxy names one.
+        let sandbox = h.sandbox_id("none");
+        let thread_key = h.session("C0TEST", &sandbox).await;
+        let (status, body) = h
+            .create(
+                &thread_key,
+                &proxy_token_for(
+                    &h.principal,
+                    Some(&sandbox),
+                    Some(&author),
+                    Some("prn_alice"),
+                ),
+                h.create_body(),
+            )
+            .await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::CONFLICT, Some("requester_not_applied"))
+        );
+
+        // The turn is running but api-rs has not recorded a requester yet, so
+        // even a token with no requester cannot be shown to match.
+        let sandbox = h.sandbox_id("unrecorded");
+        let thread_key = h.session_for("C0TEST", &sandbox, None).await;
+        let (status, body) = h
+            .create(&thread_key, &h.token(&sandbox), h.create_body())
+            .await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::CONFLICT, Some("requester_not_applied"))
+        );
+        assert!(h.backend.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_queued_execution_is_not_enough() {
+        let Some(h) = Harness::new().await else {
+            return;
+        };
+        let sandbox = h.sandbox_id("queued");
+        let thread_key = h.session("C0TEST", &sandbox).await;
+        // A session whose only execution has not started.
+        sqlx::query("update session_executions set status = 'queued' where thread_key = $1")
+            .bind(thread_key.as_str())
+            .execute(h.store.pool())
+            .await
+            .unwrap();
+        h.backend.respond(
+            201,
+            h.github_pull_request(7, AUTHOR_ID, "User", &h.repository()),
+        );
+
+        let (status, body) = h
+            .create(&thread_key, &h.token(&sandbox), h.create_body())
+            .await;
+
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::CONFLICT, Some("no_active_execution"))
+        );
         assert!(h.backend.calls().is_empty());
     }
 
