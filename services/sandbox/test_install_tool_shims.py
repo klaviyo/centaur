@@ -561,6 +561,71 @@ class GeneratedShimTest(unittest.TestCase):
 
 
 class RefreshInstallTest(unittest.TestCase):
+    def test_failed_tool_refresh_leaves_previous_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tools = root / "tools"
+            first, second = root / "first", root / "second"
+            for path in (tools / "old", first / "tools" / "new", second / "tools" / "broken"):
+                path.mkdir(parents=True)
+                (path / "pyproject.toml").write_text('[project]\nname = "fixture"\n')
+            (tools / install_tool_shims.TOOLS_METADATA_NAME).write_text(json.dumps({
+                "sources": [
+                    {"source": "repo_cache", "repo_cache_repo_path": str(path)}
+                    for path in (first, second)
+                ],
+            }))
+
+            copytree = install_tool_shims.shutil.copytree
+
+            def fail_second(source, target, **kwargs):
+                if source.name == "broken":
+                    raise OSError("fixture copy failure")
+                return copytree(source, target, **kwargs)
+
+            with mock.patch.object(install_tool_shims.shutil, "copytree", side_effect=fail_second):
+                with self.assertRaisesRegex(OSError, "fixture copy failure"):
+                    install_tool_shims._refresh_tool_dir(tools)
+
+            self.assertTrue((tools / "old" / "pyproject.toml").is_file())
+            self.assertFalse((tools / "new").exists())
+
+    def test_skill_refresh_removes_managed_entries_and_preserves_local_collisions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base, overlay = root / "base", root / "overlay"
+            workspace = root / "workspace"
+            skills = workspace / ".agents" / "skills"
+            local_claude = workspace / ".claude" / "skills"
+
+            def write_skill(directory, name, contents):
+                skill = directory / name / "SKILL.md"
+                skill.parent.mkdir(parents=True, exist_ok=True)
+                skill.write_text(contents)
+                return skill
+
+            write_skill(base, "shared", "base")
+            write_skill(overlay, "shared", "overlay")
+            write_skill(overlay, "old", "overlay")
+            write_skill(overlay, "owned-locally", "overlay")
+            local = write_skill(skills, "owned-locally", "local")
+            claude = write_skill(local_claude, "custom", "local Claude skill")
+
+            with mock.patch.object(install_tool_shims, "_skill_sources", return_value=[base, overlay]):
+                install_tool_shims._refresh_skill_dirs(workspace)
+                self.assertEqual((skills / "shared" / "SKILL.md").read_text(), "overlay")
+                self.assertTrue((skills / "old" / "SKILL.md").is_file())
+                (overlay / "old").rename(overlay / "renamed")
+                (overlay / "shared" / "SKILL.md").unlink()
+                (overlay / "shared").rmdir()
+                install_tool_shims._refresh_skill_dirs(workspace)
+
+            self.assertFalse((skills / "old").exists())
+            self.assertTrue((skills / "renamed" / "SKILL.md").is_file())
+            self.assertEqual((skills / "shared" / "SKILL.md").read_text(), "base")
+            self.assertEqual(local.read_text(), "local")
+            self.assertEqual(claude.read_text(), "local Claude skill")
+
     def test_install_removes_stale_generated_shims(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
