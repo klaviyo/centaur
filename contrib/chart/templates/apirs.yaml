@@ -542,6 +542,19 @@ them and override what the checks below compared. */}}
             - name: KUBERNETES_FIREWALL_CA_KEY_SECRET_KEY
               value: {{ .Values.firewall.existingCaKeySecretKey | default "ca-key.pem" | quote }}
 {{- if .Values.apiRs.trustedPrCreateEnabled }}
+{{- /* Kubernetes expands $(VAR) in env values, so a selector could resolve in
+the container to something other than what the alias check below compares.
+Valid Secret names and keys can't contain "$": require their real formats. */}}
+{{- range $name := list (include "centaur.trustedCaSecretName" .) (include "centaur.trustedCaKeySecretName" .) }}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" $name) }}
+{{- fail (printf "apiRs.trustedPrCreateEnabled needs firewall CA Secret names that are valid Kubernetes names; got %q" $name) }}
+{{- end }}
+{{- end }}
+{{- range $key := list (.Values.firewall.existingCaSecretKey | default "ca-cert.pem") (.Values.firewall.existingCaKeySecretKey | default "ca-key.pem") }}
+{{- if not (regexMatch "^[-._a-zA-Z0-9]+$" $key) }}
+{{- fail (printf "apiRs.trustedPrCreateEnabled needs firewall CA Secret keys that are valid Secret keys; got %q" $key) }}
+{{- end }}
+{{- end }}
 {{- if and (eq (include "centaur.trustedCaSecretName" .) (include "centaur.trustedCaKeySecretName" .)) (eq (.Values.firewall.existingCaSecretKey | default "ca-cert.pem") (.Values.firewall.existingCaKeySecretKey | default "ca-key.pem")) }}
 {{- fail "apiRs.trustedPrCreateEnabled needs the proxy CA certificate in its own Secret entry: firewall.existingCaSecretName/existingCaSecretKey name the same entry as existingCaKeySecretName/existingCaKeySecretKey, so projecting it would expose the CA key to api-rs" }}
 {{- end }}
@@ -728,7 +741,10 @@ copies in source order (later roots shadow earlier ones). */}}
 {{- end }}
 {{- range $name, $value := .Values.apiRs.extraEnv }}
 {{- if ne $name "SESSION_SANDBOX_PASSTHROUGH_ENV" }}
-            - name: {{ $name }}
+            {{- /* Quoted, so the rendered name is exactly the key the guards
+            above compared: YAML would strip whitespace or a " #" comment
+            from an unquoted scalar. */}}
+            - name: {{ $name | quote }}
 {{- if kindIs "map" $value }}
 {{ toYaml $value | nindent 14 }}
 {{- else }}

@@ -105,8 +105,8 @@ pub struct IronProxyConfig {
     /// reads the CA Secret through the Kubernetes API. The certificate entry
     /// must hold only the certificate: a combined certificate-and-key entry
     /// would be mounted as is, and api-rs then refuses the file (see
-    /// `parse_proxy_ca`). `None` leaves that call unsupported. Proxy and sandbox pods ignore it and keep using the Secret
-    /// names.
+    /// `parse_proxy_ca`). `None` leaves that call unsupported. Proxy and
+    /// sandbox pods ignore it and keep using the Secret names.
     pub ca_cert_file: Option<PathBuf>,
     pub ca_key_secret_name: String,
     /// Entry in `ca_key_secret_name` holding the PEM CA private key.
@@ -1453,15 +1453,17 @@ impl AgentSandboxBackend {
     /// Creates a pull request through the sandbox's own proxy: HTTP CONNECT to
     /// the proxy service's tunnel port, then TLS to `api.github.com` trusting
     /// only the proxy's CA certificate. The proxy terminates TLS, swaps the
-    /// `GITHUB_TOKEN` placeholder for the bound human's OAuth token and
-    /// forwards the request, so the PR is authored as that person.
+    /// identity-bound placeholder (see [`github_pr_authorization`]) for the
+    /// bound human's attested OAuth token and forwards the request, so the PR
+    /// is authored as that person.
     ///
     /// The method, host, path and headers are fixed here; `owner` and `repo`
     /// are validated before anything else happens, so a bad value never
     /// reaches the network or Kubernetes. The proxy's CA certificate is read
-    /// from `ca_cert_file`, a file holding only the certificate; the CA Secret
-    /// itself is never fetched, so the CA key cannot reach api-rs whatever that
-    /// Secret holds.
+    /// from `ca_cert_file`, projected from the certificate entry alone; the CA
+    /// Secret itself is never fetched, so a key kept in a separate entry never
+    /// reaches api-rs. The certificate entry must hold only the certificate: a
+    /// key-bearing file is refused (see `parse_proxy_ca`).
     pub(crate) async fn create_github_pull_request_through_proxy(
         &self,
         id: &SandboxId,
